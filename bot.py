@@ -80,6 +80,9 @@ EUROPA_LEAGUES = {
     "Eredivisie": {"id": 88, "season": 2025, "country": "Netherlands"},
     "Eliteserien": {"id": 103, "season": 2026, "country": "Norway"},
     "Bélgica Pro League": {"id": 144, "season": 2025, "country": "Belgium"},
+    "Süper Lig": {"id": 203, "season": 2025, "country": "Turkey"},
+    "Primeira Liga": {"id": 94, "season": 2025, "country": "Portugal"},
+    "Allsvenskan": {"id": 113, "season": 2026, "country": "Sweden"},
 }
 
 SUDAMERICA_LEAGUES = {
@@ -94,6 +97,13 @@ SUDAMERICA_LEAGUES = {
     "Ecuador Liga Pro": {"id": 242, "season": 2026, "country": "Ecuador"},
     "Bolivia División Profesional": {"id": 344, "season": 2026, "country": "Bolivia"},
     "Venezuela Primera División": {"id": 288, "season": 2026, "country": "Venezuela"},
+    "Copa Libertadores": {"id": 13, "season": 2026, "country": "World"},
+    "Copa Sudamericana": {"id": 11, "season": 2026, "country": "World"},
+}
+
+OTRAS_LEAGUES = {
+    "MLS": {"id": 253, "season": 2026, "country": "USA"},
+    "J-League": {"id": 98, "season": 2026, "country": "Japan"},
 }
 
 
@@ -1824,6 +1834,7 @@ def obtener_partidos_configurados():
     ligas = {}
     ligas.update(EUROPA_LEAGUES)
     ligas.update(SUDAMERICA_LEAGUES)
+    ligas.update(OTRAS_LEAGUES)
 
     partidos = []
 
@@ -1865,6 +1876,7 @@ def generar_top(score_minimo=7.5):
     ligas = {}
     ligas.update(EUROPA_LEAGUES)
     ligas.update(SUDAMERICA_LEAGUES)
+    ligas.update(OTRAS_LEAGUES)
 
     today = fecha_hoy_peru()
 
@@ -1989,6 +2001,7 @@ def generar_top_fecha(fecha, score_minimo=7.5):
     ligas = {}
     ligas.update(EUROPA_LEAGUES)
     ligas.update(SUDAMERICA_LEAGUES)
+    ligas.update(OTRAS_LEAGUES)
 
     partidos = obtener_fixtures_por_fecha(ligas, fecha)
 
@@ -3749,6 +3762,7 @@ async def fixtures_manana(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ligas = {}
     ligas.update(EUROPA_LEAGUES)
     ligas.update(SUDAMERICA_LEAGUES)
+    ligas.update(OTRAS_LEAGUES)
 
     fecha = fecha_manana_peru()
 
@@ -4099,7 +4113,8 @@ async def fixtures(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ligas = {}
     ligas.update(EUROPA_LEAGUES)
     ligas.update(SUDAMERICA_LEAGUES)
-    await fixtures_ligas(update, context, ligas, "Europa + Sudamérica")
+    ligas.update(OTRAS_LEAGUES)
+    await fixtures_ligas(update, context, ligas, "Europa + Sudamérica + Otras")
 
 
 async def fixtures_europa(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -4206,8 +4221,9 @@ async def scanear(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ligas = {}
     ligas.update(EUROPA_LEAGUES)
     ligas.update(SUDAMERICA_LEAGUES)
+    ligas.update(OTRAS_LEAGUES)
 
-    await scanear_ligas(update, context, ligas, "Europa + Sudamérica")
+    await scanear_ligas(update, context, ligas, "Europa + Sudamérica + Otras")
 
 
 async def elite(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -7451,13 +7467,14 @@ async def analizar_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     hoy = fecha_hoy_peru()
     await update.message.reply_text(
-        f"🔍 *Analizando TODAS las ligas — {hoy}*\nLigas: {len(EUROPA_LEAGUES)+len(SUDAMERICA_LEAGUES)} | Filtro: score 7.5+\nEsto puede tardar varios minutos...",
+        f"🔍 *Analizando TODAS las ligas — {hoy}*\nLigas: {len(EUROPA_LEAGUES)+len(SUDAMERICA_LEAGUES)+len(OTRAS_LEAGUES)} | Filtro: score 7.5+\nEsto puede tardar varios minutos...",
         parse_mode="Markdown"
     )
 
     ligas_todas = {}
     ligas_todas.update(EUROPA_LEAGUES)
     ligas_todas.update(SUDAMERICA_LEAGUES)
+    ligas_todas.update(OTRAS_LEAGUES)
 
     partidos = obtener_fixtures_por_fecha(ligas_todas, hoy)
 
