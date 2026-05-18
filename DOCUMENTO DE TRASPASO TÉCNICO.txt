@@ -1,0 +1,1336 @@
+DOCUMENTO DE TRASPASO TÉCNICO
+Proyecto: HarryNine Bot V14
+1. RESUMEN GENERAL DEL PROYECTO
+¿Qué hace este bot?
+
+HarryNine es un bot de Telegram orientado al análisis deportivo de fútbol. Su objetivo principal es detectar oportunidades de apuesta pre-match y live usando datos estadísticos de API-Football.
+
+El bot analiza partidos, genera recomendaciones de mercados, asigna score, riesgo, probabilidad estimada, cuota mínima recomendada, guarda las jugadas para seguimiento y posteriormente genera reportes de rendimiento.
+
+El enfoque actual del proyecto es construir un sistema tipo tipster cuantitativo que no solo sugiera picks, sino que también mida su efectividad real con resultados históricos.
+
+Propósito principal
+
+El bot sirve para:
+
+Consultar fixtures confiables por región.
+Analizar partidos pre-match.
+Analizar partidos live.
+Detectar oportunidades fuertes.
+Ordenar picks por score y riesgo.
+Guardar automáticamente las jugadas sugeridas.
+Actualizar resultados automáticamente.
+Generar reportes diarios, semanales y mensuales.
+Construir una base histórica para evaluar mercados, ligas, score, riesgo y efectividad.
+Plataforma
+
+Opera en:
+
+Telegram
+
+El usuario interactúa con el bot mediante comandos como:
+
+/fixtures
+/analizar ID
+/top
+/toplive
+/resumen
+Lenguaje y librerías principales
+
+El proyecto está escrito en:
+
+Python
+
+Librerías utilizadas o presentes en el código:
+
+python-telegram-bot
+requests
+python-dotenv
+reportlab
+json
+os
+time
+datetime
+
+Imports vistos en el archivo:
+
+from telegram import Update
+from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
+from dotenv import load_dotenv
+from datetime import datetime, timedelta, time as dtime
+from reportlab.lib.pagesizes import A4, landscape
+from reportlab.pdfgen import canvas
+from reportlab.lib import colors
+from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer
+from reportlab.lib.styles import getSampleStyleSheet
+import requests
+import os
+import json
+import time
+Estructura general conocida
+
+El proyecto se está ejecutando desde:
+
+C:\Users\arnol\Documents\modelo_futbol\
+
+Estructura aproximada:
+
+modelo_futbol/
+│
+├── bot.py
+├── .env
+├── picks.json
+├── resumen_dia.pdf
+├── reportes PDF semanales/mensuales
+└── posibles archivos JSON auxiliares/cache
+
+El archivo principal es:
+
+bot.py
+2. ARQUITECTURA Y FLUJO DE FUNCIONAMIENTO
+Flujo general de arranque
+
+El bot arranca ejecutando:
+
+python bot.py
+
+El flujo general es:
+
+1. Carga variables de entorno desde .env.
+2. Define constantes globales.
+3. Define listas de ligas configuradas.
+4. Define funciones utilitarias.
+5. Define funciones de API.
+6. Define funciones de análisis pre-match.
+7. Define funciones de análisis live.
+8. Define funciones de guardado y actualización de resultados.
+9. Define comandos de Telegram.
+10. Registra los CommandHandler.
+11. Ejecuta app.run_polling().
+
+El bot imprime algo parecido a:
+
+🤖 HarryNine V14 ejecutándose...
+Cómo recibe mensajes
+
+Usa python-telegram-bot.
+
+Cada comando se registra así:
+
+app.add_handler(CommandHandler("comando", funcion))
+
+Ejemplo:
+
+app.add_handler(CommandHandler("resumen", resumen))
+
+Cuando el usuario escribe:
+
+/resumen
+
+Telegram envía el evento, python-telegram-bot lo procesa y llama a la función async correspondiente.
+
+Estados, sesiones o memoria
+
+No usa sesiones complejas ni base de datos SQL.
+
+La memoria persistente se maneja principalmente con archivos JSON.
+
+El más importante es el archivo de picks guardados:
+
+picks.json
+
+Ahí se almacenan las jugadas recomendadas para luego hacer seguimiento.
+
+APIs externas
+
+La API principal es:
+
+API-Football
+
+Se usa para:
+
+Fixtures.
+Partidos live.
+Resultados.
+Estadísticas.
+Forma de equipos.
+Datos de equipos.
+Ligas.
+Corners.
+Tarjetas.
+Goles.
+Datos de partido.
+Potencialmente odds.
+
+Actualmente las cuotas que aparecen en el bot son principalmente estimadas o internas. Se evaluó integrar APIs de odds reales como:
+
+The Odds API
+Odds-API.io
+OddsPapi
+
+pero aún no se integraron completamente.
+
+3. COMANDOS Y FUNCIONES
+Comandos disponibles o trabajados
+/start
+
+Muestra la lista de comandos disponibles.
+
+Actualmente debe incluir:
+
+/fixtures
+/fixtures_europa
+/fixtures_sudamerica
+/fixtures_manana
+/fixtures_europa_manana
+/fixtures_sudamerica_manana
+/scanear
+/scanear_europa
+/scanear_sudamerica
+/analizar ID
+/detalle ID
+/top
+/toplive
+/top_manana
+/elite
+/elitelive
+/elite_manana
+/alertas_on
+/alertas_off
+/resumen
+/resumentop
+/resumentoplive
+/pdf_semana
+/pdf_mes
+
+Pendiente: revisar que el menú de /start esté actualizado con todos los comandos nuevos.
+
+/fixtures
+
+Muestra los fixtures configurados de Europa + Sudamérica del día.
+
+Debe mostrar:
+
+País + Liga
+Hora Perú
+Local vs visitante
+ID del fixture
+
+Ejemplo:
+
+🏆 England Premier League
+⚽ 09:00 | Aston Villa vs Liverpool
+📌 ID: 1379330
+/fixtures_europa
+
+Muestra solo fixtures europeos.
+
+Usa el diccionario:
+
+EUROPA_LEAGUES
+/fixtures_sudamerica
+
+Muestra solo fixtures sudamericanos.
+
+Usa:
+
+SUDAMERICA_LEAGUES
+/fixtures_manana
+
+Muestra fixtures de mañana de Europa + Sudamérica.
+
+Requiere funciones:
+
+fecha_manana_peru()
+obtener_fixtures_por_fecha()
+texto_fixtures_fecha()
+/fixtures_europa_manana
+
+Muestra fixtures europeos de mañana.
+
+/fixtures_sudamerica_manana
+
+Muestra fixtures sudamericanos de mañana.
+
+/analizar ID
+
+Analiza un partido específico.
+
+Comportamiento:
+
+Si el partido es pre-match, hace análisis pre-match.
+Si el partido está en vivo, detecta el estado live y ejecuta análisis live.
+Muestra TOP 1 recomendado.
+Guarda automáticamente la jugada recomendada si hay oportunidad.
+
+Ejemplo de salida:
+
+⚽ FBC Melgar vs Sport Huancayo
+🏆 Peru - Primera División
+🕒 18:00 Hora Perú
+
+🎯 Mercado: Goles totales
+✅ Jugada: Over 1.5 goles
+
+⭐ Score: 8.3/10
+⚠️ Riesgo: 2.0/10
+🟢 FUERTE
+
+💰 Entrar solo si cuota ≥ 1.28
+
+🧠 Resumen:
+Alta frecuencia de partidos con mínimo 2 goles y producción ofensiva suficiente.
+
+💾 Guardado automáticamente para seguimiento.
+/detalle ID
+
+Análisis profundo.
+
+Muestra:
+
+Forma general local.
+Forma general visitante.
+Forma de local en casa.
+Forma de visitante fuera.
+Promedio GF.
+Promedio GC.
+Over 1.5.
+Over 2.5.
+Under 3.5.
+BTTS.
+Mercados detectados.
+Doble oportunidad.
+Cuota justa.
+Cuota mínima.
+Edge si está disponible.
+
+Decisión importante:
+
+/detalle es exploratorio y no debería contaminar el tracking principal, salvo que se decida expresamente.
+/top
+
+Busca oportunidades pre-match del día.
+
+Debe:
+
+Analizar partidos configurados.
+Tomar solo el mejor pick por partido.
+Filtrar por score mínimo.
+Ordenar por score descendente.
+Mostrar hora, país, liga, mercado, jugada, score, riesgo, cuota mínima e ID.
+Guardar automáticamente picks para tracking.
+
+Criterio recomendado actual:
+
+score_minimo = 7.5
+
+Antes estaba en 7. Se sugirió subirlo a 7.5 para mejorar calidad.
+
+/toplive
+
+Busca oportunidades live.
+
+Debe:
+
+Consultar fixtures live.
+Analizar cada partido live.
+Detectar oportunidades.
+Ordenar por score live.
+Mostrar los mejores.
+Guardar automáticamente para tracking con:
+"fuente": "toplive"
+"tipo": "live"
+/top_manana
+
+Comando en desarrollo.
+
+Objetivo:
+
+Generar TOP pre-match de mañana.
+
+Debe usar:
+
+generar_top_fecha(fecha_manana_peru(), score_minimo=7.5)
+
+Problema conocido: el comando puede quedarse procesando demasiado si analiza demasiados partidos. Se recomendó limitar temporalmente:
+
+max_partidos=25
+/elite
+
+Busca picks pre-match de score alto.
+
+Criterio esperado:
+
+score >= 9
+/elitelive
+
+Busca picks live de score alto.
+
+/elite_manana
+
+Comando en desarrollo.
+
+Objetivo:
+
+Buscar picks élite de mañana.
+
+Debe usar:
+
+generar_top_fecha(fecha, score_minimo=9)
+/scanear
+
+Escanea Europa + Sudamérica buscando oportunidades fuertes.
+
+No necesariamente devuelve pick si no hay oportunidad clara.
+
+Filosofía:
+
+Mejor no dar jugada que forzar una mala.
+/scanear_europa
+
+Escanea solo Europa.
+
+/scanear_sudamerica
+
+Escanea solo Sudamérica.
+
+/live ID
+
+Analiza partido live específico.
+
+Existe, pero se evaluó que /analizar ID también pueda hacer esa función automáticamente si detecta partido en vivo.
+
+/alertas_on
+
+Activa alertas live automáticas.
+
+Se programó para revisar cada cierto intervalo, por ejemplo:
+
+cada 90 segundos
+
+Usa job_queue.
+
+/alertas_off
+
+Desactiva alertas live.
+
+/resumen
+
+Actualmente se modificó para generar PDF diario:
+
+resumen_dia.pdf
+
+Debe mostrar:
+
+Fecha.
+Jugadas analizadas.
+Ganadas.
+Perdidas.
+Pendientes.
+Efectividad.
+Listado de picks.
+País.
+Liga.
+Tipo.
+Mercado.
+Jugada.
+Probabilidad.
+Score.
+Riesgo.
+Cuota.
+Estado.
+Resultado.
+
+El PDF ya funcionó correctamente con 15 picks y luego se ajustó para todos los picks quitando:
+
+picks = picks[:15]
+/resumentop
+
+Planeado.
+
+Debe mostrar solo picks cuya fuente sea:
+
+"fuente": "top"
+/resumentoplive
+
+Planeado.
+
+Debe mostrar solo picks cuya fuente sea:
+
+"fuente": "toplive"
+/pdf_semana
+
+Genera reporte semanal.
+
+/pdf_mes
+
+Genera reporte mensual.
+
+/feedback ID acierto y /feedback ID fallo
+
+Existían para feedback manual, pero se consideraron menos necesarios porque el sistema actualiza resultados automáticamente.
+
+Se pueden mantener ocultos o secundarios.
+
+Funciones principales conocidas
+api_get(endpoint, use_cache=True, ttl=...)
+
+Consulta API-Football.
+
+Recibe:
+
+endpoint
+use_cache
+ttl
+
+Retorna:
+
+response["response"]
+
+Uso:
+
+Fixtures.
+Live.
+Estadísticas.
+Forma.
+Resultados.
+leer_json(path)
+
+Lee archivo JSON.
+
+Retorna lista o estructura guardada.
+
+guardar_json_lista(path, data)
+
+Guarda lista en JSON.
+
+agregar_json(path, item)
+
+Lee JSON, agrega item y guarda.
+
+fecha_peru_obj()
+
+Devuelve fecha/hora Perú.
+
+Actualmente usa:
+
+datetime.utcnow() - timedelta(hours=5)
+
+Genera warning:
+
+DeprecationWarning: datetime.utcnow() is deprecated
+
+Pendiente mejorar usando timezone-aware datetime.
+
+fecha_hoy_peru()
+
+Retorna fecha actual Perú en formato:
+
+YYYY-MM-DD
+fecha_hora_peru()
+
+Retorna fecha y hora Perú.
+
+fecha_manana_peru()
+
+Función agregada o pendiente de agregar:
+
+def fecha_manana_peru():
+    return (fecha_peru_obj() + timedelta(days=1)).strftime("%Y-%m-%d")
+hora_peru(fecha_api)
+
+Convierte o muestra hora del fixture.
+
+Importante: cuando se usa:
+
+timezone=America/Lima
+
+en la API, ya no se debe restar 5 horas.
+
+Versión recomendada:
+
+def hora_peru(fecha_api):
+    try:
+        dt = datetime.fromisoformat(
+            fecha_api.replace("Z", "+00:00")
+        )
+        return dt.strftime("%H:%M")
+    except Exception:
+        return fecha_api[11:16]
+obtener_bandera(country)
+
+Devuelve emoji de bandera según país.
+
+Ejemplo:
+
+"Spain": "🇪🇸"
+"Brazil": "🇧🇷"
+"Peru": "🇵🇪"
+"England": "🏴"
+
+Si no encuentra país:
+
+return "🌍"
+obtener_partidos_configurados()
+
+Obtiene fixtures de ligas configuradas.
+
+Debe:
+
+Consultar API por liga.
+Filtrar estados cancelados/postergados.
+Agregar ID, home, away, league, hour, timestamp.
+Ordenar por timestamp.
+
+Importante: se corrigió para mostrar partidos ordenados por hora.
+
+obtener_fixtures_por_fecha(ligas, fecha)
+
+Nueva función para obtener fixtures por fecha específica.
+
+Usada para comandos de mañana.
+
+Recibe:
+
+ligas
+fecha
+
+Retorna:
+
+lista de partidos
+texto_fixtures_fecha(titulo, ligas, fecha)
+
+Construye texto de fixtures para una fecha.
+
+calcular_forma(team_id, modo=None, last=10)
+
+Calcula forma reciente de un equipo.
+
+Retorna datos como:
+
+Partidos jugados.
+Forma tipo W/D/L.
+GF promedio.
+GC promedio.
+Over 1.5.
+Over 2.5.
+Under 3.5.
+BTTS.
+
+Tuvo un bug de indentación anteriormente.
+
+preparar_analisis(fixture_id, incluir_odds=False, incluir_contexto=False)
+
+Motor principal pre-match.
+
+Retorna diccionario con datos del partido y recomendaciones.
+
+Campos esperados:
+
+{
+    "fixture_id": ...,
+    "home": ...,
+    "away": ...,
+    "league": ...,
+    "country": ...,
+    "hora": ...,
+    "recomendaciones": [...]
+}
+obtener_recomendaciones(...)
+
+Genera recomendaciones pre-match según forma y estadísticas.
+
+Mercados considerados:
+
+Goles totales.
+Over 1.5.
+Over 2.5.
+Under 3.5.
+BTTS.
+Doble oportunidad.
+agregar_doble_oportunidad(...)
+
+Agrega mercado 1X, X2 o 12 según forma, solidez y probabilidad de derrota.
+
+agregar_mercados_extra_prematch(...)
+
+Agrega mercados extra pre-match.
+
+analizar_live_fixture(fixture_id)
+
+Motor de análisis live.
+
+Consulta fixture live sin cache.
+
+Evalúa:
+
+Minuto.
+Marcador.
+Tiros.
+Tiros al arco.
+Corners.
+Ataques peligrosos.
+xG aproximado.
+Posesión.
+Amarillas.
+Rojas.
+Favorito/dominante.
+Score live.
+Riesgo live.
+Sugerencias live.
+
+Retorna:
+
+{
+    "texto": texto[:3900],
+    "score_live": score_live,
+    "sugerencias": sugerencias,
+    "alerta": score_live >= 7 and len(sugerencias) > 0
+}
+sugerir_live_btts(...)
+
+Sugiere BTTS live.
+
+sugerir_live_tarjetas(...)
+
+Sugiere tarjetas live.
+
+Se comentó que para mejorar este mercado sería ideal agregar datos del árbitro, ya que hay árbitros más tarjeteros que otros. Pendiente.
+
+sugerir_live_ht(...)
+
+Agrega mercados:
+
+Over corners HT
+Over 0.5 gol HT Live
+
+Interpretación:
+
+Over 0.5 gol HT Live = habrá al menos un gol antes de que termine el primer tiempo.
+linea_corners_recomendada(total_corners, elapsed)
+
+Calcula línea sugerida de corners según minuto y corners actuales.
+
+guardar_pick_automatico(data)
+
+Guarda el pick recomendado en el JSON de tracking.
+
+Debe guardar campos como:
+
+fixture_id
+fecha
+hora
+country
+league
+home
+away
+partido
+mercado
+jugada
+probabilidad
+score
+riesgo
+cuota
+cuota_minima
+estado
+resultado
+tipo
+fuente
+timestamp
+
+Estados:
+
+pendiente
+acierto
+fallo
+pendiente_manual
+actualizar_resultados_automaticos()
+
+Actualiza resultados de picks guardados.
+
+Debe revisar si los partidos ya finalizaron y calcular si el pick fue acierto o fallo.
+
+Retorna:
+
+picks, cambios
+resumen_historial()
+
+Antes generaba texto de historial.
+
+Se modificó para:
+
+Ordenar por score.
+Filtrar por día.
+Mostrar resumen del día.
+Numerar jugadas.
+Mostrar país, liga y tipo.
+
+Luego /resumen se cambió para generar PDF.
+
+generar_pdf_resumen()
+
+Genera:
+
+resumen_dia.pdf
+
+Ya funcionó.
+
+El PDF incluye:
+
+Fecha.
+Total analizadas.
+Ganadas.
+Perdidas.
+Pendientes.
+Efectividad.
+Lista de jugadas.
+generar_pdf_reporte()
+
+Función ya existente para reportes.
+
+Probablemente usada para semanal/mensual.
+
+generar_top(score_minimo=7.5)
+
+Genera top de oportunidades pre-match del día.
+
+Retorna:
+
+oportunidades[:10]
+
+Cada oportunidad incluye:
+
+id
+home
+away
+league
+country
+hour
+mercado
+jugada
+prob
+score
+riesgo
+cuota_minima
+motivo
+generar_top_fecha(fecha, score_minimo=7.5, max_partidos=25)
+
+Función nueva/en desarrollo para generar top de una fecha específica, especialmente mañana.
+
+Pendiente estabilizar porque /top_manana se quedaba procesando.
+
+Tareas automáticas
+Alertas live
+
+Comandos:
+
+/alertas_on
+/alertas_off
+
+Funcionan con context.job_queue.
+
+Se configuró para revisar cada cierto intervalo:
+
+90 segundos
+
+Objetivo:
+
+Revisar partidos live.
+Detectar oportunidades.
+Mandar alerta automática.
+Reportes automáticos
+
+En /start aparece:
+
+Reportes automáticos programados:
+• Semanal: domingos 9:00 p.m.
+• Mensual: revisión diaria 9:10 p.m. del mes actual
+
+Pendiente confirmar implementación completa.
+
+4. VARIABLES, CONSTANTES Y CONFIGURACIÓN
+Variables de entorno
+
+En .env:
+
+API_KEY
+TELEGRAM_TOKEN
+
+No deben exponerse.
+
+Uso:
+
+load_dotenv()
+API_KEY = os.getenv("API_KEY")
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+Constantes globales
+
+Ejemplos vistos:
+
+CACHE_TTL = 300
+ALERTED_LIVE = set()
+
+Archivos:
+
+PICKS_FILE
+PICKS_PATH
+
+Verificar nombre exacto en código, porque se han usado ambos conceptos en conversación.
+
+Ligas configuradas
+EUROPA_LEAGUES
+
+Ejemplo actual:
+
+EUROPA_LEAGUES = {
+    "Premier League": {"id": 39, "season": 2025, "country": "England"},
+    "Championship": {"id": 40, "season": 2025, "country": "England"},
+    "Bundesliga": {"id": 78, "season": 2025, "country": "Germany"},
+    "Bundesliga 2": {"id": 79, "season": 2025, "country": "Germany"},
+    "Serie A Italia": {"id": 135, "season": 2025, "country": "Italy"},
+    "Serie B Italia": {"id": 136, "season": 2025, "country": "Italy"},
+    "LaLiga": {"id": 140, "season": 2025, "country": "Spain"},
+    "Segunda España": {"id": 141, "season": 2025, "country": "Spain"},
+    "Ligue 1": {"id": 61, "season": 2025, "country": "France"},
+    "Ligue 2": {"id": 62, "season": 2025, "country": "France"},
+    "Eredivisie": {"id": 88, "season": 2025, "country": "Netherlands"},
+    "Eliteserien": {"id": 103, "season": 2026, "country": "Norway"},
+    "Bélgica Pro League": {"id": 144, "season": 2025, "country": "Belgium"},
+}
+
+Importante:
+
+No cambiar season si ya funciona. Solo agregar country.
+SUDAMERICA_LEAGUES
+
+Debe tener ligas como:
+
+"Perú Liga 1"
+"Ecuador Liga Pro"
+"Uruguay Primera División"
+"Chile Primera División"
+"Bolivia División Profesional"
+"Colombia Primera A"
+"Argentina"
+"Brasil"
+
+Cada una debería tener:
+
+"id"
+"season"
+"country"
+Parámetros configurables
+
+Criterios clave:
+
+score_minimo_top = 7.5
+score_minimo_elite = 9
+max_partidos_top_manana = 25
+cache_ttl = 300 o 600
+intervalo_alertas_live = 90 segundos
+5. LÓGICA DE NEGOCIO Y CRITERIOS
+Filosofía del bot
+
+La decisión de diseño principal es:
+
+Calidad > cantidad.
+
+El bot no debe forzar picks si no hay valor.
+
+Score
+
+El score va de 0 a 10.
+
+Interpretación:
+
+10/10 = señal muy fuerte
+9/10 = élite
+8/10 = fuerte
+7.5/10 = top mínimo recomendado
+7/10 = aceptable, pero actualmente se considera más débil
+<7 = no recomendado
+Riesgo
+
+El riesgo va de 0 a 10.
+
+Interpretación:
+
+1-2 = bajo
+2-4 = moderado
+4-6 = alto
+>6 = evitar
+Probabilidad
+
+Probabilidad estimada interna según reglas del modelo.
+
+No es garantía real. Debe compararse luego con resultados y cuotas.
+
+Cuota
+
+Actualmente muchas cuotas son internas/estimadas:
+
+cuota_minima
+cuota_justa
+cuota
+
+Se detectó que no son cuotas reales de casa de apuesta.
+
+Pendiente integrar API de odds reales.
+
+Mercados usados
+
+Pre-match:
+
+Over 1.5 goles
+Over 2.5 goles
+Under 3.5 goles
+Ambos marcan - Sí
+Doble oportunidad 1X
+Doble oportunidad X2
+Doble oportunidad 12
+Corners
+Tarjetas
+
+Live:
+
+Corners live
+Tarjetas live
+Over 0.5 gol HT Live
+Corners HT Over
+BTTS live
+Over goles live
+Decisiones importantes
+/analizar vs /detalle
+
+Se decidió:
+
+/analizar = rápido, TOP 1
+/detalle = profundo, varias opciones
+
+No es problema que /detalle muestre más mercados que /analizar.
+
+Guardado para tracking
+
+Guardar:
+
+/top
+/toplive
+/elite
+/elitelive
+/analizar si recomienda
+/live si recomienda
+
+No guardar:
+
+/detalle
+partidos sin recomendación
+consultas exploratorias
+
+Motivo:
+
+Evitar contaminar el dataset.
+Resumen
+
+El resumen pasó de texto Telegram a PDF porque:
+
+Telegram corta mensajes largos.
+
+El PDF diario es mejor para seguimiento.
+
+Top mañana
+
+Se quiere preparar partidos de mañana.
+
+Comandos deseados:
+
+/fixtures_manana
+/fixtures_europa_manana
+/fixtures_sudamerica_manana
+/top_manana
+/elite_manana
+
+Los fixtures ya están en proceso. Top mañana sigue con problemas de lentitud.
+
+6. ESTADO ACTUAL Y PENDIENTES
+Funcionalidades completas o casi completas
+Completas
+/fixtures
+/fixtures_europa
+/fixtures_sudamerica
+/analizar ID
+/detalle ID
+/top
+/toplive
+/alertas_on
+/alertas_off
+/resumen PDF
+/pdf_semana
+/pdf_mes
+Casi completas
+/fixtures_manana
+/fixtures_europa_manana
+/fixtures_sudamerica_manana
+En desarrollo / con problemas
+/top_manana
+/elite_manana
+/resumentop
+/resumentoplive
+Bugs o problemas conocidos
+1. /top_manana y /elite_manana no responden o se quedan procesando
+
+Causa probable:
+
+Analizan demasiados partidos y cada análisis consulta varias veces la API.
+
+Solución propuesta:
+
+max_partidos=25
+
+y luego optimizar.
+
+2. Warning de datetime
+
+Aparece:
+
+DeprecationWarning: datetime.utcnow() is deprecated
+
+Causa:
+
+datetime.utcnow()
+
+Solución futura:
+
+usar datetime timezone-aware.
+
+3. Telegram timeout
+
+Error visto:
+
+telegram.error.TimedOut: Timed out
+
+Causas:
+
+PDF muy grande.
+Telegram demoró al enviar.
+Comando pesado.
+Bot anterior colgado.
+
+Solución:
+
+Dividir procesos.
+Manejar try/except.
+Aumentar timeouts si es necesario.
+Reducir contenido por mensaje.
+Usar PDF.
+4. País/liga duplicado
+
+Se vio:
+
+Peru Perú Liga 1
+Belgium Bélgica Pro League
+
+Causa:
+
+Se concatenó country + league_name, pero algunos nombres ya contenían país.
+
+Solución:
+
+Definir convención única:
+
+league_name debe ser nombre limpio de liga
+country debe ir aparte
+
+Para fixtures:
+
+🏆 Peru - Liga 1
+
+o:
+
+🏆 Peru Liga 1
+
+pero evitar duplicar.
+
+5. Hora Perú
+
+Se detectó que el partido Universitario aparecía a las 15:00 cuando era a las 20:00.
+
+Causa:
+
+La API ya venía con timezone America/Lima y luego el código restaba 5 horas otra vez.
+
+Solución:
+
+def hora_peru(fecha_api):
+    try:
+        dt = datetime.fromisoformat(fecha_api.replace("Z", "+00:00"))
+        return dt.strftime("%H:%M")
+    except Exception:
+        return fecha_api[11:16]
+6. Cuotas no reales
+
+Actualmente el bot muestra cuotas internas o estimadas.
+
+Pendiente:
+
+Integrar odds reales con:
+
+The Odds API
+Odds-API.io
+OddsPapi
+API-Football Odds
+
+Recomendación:
+
+API-Football = cerebro estadístico
+Odds API = validación final de cuota
+Mejoras planeadas
+1. Módulo de bank management
+
+Comandos sugeridos:
+
+/bank
+/stake
+/plan_dia
+/plan_agresivo
+/retroescalera
+
+Objetivo:
+
+Administrar bank.
+Recomendar stake.
+Simular estrategia diaria.
+Controlar riesgo.
+
+Advertencia:
+
+No garantizar 10% diario. Solo simular o sugerir con control de riesgo.
+2. Retro escalera
+
+Estrategia propuesta:
+
+Stake inicial pequeño
+3 a 5 escalones
+Score mínimo 8.5+
+Cuotas 1.25 a 1.45
+Detener al lograr objetivo
+No reiniciar si falla
+
+Debe ser módulo separado dentro del mismo bot.
+
+3. Autoaprendizaje
+
+La base del autoaprendizaje será:
+
+picks guardados + resultados actualizados
+
+Se debe analizar:
+
+Efectividad por mercado.
+Efectividad por liga.
+Efectividad por score.
+Efectividad por riesgo.
+Efectividad live vs prematch.
+ROI estimado si se integran cuotas reales.
+4. Árbitros para tarjetas
+
+Para mejorar mercado de tarjetas, agregar análisis de árbitro:
+
+Promedio de amarillas.
+Promedio de rojas.
+Tendencia tarjetero.
+Liga.
+Historial.
+5. Odds reales
+
+Integrar cuotas reales solo cuando:
+
+score >= 7.5
+
+No consultar cuotas para todos los partidos para no gastar créditos.
+
+6. Mejorar PDFs
+
+El PDF diario ya funciona, pero se puede mejorar:
+
+Mejor diseño.
+Tablas.
+Separar prematch/live.
+Resumen por mercado.
+Resumen por país.
+Ranking de mejores picks.
+Paginación profesional.
+Exportar CSV/Excel.
+Reglas importantes para el nuevo asistente
+No modificar todo el bot de golpe.
+Hacer cambios pequeños y probar.
+Mantener el tracking limpio.
+No guardar /detalle automáticamente.
+Evitar contaminar dataset con picks débiles.
+Mantener /analizar como TOP 1.
+Mantener /detalle como análisis profundo.
+Mantener /resumen como PDF.
+Priorizar calidad sobre cantidad.
+No forzar picks si no hay valor.
+Estado final recomendado de comandos
+/start
+/fixtures
+/fixtures_europa
+/fixtures_sudamerica
+/fixtures_manana
+/fixtures_europa_manana
+/fixtures_sudamerica_manana
+/analizar ID
+/detalle ID
+/top
+/toplive
+/top_manana
+/elite
+/elitelive
+/elite_manana
+/scanear
+/scanear_europa
+/scanear_sudamerica
+/alertas_on
+/alertas_off
+/resumen
+/resumentop
+/resumentoplive
+/pdf_semana
+/pdf_mes
+/bank           pendiente
+/stake          pendiente
+/plan_dia       pendiente
+/retroescalera  pendiente
+Nota final para el nuevo asistente
+
+Este proyecto no es solo un bot de picks. Es un sistema de análisis, tracking y evolución estadística.
+
+La lógica correcta es:
+
+Fixtures
+→ Análisis estadístico
+→ Score/riesgo
+→ Pick recomendado
+→ Guardado
+→ Resultado real
+→ Reporte
+→ Medición
+→ Ajuste del modelo
+
+La visión del proyecto es convertir HarryNine en un sistema tipster con:
+
+análisis pre-match
+análisis live
+gestión de bank
+retro escalera
+tracking histórico
+reportes PDF
+autoaprendizaje
+
+La prioridad inmediata debería ser:
+
+1. Estabilizar /top_manana y /elite_manana.
+2. Terminar /resumentop y /resumentoplive.
+3. Revisar guardado por fuente y tipo.
+4. Optimizar PDF diario.
+5. Integrar cuotas reales solo para picks fuertes.
