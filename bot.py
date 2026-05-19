@@ -80,9 +80,6 @@ EUROPA_LEAGUES = {
     "Eredivisie": {"id": 88, "season": 2025, "country": "Netherlands"},
     "Eliteserien": {"id": 103, "season": 2026, "country": "Norway"},
     "Bélgica Pro League": {"id": 144, "season": 2025, "country": "Belgium"},
-    "Süper Lig": {"id": 203, "season": 2025, "country": "Turkey"},
-    "Primeira Liga": {"id": 94, "season": 2025, "country": "Portugal"},
-    "Allsvenskan": {"id": 113, "season": 2026, "country": "Sweden"},
 }
 
 SUDAMERICA_LEAGUES = {
@@ -97,13 +94,6 @@ SUDAMERICA_LEAGUES = {
     "Ecuador Liga Pro": {"id": 242, "season": 2026, "country": "Ecuador"},
     "Bolivia División Profesional": {"id": 344, "season": 2026, "country": "Bolivia"},
     "Venezuela Primera División": {"id": 288, "season": 2026, "country": "Venezuela"},
-    "Copa Libertadores": {"id": 13, "season": 2026, "country": "World"},
-    "Copa Sudamericana": {"id": 11, "season": 2026, "country": "World"},
-}
-
-OTRAS_LEAGUES = {
-    "MLS": {"id": 253, "season": 2026, "country": "USA"},
-    "J-League": {"id": 98, "season": 2026, "country": "Japan"},
 }
 
 
@@ -686,8 +676,97 @@ def guardar_snapshot_odds(fixture_id, jugada, cuota):
     return movimiento
 
 
+def _extraer_cuotas_1x2_pinnacle(odds):
+    """
+    Extrae las cuotas de Home, Draw, Away del mercado 1X2 de Pinnacle.
+    Devuelve dict {"Home": float, "Draw": float, "Away": float} o {} si no hay.
+    Usado para calcular Doble Oportunidad desde Pinnacle (que no tiene ese mercado).
+    """
+    PINNACLE_NAMES = {"Pinnacle", "Pinnacle Sports"}
+    WINNER_MARKETS = {"Match Winner", "1X2", "Match Result", "Full Time Result", "Home/Away"}
+    resultado = {}
+    for casa in odds:
+        for book in casa.get("bookmakers", []):
+            if book.get("name", "") not in PINNACLE_NAMES:
+                continue
+            for bet in book.get("bets", []):
+                if not any(m.lower() in bet.get("name", "").lower() for m in WINNER_MARKETS):
+                    continue
+                for value in bet.get("values", []):
+                    nombre = str(value.get("value", "")).strip()
+                    try:
+                        odd = float(value.get("odd"))
+                    except Exception:
+                        continue
+                    if nombre in ("Home", "1", "Home Team"):
+                        resultado["Home"] = odd
+                    elif nombre in ("Draw", "X", "Tie"):
+                        resultado["Draw"] = odd
+                    elif nombre in ("Away", "2", "Away Team"):
+                        resultado["Away"] = odd
+            if resultado:
+                return resultado
+    return resultado
+
+
+def _cuota_doble_oportunidad_pinnacle(odds, jugada):
+    """
+    Calcula la cuota equivalente de Doble Oportunidad desde el 1X2 de Pinnacle.
+    Pinnacle no ofrece mercado de Doble Oportunidad directamente.
+    Formula: cuota_DC = 1 / (1/cuota_A + 1/cuota_B)
+    Devuelve (cuota, "Pinnacle (calc DC)") o (None, None).
+    """
+    cuotas = _extraer_cuotas_1x2_pinnacle(odds)
+    if not cuotas:
+        return None, None
+    try:
+        if jugada == "1X":
+            if "Home" in cuotas and "Draw" in cuotas:
+                prob = (1 / cuotas["Home"]) + (1 / cuotas["Draw"])
+                return round(1 / prob, 3), "Pinnacle (DC calc)"
+        elif jugada == "X2":
+            if "Draw" in cuotas and "Away" in cuotas:
+                prob = (1 / cuotas["Draw"]) + (1 / cuotas["Away"])
+                return round(1 / prob, 3), "Pinnacle (DC calc)"
+        elif jugada == "12":
+            if "Home" in cuotas and "Away" in cuotas:
+                prob = (1 / cuotas["Home"]) + (1 / cuotas["Away"])
+                return round(1 / prob, 3), "Pinnacle (DC calc)"
+    except Exception:
+        pass
+    return None, None
+
+
+def _normalizar_jugada_para_matching(jugada):
+    """
+    Normaliza el texto de la jugada para el matching de cuotas.
+    Elimina sufijos de contexto que no forman parte del nombre del mercado:
+    ' live', ' restante', ' HT', ' HT Live', ' Live', etc.
+    Devuelve la jugada normalizada en lowercase para comparacion.
+    """
+    import re as _re_norm
+    jugada_norm = jugada.strip()
+    # Quitar sufijos contextuales (orden importa: mas especifico primero)
+    sufijos = [
+        r"\s+ht\s+live$", r"\s+ht$", r"\s+live$", r"\s+restante$",
+        r"\s+1t$", r"\s+2t$", r"\s+primer\s+tiempo$", r"\s+segundo\s+tiempo$",
+    ]
+    for suf in sufijos:
+        jugada_norm = _re_norm.sub(suf, "", jugada_norm, flags=_re_norm.IGNORECASE).strip()
+    return jugada_norm
+
+
 def buscar_mejor_cuota(fixture_id, jugada):
     odds = api_get(f"/odds?fixture={fixture_id}", use_cache=True, ttl=600)
+
+    # --- FIX 1: Doble Oportunidad calculada desde 1X2 de Pinnacle ---
+    # Pinnacle no ofrece mercado DC directamente. Calculamos la cuota
+    # equivalente matematicamente desde sus cuotas 1X2 (mas precisas).
+    if jugada in ("1X", "X2", "12"):
+        cuota_dc, book_dc = _cuota_doble_oportunidad_pinnacle(odds, jugada)
+        if cuota_dc:
+            return cuota_dc, book_dc
+        # Si Pinnacle no tiene 1X2 tampoco, caer al fallback normal abajo
 
     mejor = None
     mejor_book = None
@@ -701,7 +780,11 @@ def buscar_mejor_cuota(fixture_id, jugada):
         "Bwin": 7, "Unibet": 8,
     }
 
-    mejor_por_casa = {}  # book_name -> (odd, match_found)
+    # --- FIX 2: Normalizar jugada antes del matching ---
+    # Quita sufijos como " live", " restante", " HT" para que el matcher
+    # encuentre la linea numerica correctamente en jugadas live.
+    jugada_norm = _normalizar_jugada_para_matching(jugada)
+    jugada_l = jugada_norm.lower()
 
     for casa in odds:
         for book in casa.get("bookmakers", []):
@@ -721,8 +804,6 @@ def buscar_mejor_cuota(fixture_id, jugada):
 
                     match = False
 
-                    jugada_l = jugada.lower()
-
                     # Goles Over/Under — verificar que el mercado sea de goles
                     GOALS_MARKETS = {"Goals Over/Under", "Total Goals", "Over/Under",
                                      "Goals", "Total", "Over Under"}
@@ -731,11 +812,11 @@ def buscar_mejor_cuota(fixture_id, jugada):
 
                     if "over" in jugada_l and "gol" in jugada_l:
                         try:
-                            linea = float(jugada.split("Over")[-1].strip().split()[0])
+                            linea = float(jugada_norm.split("Over")[-1].strip().split()[0])
                         except Exception:
                             linea = None
                         if is_goals_market and linea is not None:
-                            # Match exacto primero
+                            # Match exacto
                             if nombre.strip() in (f"Over {linea}", f"Over{linea}",
                                                    f"Over {linea:.1f}", f"Over {int(linea)}"):
                                 match = True
@@ -753,7 +834,7 @@ def buscar_mejor_cuota(fixture_id, jugada):
 
                     elif "under" in jugada_l and "gol" in jugada_l:
                         try:
-                            linea = float(jugada.split("Under")[-1].strip().split()[0])
+                            linea = float(jugada_norm.split("Under")[-1].strip().split()[0])
                         except Exception:
                             linea = None
                         if is_goals_market and linea is not None:
@@ -770,12 +851,13 @@ def buscar_mejor_cuota(fixture_id, jugada):
                                     val2 = float(m_num2.group(1))
                                     if abs(val2 - linea) <= 0.5 and "under" in nombre.lower():
                                         match = True
+
                     # Ambos marcan
                     elif "ambos marcan" in jugada_l or "btts" in jugada_l:
                         if ("Both Teams" in bet_name or "BTTS" in bet_name) and nombre.lower() in ["yes","si","sí"]:
                             match = True
-                    # Doble oportunidad
-                    # Pinnacle usa "Home/Draw", "Draw/Away", "Home/Away"
+
+                    # Doble oportunidad fallback (si Pinnacle no tenia 1X2)
                     # Otras casas usan "1X", "X2", "12"
                     elif jugada == "1X":
                         if "Double Chance" in bet_name and (
@@ -795,31 +877,75 @@ def buscar_mejor_cuota(fixture_id, jugada):
                             "Home Away" in nombre or "1 2" in nombre
                         ):
                             match = True
-                    # Corners Over/Under
+
+                    # --- FIX 3: Corners — matching mas flexible ---
                     elif "corner" in jugada_l and "over" in jugada_l:
-                        linea_c = jugada.split("Over")[-1].strip().split()[0]
-                        if ("Corner" in bet_name or "Corners" in bet_name) and (
-                            nombre.strip() == f"Over {linea_c}" or
-                            nombre.strip() == f"Over{linea_c}"
-                        ):
-                            match = True
+                        try:
+                            linea_c = float(jugada_norm.split("Over")[-1].strip().split()[0].replace(",", "."))
+                        except Exception:
+                            linea_c = None
+                        CORNER_MARKETS = {"Corner", "Corners", "Asian Corners", "Total Corners"}
+                        is_corner_market = any(cm.lower() in bet_name.lower() for cm in CORNER_MARKETS)
+                        if is_corner_market and linea_c is not None:
+                            import re as _re_c
+                            m_c = _re_c.search(r"(\d+\.?\d*)", nombre)
+                            if m_c and abs(float(m_c.group(1)) - linea_c) < 0.01 and "over" in nombre.lower():
+                                match = True
+                            elif nombre.strip() in (f"Over {linea_c}", f"Over{linea_c}",
+                                                     f"Over {linea_c:.1f}", f"Over {int(linea_c)}"):
+                                match = True
+
                     elif "corner" in jugada_l and "under" in jugada_l:
-                        linea_c = jugada.split("Under")[-1].strip().split()[0]
-                        if ("Corner" in bet_name or "Corners" in bet_name) and (
-                            nombre.strip() == f"Under {linea_c}" or
-                            nombre.strip() == f"Under{linea_c}"
-                        ):
-                            match = True
-                    # Tarjetas - Pinnacle usa "Bookings" o "Cards"
+                        try:
+                            linea_c = float(jugada_norm.split("Under")[-1].strip().split()[0].replace(",", "."))
+                        except Exception:
+                            linea_c = None
+                        CORNER_MARKETS = {"Corner", "Corners", "Asian Corners", "Total Corners"}
+                        is_corner_market = any(cm.lower() in bet_name.lower() for cm in CORNER_MARKETS)
+                        if is_corner_market and linea_c is not None:
+                            import re as _re_c2
+                            m_c2 = _re_c2.search(r"(\d+\.?\d*)", nombre)
+                            if m_c2 and abs(float(m_c2.group(1)) - linea_c) < 0.01 and "under" in nombre.lower():
+                                match = True
+                            elif nombre.strip() in (f"Under {linea_c}", f"Under{linea_c}",
+                                                     f"Under {linea_c:.1f}", f"Under {int(linea_c)}"):
+                                match = True
+
+                    # --- FIX 3: Tarjetas — ampliar nombres de mercado aceptados ---
                     elif "tarjeta" in jugada_l and "over" in jugada_l:
-                        linea_t = jugada.split("Over")[-1].strip().split()[0]
-                        if ("Card" in bet_name or "Booking" in bet_name or
-                            "Yellow" in bet_name) and (
-                            nombre.strip() == f"Over {linea_t}" or
-                            nombre.strip() == f"Over{linea_t}" or
-                            f"Over {linea_t}" in nombre
-                        ):
-                            match = True
+                        try:
+                            linea_t = float(jugada_norm.split("Over")[-1].strip().split()[0].replace(",", "."))
+                        except Exception:
+                            linea_t = None
+                        CARD_MARKETS = {"Card", "Booking", "Yellow", "Total Cards",
+                                        "Bookings", "Cards", "Total Bookings"}
+                        is_card_market = any(cm.lower() in bet_name.lower() for cm in CARD_MARKETS)
+                        if is_card_market and linea_t is not None:
+                            import re as _re_t
+                            m_t = _re_t.search(r"(\d+\.?\d*)", nombre)
+                            if m_t and abs(float(m_t.group(1)) - linea_t) < 0.01 and "over" in nombre.lower():
+                                match = True
+                            elif nombre.strip() in (f"Over {linea_t}", f"Over{linea_t}",
+                                                     f"Over {linea_t:.1f}", f"Over {int(linea_t)}"):
+                                match = True
+
+                    elif "tarjeta" in jugada_l and "under" in jugada_l:
+                        try:
+                            linea_t = float(jugada_norm.split("Under")[-1].strip().split()[0].replace(",", "."))
+                        except Exception:
+                            linea_t = None
+                        CARD_MARKETS = {"Card", "Booking", "Yellow", "Total Cards",
+                                        "Bookings", "Cards", "Total Bookings"}
+                        is_card_market = any(cm.lower() in bet_name.lower() for cm in CARD_MARKETS)
+                        if is_card_market and linea_t is not None:
+                            import re as _re_t2
+                            m_t2 = _re_t2.search(r"(\d+\.?\d*)", nombre)
+                            if m_t2 and abs(float(m_t2.group(1)) - linea_t) < 0.01 and "under" in nombre.lower():
+                                match = True
+                            elif nombre.strip() in (f"Under {linea_t}", f"Under{linea_t}",
+                                                     f"Under {linea_t:.1f}", f"Under {int(linea_t)}"):
+                                match = True
+
                     # 1X2 - Pinnacle usa "Home", "Draw", "Away" o "1", "X", "2"
                     elif jugada_l.strip() in ("1", "local gana", "victoria local"):
                         if ("Match Winner" in bet_name or "1X2" in bet_name or
@@ -843,18 +969,13 @@ def buscar_mejor_cuota(fixture_id, jugada):
                     if match:
                         prioridad_actual = CASA_PRIORIDAD.get(book_name, 50)
                         prioridad_mejor = CASA_PRIORIDAD.get(mejor_book, 50) if mejor_book else 99
-                        # Preferir Pinnacle sobre cualquier otra casa
                         if mejor is None:
                             mejor = odd
                             mejor_book = book_name
                         elif prioridad_actual < prioridad_mejor:
-                            # Casa con mayor prioridad (Pinnacle sobre Bet365, etc.)
                             mejor = odd
                             mejor_book = book_name
 
-    # Si no encontro cuota de Pinnacle, registrar para diagnostico
-    if mejor is None:
-        pass  # No hay cuota Pinnacle disponible para esta jugada
     return mejor, mejor_book
 
 
@@ -1834,7 +1955,6 @@ def obtener_partidos_configurados():
     ligas = {}
     ligas.update(EUROPA_LEAGUES)
     ligas.update(SUDAMERICA_LEAGUES)
-    ligas.update(OTRAS_LEAGUES)
 
     partidos = []
 
@@ -1876,7 +1996,6 @@ def generar_top(score_minimo=7.5):
     ligas = {}
     ligas.update(EUROPA_LEAGUES)
     ligas.update(SUDAMERICA_LEAGUES)
-    ligas.update(OTRAS_LEAGUES)
 
     today = fecha_hoy_peru()
 
@@ -1950,11 +2069,26 @@ def _formatear_pick_mensaje(o, idx=None, mostrar_id=True):
         cuota_calc = 0
 
     cuota_mostrar = cuota_pin if cuota_pin > 1.0 else cuota_calc
-    book_str = " (Pinnacle)" if cuota_pin > 1.0 else (" (calc)" if cuota_calc > 1.0 else "")
 
-    # Edge vs Pinnacle
+    # --- FIX 4: Mostrar la casa real, no siempre "Pinnacle" ---
+    bookmaker = o.get("bookmaker", "")
+    PINNACLE_NAMES = {"Pinnacle", "Pinnacle Sports", "Pinnacle (DC calc)"}
+    if cuota_pin > 1.0:
+        if bookmaker in PINNACLE_NAMES or "Pinnacle" in str(bookmaker):
+            book_str = " (Pinnacle)"
+        elif bookmaker:
+            book_str = f" ({bookmaker})"
+        else:
+            book_str = " (casas)"
+    elif cuota_calc > 1.0:
+        book_str = " (calc)"
+    else:
+        book_str = ""
+
+    # Edge vs Pinnacle — solo calcular si la cuota es de Pinnacle
     prob = float(o.get("prob", 0) or 0)
-    edge_val = edge_estimado(prob, cuota_pin) if cuota_pin > 1.0 else None
+    es_pinnacle = cuota_pin > 1.0 and (bookmaker in PINNACLE_NAMES or "Pinnacle" in str(bookmaker))
+    edge_val = edge_estimado(prob, cuota_pin) if es_pinnacle else None
     cat_edge, label_edge = clasificar_edge(edge_val)
 
     # Emoji de edge
@@ -2001,7 +2135,6 @@ def generar_top_fecha(fecha, score_minimo=7.5):
     ligas = {}
     ligas.update(EUROPA_LEAGUES)
     ligas.update(SUDAMERICA_LEAGUES)
-    ligas.update(OTRAS_LEAGUES)
 
     partidos = obtener_fixtures_por_fecha(ligas, fecha)
 
@@ -3762,7 +3895,6 @@ async def fixtures_manana(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ligas = {}
     ligas.update(EUROPA_LEAGUES)
     ligas.update(SUDAMERICA_LEAGUES)
-    ligas.update(OTRAS_LEAGUES)
 
     fecha = fecha_manana_peru()
 
@@ -4113,8 +4245,7 @@ async def fixtures(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ligas = {}
     ligas.update(EUROPA_LEAGUES)
     ligas.update(SUDAMERICA_LEAGUES)
-    ligas.update(OTRAS_LEAGUES)
-    await fixtures_ligas(update, context, ligas, "Europa + Sudamérica + Otras")
+    await fixtures_ligas(update, context, ligas, "Europa + Sudamérica")
 
 
 async def fixtures_europa(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -4221,9 +4352,8 @@ async def scanear(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ligas = {}
     ligas.update(EUROPA_LEAGUES)
     ligas.update(SUDAMERICA_LEAGUES)
-    ligas.update(OTRAS_LEAGUES)
 
-    await scanear_ligas(update, context, ligas, "Europa + Sudamérica + Otras")
+    await scanear_ligas(update, context, ligas, "Europa + Sudamérica")
 
 
 async def elite(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -7467,14 +7597,13 @@ async def analizar_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     hoy = fecha_hoy_peru()
     await update.message.reply_text(
-        f"🔍 *Analizando TODAS las ligas — {hoy}*\nLigas: {len(EUROPA_LEAGUES)+len(SUDAMERICA_LEAGUES)+len(OTRAS_LEAGUES)} | Filtro: score 7.5+\nEsto puede tardar varios minutos...",
+        f"🔍 *Analizando TODAS las ligas — {hoy}*\nLigas: {len(EUROPA_LEAGUES)+len(SUDAMERICA_LEAGUES)} | Filtro: score 7.5+\nEsto puede tardar varios minutos...",
         parse_mode="Markdown"
     )
 
     ligas_todas = {}
     ligas_todas.update(EUROPA_LEAGUES)
     ligas_todas.update(SUDAMERICA_LEAGUES)
-    ligas_todas.update(OTRAS_LEAGUES)
 
     partidos = obtener_fixtures_por_fecha(ligas_todas, hoy)
 
