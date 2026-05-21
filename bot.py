@@ -6510,8 +6510,13 @@ def _insertar_graficos_pdf(elements, picks, prefijo="reporte", styles=None):
 
     tmps = []
 
-    def add_graph(gen_fn, titulo, width, height, **kwargs):
-        """Genera un grafico y lo agrega al PDF de forma segura."""
+    def add_graph(gen_fn, seccion_titulo, width, height, **kwargs):
+        """Genera un grafico y lo agrega al PDF de forma segura.
+
+        'seccion_titulo' es el encabezado de la seccion en el PDF.
+        Se renombro desde 'titulo' para evitar colision con el argumento
+        'titulo' que algunas funciones de grafico reciben via **kwargs.
+        """
         try:
             path = gen_fn(**kwargs)
             if not path:
@@ -6519,7 +6524,7 @@ def _insertar_graficos_pdf(elements, picks, prefijo="reporte", styles=None):
             # Verificar que el archivo existe y tiene contenido
             if not _os_bot.path.exists(path) or _os_bot.path.getsize(path) == 0:
                 return
-            elements.append(Paragraph(titulo, s_h2))
+            elements.append(Paragraph(seccion_titulo, s_h2))
             elements.append(RLImage(path, width=width*_cm, height=height*_cm))
             elements.append(Spacer(1, 0.3*_cm))
             tmps.append(path)
