@@ -80,6 +80,9 @@ EUROPA_LEAGUES = {
     "Eredivisie": {"id": 88, "season": 2025, "country": "Netherlands"},
     "Eliteserien": {"id": 103, "season": 2026, "country": "Norway"},
     "Bélgica Pro League": {"id": 144, "season": 2025, "country": "Belgium"},
+    "Süper Lig": {"id": 203, "season": 2025, "country": "Turkey"},
+    "Primeira Liga": {"id": 94, "season": 2025, "country": "Portugal"},
+    "Allsvenskan": {"id": 113, "season": 2026, "country": "Sweden"},
 }
 
 SUDAMERICA_LEAGUES = {
@@ -94,6 +97,13 @@ SUDAMERICA_LEAGUES = {
     "Ecuador Liga Pro": {"id": 242, "season": 2026, "country": "Ecuador"},
     "Bolivia División Profesional": {"id": 344, "season": 2026, "country": "Bolivia"},
     "Venezuela Primera División": {"id": 288, "season": 2026, "country": "Venezuela"},
+    "Copa Libertadores": {"id": 13, "season": 2026, "country": "World"},
+    "Copa Sudamericana": {"id": 11, "season": 2026, "country": "World"},
+}
+
+OTRAS_LEAGUES = {
+    "MLS": {"id": 253, "season": 2026, "country": "USA"},
+    "J-League": {"id": 98, "season": 2026, "country": "Japan"},
 }
 
 
@@ -1461,69 +1471,118 @@ def preparar_analisis(fixture_id, incluir_odds=False, incluir_contexto=False):
     }
 
 
-def guardar_pick_automatico(data):
-    if not data or not data.get("recomendaciones"):
-        return
+def guardar_pick_plano(pick):
+    """
+    Persiste un pick que ya viene en formato PLANO (claves jugada/score/etc
+    en la raiz), como los que generan /analizar_all y /live_all.
+    Centraliza la persistencia para que TODA jugada entre al mismo pipeline
+    de resumen, aprendizaje, metricas y simulacion de bank.
+    Evita duplicados por (fixture_id + jugada).
+    """
+    if not pick or not pick.get("fixture_id") or not pick.get("jugada"):
+        return False
 
-    top = data["recomendaciones"][0]
     picks = leer_json(PICKS_FILE)
 
+    # Evitar duplicado: mismo fixture + misma jugada
     for p in picks:
-        if (
-            str(p.get("fixture_id")) == str(data["fixture_id"])
-            and p.get("jugada") == top["jugada"]
-        ):
+        if (str(p.get("fixture_id")) == str(pick.get("fixture_id"))
+                and p.get("jugada") == pick.get("jugada")):
             p["fecha_consulta"] = fecha_hora_peru()
-            p["probabilidad"] = top["prob"]
-            p["score"] = top["score"]
-            p["riesgo"] = top["riesgo"]
+            p["probabilidad"] = pick.get("prob", p.get("probabilidad"))
+            p["score"] = pick.get("score", p.get("score"))
+            p["riesgo"] = pick.get("riesgo", p.get("riesgo"))
+            if pick.get("minuto") is not None:
+                p["minuto_consulta"] = pick.get("minuto")
             guardar_json_lista(PICKS_FILE, picks)
-            return
+            return True
 
-    _cuota_val = top.get("cuota_minima", 0) or top.get("cuota", 0) or 0
+    # Normalizar cuota
+    _cuota = pick.get("cuota_api") or pick.get("cuota") or pick.get("cuota_minima") or 0
     try:
-        _cuota_val = float(_cuota_val)
+        _cuota = float(_cuota) if _cuota else 0.0
     except (ValueError, TypeError):
-        _cuota_val = 0.0
+        _cuota = 0.0
 
-    # Calcular edge vs Pinnacle si hay cuota real
-    cuota_pinnacle = top.get("cuota_api") or _cuota_val
+    cuota_pinnacle = pick.get("cuota_api") or _cuota
     try:
         cuota_pinnacle = float(cuota_pinnacle) if cuota_pinnacle else 0
     except Exception:
         cuota_pinnacle = 0
 
-    edge_val = edge_estimado(float(top.get("prob", 0) or 0), cuota_pinnacle) if cuota_pinnacle > 1.0 else None
-    categoria_edge, label_edge = clasificar_edge(edge_val)
-    ve_val = valor_esperado(float(top.get("prob", 0) or 0), cuota_pinnacle) if cuota_pinnacle > 1.0 else None
+    prob_val = float(pick.get("prob", 0) or pick.get("probabilidad", 0) or 0)
+    edge_val = edge_estimado(prob_val, cuota_pinnacle) if cuota_pinnacle > 1.0 else None
+    categoria_edge, _label = clasificar_edge(edge_val)
+    ve_val = valor_esperado(prob_val, cuota_pinnacle) if cuota_pinnacle > 1.0 else None
 
-    picks.append({
-        "fixture_id": str(data["fixture_id"]),
-        "fecha": data["fecha"],
-        "hora": data["hora"],
-        "fecha_partido": data.get("fecha_partido", data["fecha"]),
-        "country": data["country"],
-        "league": data["league"],
-        "partido": f"{data['home']} vs {data['away']}",
-        "mercado": top["mercado"],
-        "jugada": top["jugada"],
-        "probabilidad": top["prob"],
-        "score": top["score"],
-        "riesgo": top["riesgo"],
-        "cuota_minima": _cuota_val,
-        "cuota": cuota_pinnacle if cuota_pinnacle > 1.0 else _cuota_val,
+    registro = {
+        "fixture_id": str(pick.get("fixture_id")),
+        "fecha": pick.get("fecha", pick.get("fecha_partido", fecha_hoy_peru())),
+        "hora": pick.get("hora", ""),
+        "fecha_partido": pick.get("fecha_partido", fecha_hoy_peru()),
+        "country": pick.get("country", ""),
+        "league": pick.get("league", ""),
+        "partido": pick.get("partido", ""),
+        "mercado": pick.get("mercado", ""),
+        "jugada": pick.get("jugada", ""),
+        "probabilidad": prob_val,
+        "score": pick.get("score", 0),
+        "riesgo": pick.get("riesgo", 0),
+        "cuota_minima": _cuota,
+        "cuota": cuota_pinnacle if cuota_pinnacle > 1.0 else _cuota,
         "cuota_pinnacle": cuota_pinnacle if cuota_pinnacle > 1.0 else None,
-        "bookmaker": top.get("bookmaker", ""),
+        "bookmaker": pick.get("bookmaker", ""),
         "edge": edge_val,
         "edge_categoria": categoria_edge,
         "valor_esperado": ve_val,
         "estado": "pendiente",
         "resultado_real": None,
-        "tipo": "prematch",
-        "timestamp": fecha_hora_peru()
-    })
-
+        "tipo": pick.get("tipo", "prematch"),
+        "minuto_consulta": pick.get("minuto"),
+        "es_seleccion": pick.get("es_seleccion", False),
+        "timestamp": fecha_hora_peru(),
+    }
+    picks.append(registro)
     guardar_json_lista(PICKS_FILE, picks)
+    return True
+
+
+def guardar_pick_automatico(data):
+    """
+    Guarda un pick prematch en picks_guardados.json.
+    Acepta dos formatos y los unifica:
+      A) Formato preparar_analisis: data tiene clave 'recomendaciones'.
+      B) Formato plano (analizar_all): jugada/score/etc en la raiz.
+    Delega la persistencia a guardar_pick_plano para que TODA jugada
+    entre al mismo pipeline (resumen, aprendizaje, metricas, bank).
+    """
+    if not data:
+        return False
+
+    if data.get("recomendaciones"):
+        top = data["recomendaciones"][0]
+        pick = {
+            "fixture_id": str(data.get("fixture_id", "")),
+            "fecha": data.get("fecha", fecha_hoy_peru()),
+            "hora": data.get("hora", ""),
+            "fecha_partido": data.get("fecha_partido", data.get("fecha", fecha_hoy_peru())),
+            "country": data.get("country", ""),
+            "league": data.get("league", ""),
+            "partido": f"{data.get('home','')} vs {data.get('away','')}",
+            "mercado": top.get("mercado", ""),
+            "jugada": top.get("jugada", ""),
+            "prob": top.get("prob", 0),
+            "score": top.get("score", 0),
+            "riesgo": top.get("riesgo", 0),
+            "cuota": top.get("cuota_minima", 0) or top.get("cuota", 0),
+            "cuota_api": top.get("cuota_api"),
+            "bookmaker": top.get("bookmaker", ""),
+            "tipo": data.get("tipo", "prematch"),
+        }
+        return guardar_pick_plano(pick)
+    elif data.get("jugada"):
+        return guardar_pick_plano(data)
+    return False
 
 
 def guardar_pick_live_automatico(fixture_id, home, away, country, league, hora, sugerencia, minuto=None):
@@ -1955,6 +2014,7 @@ def obtener_partidos_configurados():
     ligas = {}
     ligas.update(EUROPA_LEAGUES)
     ligas.update(SUDAMERICA_LEAGUES)
+    ligas.update(OTRAS_LEAGUES)
 
     partidos = []
 
@@ -1996,6 +2056,7 @@ def generar_top(score_minimo=7.5):
     ligas = {}
     ligas.update(EUROPA_LEAGUES)
     ligas.update(SUDAMERICA_LEAGUES)
+    ligas.update(OTRAS_LEAGUES)
 
     today = fecha_hoy_peru()
 
@@ -2045,8 +2106,12 @@ def generar_top(score_minimo=7.5):
             except Exception as e:
                 print("ERROR TOP:", e)
 
+    # PUNTO 2: orden descendente (mejores primero). Antes faltaba reverse=True
     oportunidades.sort(
-        key=lambda x: (x["score"], -x["riesgo"], x["prob"]),
+        key=lambda x: (float(x.get("score", 0) or 0),
+                       -int(x.get("riesgo", 9) or 9),
+                       float(x.get("prob", 0) or 0)),
+        reverse=True,
     )
 
     return oportunidades[:10]
@@ -2135,6 +2200,7 @@ def generar_top_fecha(fecha, score_minimo=7.5):
     ligas = {}
     ligas.update(EUROPA_LEAGUES)
     ligas.update(SUDAMERICA_LEAGUES)
+    ligas.update(OTRAS_LEAGUES)
 
     partidos = obtener_fixtures_por_fecha(ligas, fecha)
 
@@ -3895,6 +3961,7 @@ async def fixtures_manana(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ligas = {}
     ligas.update(EUROPA_LEAGUES)
     ligas.update(SUDAMERICA_LEAGUES)
+    ligas.update(OTRAS_LEAGUES)
 
     fecha = fecha_manana_peru()
 
@@ -4245,7 +4312,8 @@ async def fixtures(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ligas = {}
     ligas.update(EUROPA_LEAGUES)
     ligas.update(SUDAMERICA_LEAGUES)
-    await fixtures_ligas(update, context, ligas, "Europa + Sudamérica")
+    ligas.update(OTRAS_LEAGUES)
+    await fixtures_ligas(update, context, ligas, "Europa + Sudamérica + Otras")
 
 
 async def fixtures_europa(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -4352,8 +4420,9 @@ async def scanear(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ligas = {}
     ligas.update(EUROPA_LEAGUES)
     ligas.update(SUDAMERICA_LEAGUES)
+    ligas.update(OTRAS_LEAGUES)
 
-    await scanear_ligas(update, context, ligas, "Europa + Sudamérica")
+    await scanear_ligas(update, context, ligas, "Europa + Sudamérica + Otras")
 
 
 async def elite(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -4737,14 +4806,133 @@ async def resumentoplive(update: Update, context: ContextTypes.DEFAULT_TYPE):
     with open(_tmp_path("resumen_toplive.pdf"), "rb") as f:
         await update.message.reply_document(f)
 
+def construir_resumen_textual(picks, titulo="Resumen Diario"):
+    """
+    Construye un resumen textual compacto estilo Telegram a partir de una
+    lista de picks. Calcula efectividad, profit/loss simulado, ROI, mejores
+    y peores mercados, y agrega observaciones automaticas.
+    """
+    if not picks:
+        return f"\U0001f4ca *{titulo}*\n\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\nSin picks registrados en el periodo."
+
+    cerrados = [p for p in picks if p.get("estado") in ("acierto", "fallo")
+                or p.get("resultado_real") in ("acierto", "fallo")]
+    pendientes = [p for p in picks if p not in cerrados]
+
+    def _es_acierto(p):
+        return p.get("estado") == "acierto" or p.get("resultado_real") == "acierto"
+
+    aciertos = [p for p in cerrados if _es_acierto(p)]
+    fallos = [p for p in cerrados if not _es_acierto(p)]
+    n_cerr = len(cerrados)
+    efectividad = (len(aciertos) / n_cerr * 100) if n_cerr else 0.0
+
+    # Simulacion profit/loss: stake fijo 1 unidad por pick cerrado
+    profit = 0.0
+    for p in cerrados:
+        cuota = p.get("cuota") or p.get("cuota_pinnacle") or p.get("cuota_minima") or 0
+        try:
+            cuota = float(cuota)
+        except Exception:
+            cuota = 0
+        if _es_acierto(p) and cuota > 1.0:
+            profit += (cuota - 1)
+        else:
+            profit -= 1
+    roi = (profit / n_cerr * 100) if n_cerr else 0.0
+
+    # Mejor y peor mercado por efectividad
+    por_mercado = {}
+    for p in cerrados:
+        mkt = p.get("mercado", "N/D") or "N/D"
+        por_mercado.setdefault(mkt, {"ok": 0, "tot": 0})
+        por_mercado[mkt]["tot"] += 1
+        if _es_acierto(p):
+            por_mercado[mkt]["ok"] += 1
+
+    ranking = []
+    for mkt, d in por_mercado.items():
+        if d["tot"] >= 2:  # minimo 2 picks para ser representativo
+            ranking.append((mkt, d["ok"] / d["tot"] * 100, d["tot"]))
+    ranking.sort(key=lambda x: x[1], reverse=True)
+
+    mejor_mkt = ranking[0] if ranking else None
+    peor_mkt = ranking[-1] if len(ranking) > 1 else None
+
+    # Bank simulado acumulado del mes
+    try:
+        bank_data = _leer_bank_acumulado()
+        bank_actual = bank_data[-1].get("bank") if bank_data else BANK_INICIAL
+    except Exception:
+        bank_actual = BANK_INICIAL
+
+    # Observaciones automaticas
+    obs = []
+    if efectividad >= 75:
+        obs.append("Rendimiento solido, efectividad sobre objetivo.")
+    elif efectividad >= 60:
+        obs.append("Rendimiento aceptable, margen de mejora en seleccion.")
+    elif n_cerr > 0:
+        obs.append("Efectividad baja, revisar criterios de los picks.")
+    if mejor_mkt:
+        obs.append(f"El mercado {mejor_mkt[0]} fue el mas preciso ({mejor_mkt[1]:.0f}%).")
+    if peor_mkt and peor_mkt[1] < 50:
+        obs.append(f"El mercado {peor_mkt[0]} rindio por debajo del 50%, precaucion.")
+    if roi > 0:
+        obs.append(f"ROI positivo: cada unidad apostada genero retorno.")
+    elif n_cerr > 0:
+        obs.append("ROI negativo en el periodo.")
+    if not obs:
+        obs.append("Sin datos suficientes para un analisis detallado.")
+
+    profit_emoji = "\U0001f7e2" if profit >= 0 else "\U0001f534"
+    signo = "+" if profit >= 0 else ""
+
+    lineas = [
+        f"\U0001f4ca *{titulo}*",
+        "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501",
+        f"\U0001f3b2 Total picks: {len(picks)}  (cerrados: {n_cerr} | pendientes: {len(pendientes)})",
+        f"\u2705 Aciertos: {len(aciertos)}",
+        f"\u274c Fallos: {len(fallos)}",
+        f"\U0001f3af Efectividad: {efectividad:.1f}%",
+        f"{profit_emoji} Profit: {signo}{profit:.2f} u",
+        f"\U0001f4c8 ROI: {roi:+.1f}%",
+        f"\U0001f3e6 Bank acumulado: S/ {bank_actual:.2f}",
+        "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501",
+    ]
+    if mejor_mkt:
+        lineas.append(f"\U0001f3c6 Mejor mercado: {mejor_mkt[0]} ({mejor_mkt[1]:.0f}%, {mejor_mkt[2]} picks)")
+    if peor_mkt:
+        lineas.append(f"\U0001f53b Peor mercado: {peor_mkt[0]} ({peor_mkt[1]:.0f}%, {peor_mkt[2]} picks)")
+    lineas.append("")
+    lineas.append("\U0001f9e0 *Analisis:*")
+    for o in obs:
+        lineas.append(f"\u2022 {o}")
+
+    return "\n".join(lineas)
+
+
 async def resumen(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
-    await update.message.reply_text("📄 Generando resumen PDF del día...")
+    await update.message.reply_text("📄 Generando resumen del día...")
 
-    generar_pdf_resumen()
+    # PUNTO 5: resumen textual estilo Telegram (sin abrir archivos)
+    try:
+        picks_hoy = [p for p in leer_json(PICKS_FILE)
+                     if p.get("fecha") == fecha_hoy_peru()
+                     or p.get("fecha_partido") == fecha_hoy_peru()]
+        texto = construir_resumen_textual(picks_hoy, "Resumen Diario")
+        await update.message.reply_text(texto, parse_mode="Markdown")
+    except Exception as e:
+        await update.message.reply_text(f"⚠️ No se pudo generar el resumen textual: {e}")
 
-    with open(_tmp_path("resumen_dia.pdf"), "rb") as f:
-        await update.message.reply_document(f)
+    # PDF como complemento
+    try:
+        generar_pdf_resumen()
+        with open(_tmp_path("resumen_dia.pdf"), "rb") as f:
+            await update.message.reply_document(f)
+    except Exception:
+        pass
 
 
 async def pdf_semana(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -7402,6 +7590,24 @@ async def rendimiento(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ─────────────────────────────────────────────
+# === Corte centralizado de analisis live (Punto 3) ===
+MINUTO_CORTE_LIVE = 80
+
+
+def _live_minuto_valido(minuto):
+    """
+    Regla centralizada: a partir del minuto 80 NO se analizan partidos live.
+    Devuelve True si el partido AUN puede analizarse (<= 80), False si debe
+    descartarse. Aplica a todos los mercados sin excepcion.
+    """
+    try:
+        m = int(minuto)
+    except (ValueError, TypeError):
+        # Minuto desconocido ("?", None): por seguridad, descartar
+        return False
+    return m <= MINUTO_CORTE_LIVE
+
+
 #  /live_all — Analiza todos los partidos en vivo automaticamente
 # ─────────────────────────────────────────────
 
@@ -7463,6 +7669,10 @@ async def live_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
         minuto = m["fixture"]["status"].get("elapsed", "?")
         marcador_h = m["goals"]["home"] or 0
         marcador_a = m["goals"]["away"] or 0
+
+        # PUNTO 3: corte en minuto 80 - descartar partido sin analizarlo
+        if not _live_minuto_valido(minuto):
+            continue
 
         try:
             analisis = analizar_live_fixture(fixture_id)
@@ -7597,13 +7807,14 @@ async def analizar_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     hoy = fecha_hoy_peru()
     await update.message.reply_text(
-        f"🔍 *Analizando TODAS las ligas — {hoy}*\nLigas: {len(EUROPA_LEAGUES)+len(SUDAMERICA_LEAGUES)} | Filtro: score 7.5+\nEsto puede tardar varios minutos...",
+        f"🔍 *Analizando TODAS las ligas — {hoy}*\nLigas: {len(EUROPA_LEAGUES)+len(SUDAMERICA_LEAGUES)+len(OTRAS_LEAGUES)} | Filtro: score 7.5+\nEsto puede tardar varios minutos...",
         parse_mode="Markdown"
     )
 
     ligas_todas = {}
     ligas_todas.update(EUROPA_LEAGUES)
     ligas_todas.update(SUDAMERICA_LEAGUES)
+    ligas_todas.update(OTRAS_LEAGUES)
 
     partidos = obtener_fixtures_por_fecha(ligas_todas, hoy)
 
@@ -7689,7 +7900,7 @@ async def analizar_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     "rank_away": analisis_sel.get("rank_away"),
                     **top,
                 }
-                guardar_pick_automatico(pick_data)
+                guardar_pick_plano(pick_data)
                 picks_encontrados.append(pick_data)
 
                 emoji = "\U0001f30d"
@@ -7724,9 +7935,11 @@ async def analizar_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             else:
                 # Analisis normal de clubes
+                # PUNTO 2: incluir_odds=True para usar cuota Pinnacle real,
+                # igual que /top. Mismo motor de decision para ambos.
                 data = preparar_analisis(
                     fixture_id,
-                    incluir_odds=False,
+                    incluir_odds=True,
                     incluir_contexto=False
                 )
                 analizados += 1
@@ -7758,7 +7971,7 @@ async def analizar_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     "cuota": cuota_real_api if cuota_real_api > 1.0 else _cuota_segura(top),
                     **top,
                 }
-                guardar_pick_automatico(pick_data)
+                guardar_pick_plano(pick_data)
                 picks_encontrados.append(pick_data)
 
                 if score >= 9.0:
