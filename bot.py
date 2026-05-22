@@ -236,6 +236,9 @@ def fecha_hoy_peru():
 def fecha_manana_peru():
     return (fecha_peru_obj() + timedelta(days=1)).strftime("%Y-%m-%d")
 
+def fecha_ayer_peru():
+    return (fecha_peru_obj() - timedelta(days=1)).strftime("%Y-%m-%d")
+
 def fecha_hora_peru():
     return fecha_peru_obj().strftime("%Y-%m-%d %H:%M:%S")
 
@@ -764,6 +767,112 @@ def _normalizar_jugada_para_matching(jugada):
     for suf in sufijos:
         jugada_norm = _re_norm.sub(suf, "", jugada_norm, flags=_re_norm.IGNORECASE).strip()
     return jugada_norm
+
+
+def buscar_cuota_live(fixture_id, jugada):
+    """
+    PUNTO 5: Busca la cuota REAL EN VIVO de una jugada usando el endpoint
+    /odds/live de api-sports. Las cuotas live cambian minuto a minuto, por
+    eso se usa un cache muy corto (45s) en lugar de los 600s del prematch.
+
+    A diferencia de buscar_mejor_cuota (que usa /odds = prematch y devuelve
+    cuotas estaticas de antes del partido), esta refleja el estado actual.
+
+    Devuelve (cuota, casa) o (None, None) si no hay cuota live disponible.
+    """
+    odds = api_get(f"/odds/live?fixture={fixture_id}", use_cache=True, ttl=45)
+    if not odds:
+        return None, None
+
+    PINNACLE_NAMES = {"Pinnacle", "Pinnacle Sports"}
+    CASA_PRIORIDAD = {
+        "Pinnacle": 1, "Pinnacle Sports": 1,
+        "Bet365": 2, "bet365": 2,
+        "William Hill": 3, "Betfair": 4,
+        "888Sport": 5, "Dafabet": 6,
+    }
+
+    jugada_norm = _normalizar_jugada_para_matching(jugada)
+    jugada_l = jugada_norm.lower()
+
+    mejor = None
+    mejor_book = None
+
+    for casa in odds:
+        # /odds/live tiene estructura: cada item con "odds" -> lista de mercados
+        bookmakers = casa.get("bookmakers", [])
+        if not bookmakers and casa.get("odds"):
+            # Estructura alternativa de /odds/live
+            bookmakers = [{"name": "Live", "bets": casa.get("odds", [])}]
+
+        for book in bookmakers:
+            book_name = book.get("name", "Live")
+            for bet in book.get("bets", book.get("odds", [])):
+                bet_name = bet.get("name", "") or bet.get("label", "")
+                for value in bet.get("values", bet.get("odds", [])):
+                    nombre = str(value.get("value", "") or value.get("name", ""))
+                    odd_raw = value.get("odd", value.get("value"))
+                    try:
+                        odd = float(odd_raw)
+                    except (ValueError, TypeError):
+                        continue
+
+                    match = False
+                    # Goles over/under
+                    if "over" in jugada_l and "gol" in jugada_l:
+                        try:
+                            linea = float(jugada_norm.split("Over")[-1].strip().split()[0])
+                        except Exception:
+                            linea = None
+                        if linea is not None and "over" in nombre.lower():
+                            import re as _re_l
+                            mnum = _re_l.search(r"(\d+\.?\d*)", nombre)
+                            if mnum and abs(float(mnum.group(1)) - linea) < 0.01:
+                                match = True
+                    elif "under" in jugada_l and "gol" in jugada_l:
+                        try:
+                            linea = float(jugada_norm.split("Under")[-1].strip().split()[0])
+                        except Exception:
+                            linea = None
+                        if linea is not None and "under" in nombre.lower():
+                            import re as _re_l2
+                            mnum2 = _re_l2.search(r"(\d+\.?\d*)", nombre)
+                            if mnum2 and abs(float(mnum2.group(1)) - linea) < 0.01:
+                                match = True
+                    # Corners / Tarjetas live
+                    elif ("corner" in jugada_l or "tarjeta" in jugada_l) and ("over" in jugada_l or "under" in jugada_l):
+                        tipo = "over" if "over" in jugada_l else "under"
+                        try:
+                            seg = jugada_norm.split("Over" if tipo == "over" else "Under")[-1]
+                            linea = float(seg.strip().split()[0].replace(",", "."))
+                        except Exception:
+                            linea = None
+                        es_mkt = (("corner" in bet_name.lower() and "corner" in jugada_l)
+                                  or (("card" in bet_name.lower() or "booking" in bet_name.lower())
+                                      and "tarjeta" in jugada_l))
+                        if linea is not None and es_mkt and tipo in nombre.lower():
+                            import re as _re_l3
+                            mnum3 = _re_l3.search(r"(\d+\.?\d*)", nombre)
+                            if mnum3 and abs(float(mnum3.group(1)) - linea) < 0.01:
+                                match = True
+                    # Resultado 1X2
+                    elif jugada_l.strip() in ("1", "2", "x"):
+                        mapa = {"1": ("home", "1"), "2": ("away", "2"), "x": ("draw", "x")}
+                        claves = mapa[jugada_l.strip()]
+                        if nombre.lower() in claves:
+                            match = True
+
+                    if match:
+                        prio = CASA_PRIORIDAD.get(book_name, 50)
+                        prio_mejor = CASA_PRIORIDAD.get(mejor_book, 99) if mejor_book else 99
+                        if mejor is None or prio < prio_mejor:
+                            mejor = odd
+                            mejor_book = book_name
+
+    if mejor:
+        book_label = mejor_book if mejor_book in PINNACLE_NAMES else f"{mejor_book} (live)"
+        return round(mejor, 3), book_label
+    return None, None
 
 
 def buscar_mejor_cuota(fixture_id, jugada):
@@ -1329,13 +1438,16 @@ def agregar_mercados_extra_prematch(recomendaciones, home_id, away_id, home_gene
             "Tendencia aceptable de corners entre ambos equipos."
         )
 
+    # PUNTO 4: tope maximo Tarjetas Over 3.5 (el Over 4.5 se queda corto
+    # con demasiada frecuencia). Aunque el promedio combinado sea alto,
+    # se sugiere como mucho la linea 3.5, que tiene mayor tasa de acierto.
     if cards_total >= 5:
         add_extra(
-            "Tarjetas Over 4.5",
-            76,
-            7.8,
-            3.4,
-            "Promedio alto de tarjetas y posible partido friccionado."
+            "Tarjetas Over 3.5",
+            80,
+            8.0,
+            3.2,
+            "Promedio alto de tarjetas y posible partido friccionado (linea conservadora 3.5)."
         )
     elif cards_total >= 4:
         add_extra(
@@ -1598,6 +1710,17 @@ def guardar_pick_live_automatico(fixture_id, home, away, country, league, hora, 
             p["probabilidad"] = sugerencia["prob"]
             p["score"] = sugerencia["score"]
             p["riesgo"] = sugerencia["riesgo"]
+            # PUNTO 5: refrescar la cuota live si llego una nueva
+            _nueva_cuota = sugerencia.get("cuota_api") or sugerencia.get("cuota", 0)
+            try:
+                _nueva_cuota = float(_nueva_cuota)
+            except (ValueError, TypeError):
+                _nueva_cuota = 0.0
+            if _nueva_cuota > 1.0:
+                p["cuota"] = _nueva_cuota
+                p["cuota_api"] = sugerencia.get("cuota_api")
+                p["bookmaker"] = sugerencia.get("bookmaker", p.get("bookmaker", ""))
+            guardar_json_lista(PICKS_FILE, picks)
             return
 
     _cuota_live = sugerencia.get("cuota", 0) or sugerencia.get("cuota_minima", 0) or 0
@@ -1621,6 +1744,9 @@ def guardar_pick_live_automatico(fixture_id, home, away, country, league, hora, 
         "riesgo": sugerencia["riesgo"],
         "cuota_minima": _cuota_live,
         "cuota": _cuota_live,
+        "cuota_api": sugerencia.get("cuota_api"),
+        "cuota_pinnacle": sugerencia.get("cuota_api") if sugerencia.get("bookmaker", "").startswith("Pinnacle") else None,
+        "bookmaker": sugerencia.get("bookmaker", ""),
         "estado": "pendiente",
         "resultado_real": None,
         "tipo": "live",
@@ -2554,23 +2680,23 @@ def sugerir_live_tarjetas(elapsed, total_yellow, total_red, marcador_apretado):
     if elapsed <= 35 and total_cards >= 2 and marcador_apretado:
         sugerencias.append({
             "mercado": "Tarjetas",
-            "jugada": "Tarjetas Over 4.5",
-            "prob": 74,
-            "score": 7.4,
-            "riesgo": 4.0,
-            "cuota": 1.70,
-            "motivo": "Partido friccionado temprano y marcador competitivo."
+            "jugada": "Tarjetas Over 3.5",
+            "prob": 78,
+            "score": 7.5,
+            "riesgo": 3.5,
+            "cuota": 1.55,
+            "motivo": "Partido friccionado temprano y marcador competitivo (linea conservadora 3.5)."
         })
 
     elif elapsed <= 60 and total_cards >= 3:
         sugerencias.append({
             "mercado": "Tarjetas",
-            "jugada": "Tarjetas Over 4.5",
-            "prob": 76,
-            "score": 7.6,
-            "riesgo": 3.8,
-            "cuota": 1.65,
-            "motivo": "Alta frecuencia de tarjetas antes del tramo final."
+            "jugada": "Tarjetas Over 3.5",
+            "prob": 80,
+            "score": 7.7,
+            "riesgo": 3.3,
+            "cuota": 1.45,
+            "motivo": "Alta frecuencia de tarjetas antes del tramo final (linea conservadora 3.5)."
         })
 
     return sugerencias
@@ -3974,33 +4100,6 @@ async def fixtures_manana(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(texto[:3900])
 
 
-async def fixtures_europa_manana(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("📅 Buscando fixtures Europa de mañana...")
-
-    fecha = fecha_manana_peru()
-
-    texto = texto_fixtures_fecha(
-        "FIXTURES EUROPA MAÑANA",
-        EUROPA_LEAGUES,
-        fecha
-    )
-
-    await update.message.reply_text(texto[:3900])
-
-
-async def fixtures_sudamerica_manana(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("📅 Buscando fixtures Sudamérica de mañana...")
-
-    fecha = fecha_manana_peru()
-
-    texto = texto_fixtures_fecha(
-        "FIXTURES SUDAMÉRICA MAÑANA",
-        SUDAMERICA_LEAGUES,
-        fecha
-    )
-
-    await update.message.reply_text(texto[:3900])
-
 async def top_manana(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("🏆 Buscando TOP prematch de mañana...")
 
@@ -4055,19 +4154,13 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "━━━━━━━━━━\n"
         "📋 *FIXTURES*\n"
         "/fixtures — Partidos de hoy (todas las ligas)\n"
-        "/fixtures_europa — Solo Europa\n"
-        "/fixtures_sudamerica — Solo Sudamerica\n"
         "/fixtures_manana — Manana todas\n"
-        "/fixtures_europa_manana — Manana Europa\n"
-        "/fixtures_sudamerica_manana — Manana Sudamerica\n"
         "━━━━━━━━━━\n"
         "🔍 *ANALISIS*\n"
         "/analizar_all — Analiza TODAS las ligas automaticamente\n"
         "/analizar ID — Analiza un partido especifico\n"
         "/detalle ID — Detalle completo de un partido\n"
         "/scanear — Escanea todas las ligas\n"
-        "/scanear_europa — Escanea Europa\n"
-        "/scanear_sudamerica — Escanea Sudamerica\n"
         "━━━━━━━━━━\n"
         "🎯 *PICKS PREMATCH*\n"
         "/top — Mejores picks de hoy (score 7.5+)\n"
@@ -4078,8 +4171,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "🔴 *PICKS LIVE*\n"
         "/live_all — Analiza TODOS los partidos live auto\n"
         "/live ID — Analisis de un partido live por ID\n"
-        "/toplive — Mejores picks en vivo\n"
-        "/elitelive — Picks elite en vivo\n"
         "/alertas_on — Activa alertas automaticas live\n"
         "/alertas_off — Desactiva alertas\n"
         "━━━━━━━━━━\n"
@@ -4099,6 +4190,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "━━━━━━━━━━\n"
         "📊 *REPORTES PDF*\n"
         "/resumen — Resumen del dia (todos los picks)\n"
+        "/resumen_ayer — Resumen de ayer + combinadas\n"
         "/resumen_prematch — Solo picks prematch de hoy\n"
         "/resumen_live — Solo picks live de hoy\n"
         "/resumen_combinadas — Solo combinadas de hoy\n"
@@ -4316,14 +4408,6 @@ async def fixtures(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await fixtures_ligas(update, context, ligas, "Europa + Sudamérica + Otras")
 
 
-async def fixtures_europa(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await fixtures_ligas(update, context, EUROPA_LEAGUES, "Europa")
-
-
-async def fixtures_sudamerica(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await fixtures_ligas(update, context, SUDAMERICA_LEAGUES, "Sudamérica")
-
-
 async def scanear_ligas(update: Update, context: ContextTypes.DEFAULT_TYPE, leagues, titulo):
     await update.message.reply_text(f"🔎 Escaneando {titulo}...")
 
@@ -4406,14 +4490,6 @@ async def scanear_ligas(update: Update, context: ContextTypes.DEFAULT_TYPE, leag
     texto += "\n💾 Picks guardados automáticamente para tracking."
 
     await update.message.reply_text(texto[:3900])
-
-
-async def scanear_europa(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await scanear_ligas(update, context, EUROPA_LEAGUES, "Europa")
-
-
-async def scanear_sudamerica(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await scanear_ligas(update, context, SUDAMERICA_LEAGUES, "Sudamérica")
 
 
 async def scanear(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -4513,129 +4589,6 @@ async def top(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
     texto += "\n💾 Picks TOP guardados automáticamente para tracking."
-
-    await update.message.reply_text(texto[:3900])
-
-
-async def live(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.args:
-        await update.message.reply_text(listar_live())
-        return
-
-    analisis = analizar_live_fixture(context.args[0])
-
-    if not analisis:
-        await update.message.reply_text("❌ No encontré el partido.")
-        return
-
-    await update.message.reply_text(analisis["texto"])
-
-
-async def elitelive(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("🏆 Buscando picks ÉLITE LIVE...")
-
-    fixtures = api_get("/fixtures?live=all", use_cache=False)
-    oportunidades = []
-
-    for m in fixtures:
-        fixture_id = str(m["fixture"]["id"])
-        analisis = analizar_live_fixture(fixture_id)
-
-        if not analisis:
-            continue
-
-        if analisis["score_live"] >= 9 and analisis["sugerencias"]:
-            oportunidades.append({
-                "fixture_id": fixture_id,
-                "score": analisis["score_live"],
-                "texto": analisis["texto"]
-            })
-
-    oportunidades.sort(key=lambda x: x["score"], reverse=True)
-
-    if not oportunidades:
-        await update.message.reply_text("❌ No encontré picks ÉLITE LIVE score 9+.")
-        return
-
-    texto = "🏆 PICKS ÉLITE LIVE\n"
-
-    for op in oportunidades[:5]:
-        texto += f"\n⭐ Score {op['score']}/10\n{op['texto']}\n"
-
-    await update.message.reply_text(texto[:3900])
-
-
-async def toplive(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    fixtures = api_get("/fixtures?live=all", use_cache=False)
-    oportunidades = []
-
-    for m in fixtures:
-        fixture_id = str(m["fixture"]["id"])
-        analisis = analizar_live_fixture(fixture_id)
-
-        if not analisis:
-            continue
-
-        if analisis["score_live"] >= 6 and analisis["sugerencias"]:
-            mejor = analisis["sugerencias"][0]
-
-            oportunidades.append({
-                "id": fixture_id,
-                "fixture_id": fixture_id,
-                "home": m["teams"]["home"]["name"],
-                "away": m["teams"]["away"]["name"],
-                "league": m["league"]["name"],
-                "country": m["league"].get("country", ""),
-                "minute": m["fixture"]["status"].get("elapsed", ""),
-                "score": analisis["score_live"],
-                "texto": analisis["texto"],
-                "mercado": mejor.get("mercado", ""),
-                "jugada": mejor.get("jugada", ""),
-                "prob": mejor.get("prob", "N/D"),
-                "riesgo": mejor.get("riesgo", "N/D"),
-                "cuota_minima": mejor.get("cuota", "N/D"),
-                "cuota": mejor.get("cuota", "N/D"),
-                "motivo": mejor.get("motivo", "")
-            })
-
-    oportunidades.sort(key=lambda x: x["score"], reverse=True)
-
-    if not oportunidades:
-        await update.message.reply_text("❌ No hay oportunidades live fuertes.")
-        return
-
-    for o in oportunidades:
-        data_guardar = {
-            "fixture_id": str(o["fixture_id"]),
-            "fuente": "toplive",
-            "tipo": "live",
-            "fecha": fecha_hoy_peru(),
-            "hora": f"Min {o.get('minute', '')}",
-            "country": o.get("country", ""),
-            "league": o.get("league", ""),
-            "home": o["home"],
-            "away": o["away"],
-            "partido": f"{o['home']} vs {o['away']}",
-            "recomendaciones": [{
-                "mercado": o.get("mercado", ""),
-                "jugada": o.get("jugada", ""),
-                "prob": o.get("prob", "N/D"),
-                "score": o.get("score", "N/D"),
-                "riesgo": o.get("riesgo", "N/D"),
-                "cuota_minima": o.get("cuota_minima", "N/D"),
-                "cuota": o.get("cuota", "N/D"),
-                "motivo": o.get("motivo", "")
-            }]
-        }
-
-        guardar_pick_automatico(data_guardar)
-
-    texto = "🔥 TOP LIVE\n"
-
-    for op in oportunidades[:3]:
-        texto += f"\n⭐ Score {op['score']}/10\n{op['texto']}\n"
-
-    texto += "\n💾 Picks TOP LIVE guardados automáticamente para tracking."
 
     await update.message.reply_text(texto[:3900])
 
@@ -4933,6 +4886,83 @@ async def resumen(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_document(f)
     except Exception:
         pass
+
+
+def _resumen_combinadas_texto(fecha):
+    """
+    Construye un bloque textual con el resumen de combinadas de una fecha.
+    Devuelve string formateado para Telegram.
+    """
+    try:
+        combinadas = leer_json(COMBINADAS_FILE)
+    except Exception:
+        return ""
+
+    combs = [c for c in combinadas
+             if (c.get("fecha", "") == fecha)
+             and not c.get("sin_combinada")
+             and c.get("picks")]
+
+    if not combs:
+        return "\U0001f3ab *Combinadas:* sin combinadas registradas ese dia."
+
+    cerradas = [c for c in combs if c.get("estado", "").lower() in ("acierto", "fallo")]
+    aciertos = [c for c in cerradas if c.get("estado", "").lower() == "acierto"]
+    fallos = [c for c in cerradas if c.get("estado", "").lower() == "fallo"]
+    pendientes = [c for c in combs if c not in cerradas]
+
+    ef = (len(aciertos) / len(cerradas) * 100) if cerradas else 0.0
+
+    # Simulacion de bank: stake 10% por combinada
+    profit = 0.0
+    for c in cerradas:
+        cuota = float(c.get("cuota_combinada", 0) or 0)
+        stake = 1.0  # 1 unidad por ticket
+        if c.get("estado", "").lower() == "acierto" and cuota > 1.0:
+            profit += stake * (cuota - 1)
+        else:
+            profit -= stake
+    roi = (profit / len(cerradas) * 100) if cerradas else 0.0
+
+    signo = "+" if profit >= 0 else ""
+    emoji_p = "\U0001f7e2" if profit >= 0 else "\U0001f534"
+
+    lineas = [
+        "\U0001f3ab *Combinadas del dia:*",
+        f"  Total: {len(combs)}  (cerradas: {len(cerradas)} | pendientes: {len(pendientes)})",
+        f"  \u2705 Aciertos: {len(aciertos)}   \u274c Fallos: {len(fallos)}",
+        f"  \U0001f3af Efectividad: {ef:.1f}%",
+        f"  {emoji_p} Profit: {signo}{profit:.2f} u   \U0001f4c8 ROI: {roi:+.1f}%",
+    ]
+    return "\n".join(lineas)
+
+
+async def resumen_ayer(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Comando /resumen_ayer — resumen del dia anterior, incluye combinadas."""
+    ayer = fecha_ayer_peru()
+    await update.message.reply_text(f"\U0001f4c5 Generando resumen de ayer ({ayer})...")
+
+    # Actualizar resultados antes de resumir
+    try:
+        actualizar_resultados_automaticos()
+        _actualizar_resultado_combinada()
+    except Exception:
+        pass
+
+    # Resumen de picks de ayer
+    try:
+        picks_ayer = [p for p in leer_json(PICKS_FILE)
+                      if p.get("fecha") == ayer
+                      or p.get("fecha_partido") == ayer]
+        texto = construir_resumen_textual(picks_ayer, f"Resumen de Ayer — {ayer}")
+    except Exception as e:
+        texto = f"\u26a0\ufe0f No se pudo generar el resumen de picks: {e}"
+
+    # Bloque de combinadas de ayer
+    bloque_comb = _resumen_combinadas_texto(ayer)
+
+    mensaje = texto + "\n\n" + bloque_comb
+    await update.message.reply_text(mensaje, parse_mode="Markdown")
 
 
 async def pdf_semana(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -6872,6 +6902,8 @@ def generar_pdf_rendimiento(datos):
                             topMargin=1.5*cm, bottomMargin=1.5*cm)
     styles = getSampleStyleSheet()
     story = []
+    # PUNTO 2 FIX: lista de PNG temporales a borrar DESPUES de doc.build()
+    _tmps_pendientes = []
 
     def titulo(txt, size=14):
         s = styles["Heading1"].clone("t")
@@ -7356,12 +7388,10 @@ def generar_pdf_rendimiento(datos):
                           == f"{datos['anio']}-{datos['mes']:02d}"]
         if picks_mes_rend:
             tmps_rend = _insertar_graficos_pdf(story, picks_mes_rend, prefijo="rend", styles=styles)
-            for tmp in tmps_rend:
-                try:
-                    if tmp and os.path.exists(tmp):
-                        os.remove(tmp)
-                except Exception:
-                    pass
+            # PUNTO 2 FIX: NO borrar los PNG aqui. ReportLab los lee recien
+            # en doc.build(). Se acumulan en _tmps_pendientes y se borran
+            # despues del build.
+            _tmps_pendientes.extend(tmps_rend)
     except Exception:
         pass
 
@@ -7414,7 +7444,9 @@ def generar_pdf_rendimiento(datos):
 
     doc.build(story)
 
-    for tmp in [img_bank, img_ef]:
+    # PUNTO 2 FIX: borrar TODOS los temporales DESPUES del build,
+    # cuando ReportLab ya leyo las imagenes.
+    for tmp in [img_bank, img_ef] + _tmps_pendientes:
         try:
             if tmp and os.path.exists(tmp):
                 os.remove(tmp)
@@ -7693,6 +7725,18 @@ async def live_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             # Tomar la mejor sugerencia
             mejor = analisis["sugerencias"][0]
+
+            # PUNTO 5: refrescar la cuota con la cuota REAL EN VIVO.
+            # analizar_live_fixture trae una cuota estimada/estatica;
+            # /odds/live da la cuota actual segun el minuto del partido.
+            try:
+                cuota_live, book_live = buscar_cuota_live(fixture_id, mejor.get("jugada", ""))
+                if cuota_live and cuota_live > 1.0:
+                    mejor["cuota"] = cuota_live
+                    mejor["cuota_api"] = cuota_live
+                    mejor["bookmaker"] = book_live
+            except Exception:
+                pass
 
             # Guardar pick live
             guardar_pick_live_automatico(
@@ -11063,23 +11107,15 @@ app.add_handler(CommandHandler("analizar", analizar))
 app.add_handler(CommandHandler("detalle", detalle))
 app.add_handler(CommandHandler("top", top))
 app.add_handler(CommandHandler("top_manana", top_manana))
-app.add_handler(CommandHandler("toplive", toplive))
 app.add_handler(CommandHandler("elite", elite))
-app.add_handler(CommandHandler("elitelive", elitelive))
 app.add_handler(CommandHandler("elite_manana", elite_manana))
 app.add_handler(CommandHandler("fixtures", fixtures))
-app.add_handler(CommandHandler("fixtures_europa", fixtures_europa))
-app.add_handler(CommandHandler("fixtures_sudamerica", fixtures_sudamerica))
 app.add_handler(CommandHandler("fixtures_manana", fixtures_manana))
-app.add_handler(CommandHandler("fixtures_europa_manana", fixtures_europa_manana))
-app.add_handler(CommandHandler("fixtures_sudamerica_manana", fixtures_sudamerica_manana))
 app.add_handler(CommandHandler("scanear", scanear))
-app.add_handler(CommandHandler("scanear_europa", scanear_europa))
-app.add_handler(CommandHandler("scanear_sudamerica", scanear_sudamerica))
-app.add_handler(CommandHandler("live", live))
 app.add_handler(CommandHandler("alertas_on", alertas_on))
 app.add_handler(CommandHandler("alertas_off", alertas_off))
 app.add_handler(CommandHandler("resumen", resumen))
+app.add_handler(CommandHandler("resumen_ayer", resumen_ayer))
 app.add_handler(CommandHandler("resumentop", resumentop))
 app.add_handler(CommandHandler("resumentoplive", resumentoplive))
 app.add_handler(CommandHandler("pdf_semana", pdf_semana))
@@ -11119,28 +11155,20 @@ async def _set_commands(app_instance):
         BotCommand("analizar",                  "Analiza partido por ID"),
         BotCommand("detalle",                   "Detalle completo partido"),
         BotCommand("fixtures",                  "Partidos hoy todas ligas"),
-        BotCommand("fixtures_europa",           "Partidos Europa hoy"),
-        BotCommand("fixtures_sudamerica",       "Partidos Sudamerica hoy"),
         BotCommand("fixtures_manana",           "Partidos manana"),
-        BotCommand("fixtures_europa_manana",    "Europa manana"),
-        BotCommand("fixtures_sudamerica_manana","Sudamerica manana"),
         BotCommand("top",                       "Picks TOP hoy 7.5+"),
         BotCommand("elite",                     "Picks ELITE hoy 9.0+"),
         BotCommand("top_manana",                "Picks TOP manana"),
         BotCommand("elite_manana",              "Picks ELITE manana"),
-        BotCommand("toplive",                   "Picks TOP live"),
-        BotCommand("elitelive",                 "Picks ELITE live"),
         BotCommand("live_all",                  "Analiza TODOS los partidos live"),
-        BotCommand("live",                      "Analisis de un partido live por ID"),
         BotCommand("alertas_on",                "Activar alertas live"),
         BotCommand("alertas_off",               "Desactivar alertas"),
         BotCommand("combinada",                 "Combinada optima prematch del dia"),
         BotCommand("combinada_live",            "Combinada optima con picks live"),
         BotCommand("combinada_mixta",           "Combinada mixta prematch + live"),
         BotCommand("scanear",                   "Escanea todas las ligas"),
-        BotCommand("scanear_europa",            "Escanea Europa"),
-        BotCommand("scanear_sudamerica",        "Escanea Sudamerica"),
         BotCommand("resumen",                   "Resumen PDF del dia"),
+        BotCommand("resumen_ayer",              "Resumen de ayer + combinadas"),
         BotCommand("resumentop",                "PDF picks prematch"),
         BotCommand("resumentoplive",            "PDF picks live"),
         BotCommand("pdf_semana",                "Reporte semanal PDF"),
@@ -11160,18 +11188,11 @@ async def _registrar_comandos_bot(context):
         BotCommand("analizar",                   "Analiza partido por ID"),
         BotCommand("detalle",                    "Detalle completo partido"),
         BotCommand("fixtures",                   "Partidos hoy todas ligas"),
-        BotCommand("fixtures_europa",            "Partidos Europa hoy"),
-        BotCommand("fixtures_sudamerica",        "Partidos Sudamerica hoy"),
         BotCommand("fixtures_manana",            "Partidos manana"),
-        BotCommand("fixtures_europa_manana",     "Europa manana"),
-        BotCommand("fixtures_sudamerica_manana", "Sudamerica manana"),
         BotCommand("top",                        "Picks TOP hoy 7.5+"),
         BotCommand("elite",                      "Picks ELITE hoy 9.0+"),
         BotCommand("top_manana",                 "Picks TOP manana"),
         BotCommand("elite_manana",               "Picks ELITE manana"),
-        BotCommand("toplive",                    "Picks TOP live"),
-        BotCommand("elitelive",                  "Picks ELITE live"),
-        BotCommand("live",                       "Analisis de un partido live"),
         BotCommand("live_all",                   "Analiza TODOS los partidos live"),
         BotCommand("alertas_on",                 "Activar alertas live"),
         BotCommand("alertas_off",                "Desactivar alertas"),
@@ -11188,9 +11209,8 @@ async def _registrar_comandos_bot(context):
         BotCommand("comb5_live",                 "Combinada 5x+ live"),
         BotCommand("comb5_mixta",                "Combinada 5x+ mixta"),
         BotCommand("scanear",                    "Escanea todas las ligas"),
-        BotCommand("scanear_europa",             "Escanea Europa"),
-        BotCommand("scanear_sudamerica",         "Escanea Sudamerica"),
         BotCommand("resumen",                    "Resumen PDF del dia"),
+        BotCommand("resumen_ayer",               "Resumen de ayer + combinadas"),
         BotCommand("resumen_prematch",           "Resumen diario solo prematch"),
         BotCommand("resumen_live",               "Resumen diario solo live"),
         BotCommand("resumen_combinadas",         "Resumen diario de combinadas"),
