@@ -107,6 +107,159 @@ OTRAS_LEAGUES = {
 }
 
 
+# ══════════════════════════════════════════════════════════════════════
+# RECALIBRACION V14 — capa de correccion basada en datos reales
+# (279-491 picks cerrados, periodo 16-23 mayo 2026).
+# El motor de scoring usa reglas fijas; estas funciones corrigen score y
+# probabilidad para que reflejen la efectividad REAL medida, no la teorica.
+# ══════════════════════════════════════════════════════════════════════
+
+# Cuota minima exigida a cualquier pick individual. Por debajo de esto el
+# pick no es rentable aunque acierte: 80% de acierto necesita >=1.25 solo
+# para break-even; 1.50 da colchon ante error de calibracion.
+CUOTA_MINIMA_PICK = 1.50
+
+# Cuota minima de cada eslabon dentro de una combinada (coherente con el
+# filtro de picks individuales).
+CUOTA_MINIMA_ESLABON = 1.50
+
+# Rango de cuota total aceptable para una combinada.
+CUOTA_COMBINADA_MIN = 2.50
+CUOTA_COMBINADA_MAX = 4.50
+
+# Umbrales minimos por eslabon de combinada (sobre valores recalibrados).
+COMB_PROB_MIN = 80.0
+COMB_SCORE_MIN = 7.5
+# Over 1.5 es el eslabon que mas rompe combinadas (0-0 / 1-0). Se le exige
+# un score recalibrado mas alto que al resto.
+COMB_SCORE_MIN_OVER15 = 8.0
+
+# Multiplicador de score por liga. Medido sobre efectividad real por liga.
+# Ligas con muestra < 10 picks quedan neutras (1.00) por falta de datos.
+MULTIPLICADOR_LIGA = {
+    "Premier League": 1.05,   # 87.9% (n=33)
+    "La Liga": 0.70,          # 42.1% (n=19)
+    "LaLiga": 0.70,           # alias del mismo torneo
+    "Süper Lig": 0.80,        # 50.0% (n=12)
+    "Super Lig": 0.80,        # alias sin diacritico
+    "2. Bundesliga": 0.88,    # 63.2% (n=19)
+    "Bundesliga 2": 0.88,     # alias
+    "Ligue 1": 0.88,          # 63.2% (n=19)
+    "Serie A": 0.92,          # 67.7% (n=31)
+    "Serie A Italia": 0.92,   # alias
+}
+
+
+def recalibrar_probabilidad(prob):
+    """
+    Corrige la probabilidad declarada hacia la efectividad real medida.
+    La banda 75-79% concentraba el 64% de los picks y rendia solo 62%.
+    """
+    try:
+        prob = float(prob)
+    except (ValueError, TypeError):
+        return prob
+    if prob >= 90:
+        return 94.0
+    if prob >= 85:
+        return 88.0
+    if prob >= 80:
+        return 78.0          # tramo interpolado (sin datos directos)
+    if prob >= 75:
+        return 62.0          # banda peor calibrada: -14 pp reales
+    if prob >= 70:
+        return 88.0          # banda 70-74 rinde 91% real
+    return prob
+
+
+def recalibrar_score(score):
+    """
+    Re-mapea el score a la efectividad real. El score original no ordena
+    (7.0-7.4 rinde mas que 8.0-8.4); esta tabla lo corrige.
+    """
+    try:
+        score = float(score)
+    except (ValueError, TypeError):
+        return score
+    if score >= 9.5:
+        return 9.0
+    if score >= 9.0:
+        return 7.5
+    if score >= 8.5:
+        return 7.2           # tramo sin datos: interpolado conservador
+    if score >= 8.0:
+        return 6.8
+    if score >= 7.5:
+        return 6.7
+    if score >= 7.0:
+        return 8.5           # tramo 7.0-7.4 rinde 85% real
+    return 5.0
+
+
+def multiplicador_liga(liga):
+    """Retorna el factor de ajuste de score para una liga dada."""
+    if not liga:
+        return 1.0
+    return MULTIPLICADOR_LIGA.get(liga, 1.0)
+
+
+def aplicar_recalibracion(rec, liga=None):
+    """
+    Aplica la recalibracion completa a una recomendacion (dict con claves
+    prob/score). Guarda los valores originales y deja los recalibrados como
+    los oficiales. Idempotente: si ya fue recalibrada, no la altera.
+    """
+    if not rec or rec.get("_recalibrado"):
+        return rec
+
+    prob_orig = rec.get("prob", rec.get("probabilidad"))
+    score_orig = rec.get("score")
+
+    if prob_orig is not None:
+        prob_nueva = recalibrar_probabilidad(prob_orig)
+        rec["prob_original"] = prob_orig
+        rec["prob"] = prob_nueva
+        if "probabilidad" in rec:
+            rec["probabilidad"] = prob_nueva
+
+    if score_orig is not None:
+        score_nuevo = recalibrar_score(score_orig)
+        score_nuevo = round(score_nuevo * multiplicador_liga(liga), 1)
+        score_nuevo = clamp(score_nuevo, 0, 10)
+        rec["score_original"] = score_orig
+        rec["score"] = score_nuevo
+        # La etiqueta de confianza debe reflejar el score recalibrado.
+        if "confianza" in rec:
+            rec["confianza"] = etiqueta_confianza(score_nuevo)
+
+    # La cuota minima teorica depende de la probabilidad: si la prob
+    # cambio al recalibrar, se recalcula para que sea coherente.
+    if rec.get("prob") is not None and rec.get("riesgo") is not None:
+        nueva_cm = cuota_minima(rec["prob"], rec["riesgo"])
+        if nueva_cm:
+            rec["cuota_minima"] = nueva_cm
+
+    rec["_recalibrado"] = True
+    return rec
+
+
+def cuota_pick_suficiente(rec):
+    """
+    True si el pick supera la cuota minima. Usa la mejor cuota disponible
+    (API/Pinnacle si existe, si no la cuota minima calculada).
+    Si no hay ninguna cuota, se rechaza por prudencia.
+    """
+    cuota = (rec.get("cuota_api")
+             or rec.get("cuota")
+             or rec.get("cuota_minima")
+             or 0)
+    try:
+        cuota = float(cuota)
+    except (ValueError, TypeError):
+        return False
+    return cuota >= CUOTA_MINIMA_PICK
+
+
 def api_get(endpoint, use_cache=True, ttl=CACHE_TTL):
     now = time.time()
 
@@ -627,27 +780,10 @@ def obtener_recomendaciones(home_general, away_general, home_home, away_away):
             score_over25
         )
 
-    score_btts = 0
-
-    if btts >= 0.70:
-        score_btts += 5
-    elif btts >= 0.60:
-        score_btts += 4
-
-    if base_home["gf_prom"] >= 1.0 and base_away["gf_prom"] >= 1.0:
-        score_btts += 3
-
-    if base_home["gc_prom"] >= 0.8 and base_away["gc_prom"] >= 0.8:
-        score_btts += 2
-
-    if score_btts >= 7:
-        prob = min(81, 56 + score_btts * 2)
-        add_pick(
-            "Ambos marcan - Sí",
-            prob,
-            "Ambos equipos tienen tendencia a marcar y también conceden ocasiones.",
-            score_btts
-        )
+    # BTTS (Ambos marcan) ELIMINADO de la generacion: efectividad real
+    # 41.6% (101 picks). La variable `btts` se conserva mas arriba porque
+    # alimenta los scores de Under y Over 2.5; solo se elimina la emision
+    # del pick. BTTS tambien sigue excluido de combinadas y alertas.
 
     recomendaciones.sort(key=lambda x: (x["score"], x["prob"]), reverse=True)
     return recomendaciones
@@ -1403,10 +1539,8 @@ def agregar_mercados_extra_prematch(recomendaciones, home_id, away_id, home_gene
     if not home_m or not away_m:
         return recomendaciones
 
-    corners_total = home_m["corners_prom"] + away_m["corners_prom"]
+    # corners/shots/sog ya no se usan aqui: corners prematch fue eliminado.
     cards_total = home_m["cards_prom"] + away_m["cards_prom"]
-    shots_total = home_m["shots_prom"] + away_m["shots_prom"]
-    sog_total = home_m["sog_prom"] + away_m["sog_prom"]
 
     def add_extra(jugada, prob, score, riesgo, motivo):
         recomendaciones.append({
@@ -1421,22 +1555,9 @@ def agregar_mercados_extra_prematch(recomendaciones, home_id, away_id, home_gene
             "cuota_minima": cuota_minima(prob, riesgo),
         })
 
-    if corners_total >= 9:
-        add_extra(
-            "Corners Over 8.5",
-            77,
-            8.0,
-            3.0,
-            "Promedio combinado alto de corners y ritmo ofensivo favorable."
-        )
-    elif corners_total >= 8:
-        add_extra(
-            "Corners Over 7.5",
-            75,
-            7.4,
-            3.5,
-            "Tendencia aceptable de corners entre ambos equipos."
-        )
+    # CORNERS PREMATCH ELIMINADO: efectividad real 33-40% (9-15 picks)
+    # frente a 79.5% en corners live. No se sugieren corners en prematch;
+    # los corners live (calcular_corners_avanzado con elapsed>0) se mantienen.
 
     # PUNTO 4: tope maximo Tarjetas Over 3.5 (el Over 4.5 se queda corto
     # con demasiada frecuencia). Aunque el promedio combinado sea alto,
@@ -1458,23 +1579,8 @@ def agregar_mercados_extra_prematch(recomendaciones, home_id, away_id, home_gene
             "Tendencia moderada-alta de tarjetas."
         )
 
-    if home_general and away_general:
-        btts_base = (home_general["btts"] + away_general["btts"]) / 2
-
-        if (
-            btts_base >= 0.60
-            and home_general["gf_prom"] >= 1
-            and away_general["gf_prom"] >= 1
-            and home_general["gc_prom"] >= 0.8
-            and away_general["gc_prom"] >= 0.8
-        ):
-            add_extra(
-                "Ambos marcan - Sí",
-                76,
-                7.8,
-                3.8,
-                "Ambos equipos tienen capacidad de marcar y también conceden goles."
-            )
+    # BTTS PREMATCH ELIMINADO: efectividad real 41.6%. Tambien excluido de
+    # combinadas y alertas de edge.
 
     recomendaciones.sort(key=lambda x: (x["score"], x["prob"]), reverse=True)
     return recomendaciones
@@ -1566,6 +1672,26 @@ def preparar_analisis(fixture_id, incluir_odds=False, incluir_contexto=False):
             fixture_id,
             recomendaciones
         )
+
+    # ── RECALIBRACION V14 ────────────────────────────────────────────
+    # Se aplica DESPUES de enriquecer con odds para que el filtro de
+    # cuota use la cuota real de mercado cuando exista.
+    for r in recomendaciones:
+        aplicar_recalibracion(r, liga=league)
+
+    # Filtro de cuota minima: descarta picks que no pueden ser rentables.
+    # Si no se consultaron odds, cuota_minima (teorica) sirve de proxy.
+    recomendaciones = [
+        r for r in recomendaciones if cuota_pick_suficiente(r)
+    ]
+
+    # Reordenar tras recalibrar: la PROBABILIDAD recalibrada manda como
+    # clave primaria (discrimina mejor que el score), score como desempate.
+    recomendaciones.sort(
+        key=lambda x: (float(x.get("prob", 0) or 0),
+                       float(x.get("score", 0) or 0)),
+        reverse=True,
+    )
 
     return {
         "fixture_id": str(fixture_id),
@@ -5426,7 +5552,7 @@ def _analizar_tendencias_aprendizaje():
 
     ligas = {}
     for d in cerrados:
-        lg = d.get("liga", "Desconocida")
+        lg = d.get("liga") or d.get("league") or "Desconocida"
         ligas.setdefault(lg, []).append(d)
     ligas_ef = {lg: {"efectividad": efectividad_grupo(v), "total": len(v)}
                 for lg, v in ligas.items() if len(v) >= 3}
@@ -5649,26 +5775,72 @@ def _resetear_bank_acumulado_fin_mes():
         pass
 
 
+def _prob_recalibrada_pick(p):
+    """
+    Probabilidad recalibrada de un pick guardado. Si el pick ya fue
+    recalibrado en origen, su 'probabilidad' ya es la corregida; si no,
+    se recalibra aqui. Idempotente gracias a recalibrar_probabilidad.
+    """
+    if p.get("_recalibrado"):
+        base = p.get("probabilidad", p.get("prob", 0))
+    else:
+        base = p.get("prob_original",
+                      p.get("probabilidad", p.get("prob", 0)))
+    return recalibrar_probabilidad(base)
+
+
+def _score_recalibrado_pick(p):
+    """Score recalibrado de un pick guardado (idempotente)."""
+    if p.get("_recalibrado"):
+        return float(p.get("score", 0) or 0)
+    base = p.get("score_original", p.get("score", 0))
+    liga = p.get("league", p.get("liga", ""))
+    s = recalibrar_score(base) * multiplicador_liga(liga)
+    return round(clamp(s, 0, 10), 1)
+
+
 def _valor_combinada(picks_sel):
     """
-    Calcula el valor de una combinada segun:
-    valor = cuota_combinada * prob_conjunta * (1 / riesgo_promedio)
-    Mayor valor = mejor combinacion.
+    Valor de una combinada = VALOR ESPERADO REAL.
+    VE = prob_conjunta * (cuota_comb - 1) - (1 - prob_conjunta)
+    Usa la probabilidad RECALIBRADA de cada eslabon (no la declarada).
+    VE > 0  -> combinada con valor positivo.
+    VE <= 0 -> combinada sin valor (se descarta en el selector).
     """
     if not picks_sel:
-        return 0.0
+        return -1.0
     cuota_comb = 1.0
     prob_conj = 1.0
-    riesgo_sum = 0.0
     for p in picks_sel:
         cuota = max(_cuota_segura(p), 1.0)
-        prob  = float(p.get("probabilidad", 50) or 50) / 100
-        riesgo = float(p.get("riesgo", 5) or 5)
+        prob = _prob_recalibrada_pick(p) / 100.0
         cuota_comb *= cuota
-        prob_conj  *= prob
-        riesgo_sum += riesgo
-    riesgo_prom = riesgo_sum / len(picks_sel)
-    return round(cuota_comb * prob_conj * (1 / max(riesgo_prom, 0.1)), 4)
+        prob_conj *= prob
+    ve = prob_conj * (cuota_comb - 1.0) - (1.0 - prob_conj)
+    return round(ve, 4)
+
+
+def _eslabon_valido_combinada(p):
+    """
+    True si un pick puede ser eslabon de combinada. Se evalua pick por
+    pick (no por promedio): un solo eslabon debil invalida el ticket.
+      - prob recalibrada >= COMB_PROB_MIN
+      - score recalibrado >= COMB_SCORE_MIN (8.0 para Over 1.5)
+      - cuota del eslabon >= CUOTA_MINIMA_ESLABON
+      - no es BTTS
+    """
+    if _es_btts(p):
+        return False
+    cuota = _cuota_segura(p)
+    if cuota < CUOTA_MINIMA_ESLABON:
+        return False
+    if _prob_recalibrada_pick(p) < COMB_PROB_MIN:
+        return False
+    score_rec = _score_recalibrado_pick(p)
+    jugada = (p.get("jugada", "") or "").lower()
+    if "over 1.5" in jugada:
+        return score_rec >= COMB_SCORE_MIN_OVER15
+    return score_rec >= COMB_SCORE_MIN
 
 
 def _es_btts(pick):
@@ -5750,10 +5922,11 @@ def _fixture_ids_ya_usados(hoy):
 def _armar_combinada_del_dia():
     """
     Selector automatico de combinadas prematch.
-    Toma TODOS los picks prematch del dia con estado pendiente
-    (sin filtros de score/cuota minima por pick).
-    Cuota minima de la combinada: 2.50x.
-    Elige la combinacion que maximiza: cuota * prob_conjunta * (1/riesgo_promedio).
+    Cada eslabon se evalua individualmente (no por promedio): un solo
+    pick debil invalida el ticket. Filtros por eslabon:
+      - prob recalibrada >= 80%, score recalibrado >= 7.5 (8.0 para Over1.5)
+      - cuota del eslabon >= 1.50, no BTTS
+    Solo se arman combinadas con VALOR ESPERADO > 0 y cuota total 2.50-4.50.
     """
     from itertools import combinations as _comb
 
@@ -5790,8 +5963,10 @@ def _armar_combinada_del_dia():
                     continue
             except Exception:
                 pass
-        # Excluir BTTS — efectividad historica insuficiente (50%)
-        if _es_btts(p):
+        # Filtro por eslabon: prob/score recalibrados, cuota minima, no BTTS.
+        # Reemplaza tanto la exclusion suelta de BTTS como la ausencia de
+        # filtros de calidad por pick.
+        if not _eslabon_valido_combinada(p):
             continue
         # Priorizar picks con edge positivo vs Pinnacle
         edge_p = p.get("edge")
@@ -5808,9 +5983,8 @@ def _armar_combinada_del_dia():
         -float(x.get("score", 0) or 0)
     ))
 
-    CUOTA_MIN = 2.50
     mejor = None
-    mejor_valor = -1.0
+    mejor_valor = 0.0   # solo aceptamos combinadas con VE > 0
     mejor_razon = ""
 
     # Evaluar todas las combinaciones de 2 y 3 picks
@@ -5823,28 +5997,36 @@ def _armar_combinada_del_dia():
             for p in grupo:
                 cuota_comb *= max(_cuota_segura(p), 1.0)
             cuota_comb = round(cuota_comb, 2)
-            if cuota_comb < CUOTA_MIN:
+            # Rango de cuota total aceptable.
+            if cuota_comb < CUOTA_COMBINADA_MIN:
                 continue
+            if cuota_comb > CUOTA_COMBINADA_MAX:
+                continue
+            # Valor esperado real: solo combinadas con VE positivo.
             valor = _valor_combinada(grupo)
             if valor > mejor_valor:
                 mejor_valor = valor
                 mejor = grupo
                 mejor_razon = (
                     f"{'Triple' if n==3 else 'Doble'} optima — "
-                    f"cuota {cuota_comb}x | valor={valor}"
+                    f"cuota {cuota_comb}x | VE={valor}"
                 )
 
     if not mejor:
         # Guardar en aprendizaje: no hubo combinada rentable
+        motivo_sin = (
+            f"Ninguna combinacion con VE>0 y cuota "
+            f"{CUOTA_COMBINADA_MIN}-{CUOTA_COMBINADA_MAX}x "
+            f"({len(candidatos)} candidatos validos)"
+        )
         agregar_json(APRENDIZAJE_FILE, {
             "tipo": "sin_combinada",
             "fecha": hoy,
-            "motivo": f"Ninguna combinacion supera {CUOTA_MIN}x con los criterios actuales",
+            "motivo": motivo_sin,
             "candidatos": len(candidatos),
             "timestamp": fecha_hora_peru(),
         })
-        return {"sin_combinada": True, "fecha": hoy,
-                "motivo": f"Ninguna combinacion supera {CUOTA_MIN}x hoy ({len(candidatos)} candidatos disponibles)"}
+        return {"sin_combinada": True, "fecha": hoy, "motivo": motivo_sin}
 
     cuota_combinada = 1.0
     for p in mejor:
@@ -6284,7 +6466,9 @@ def _calcular_rendimiento_mes(anio, mes):
 
     ligas = {}
     for p in cerrados:
-        liga = p.get("liga", "Desconocida")
+        # Los picks guardan la liga como "league"; algunos reconstruidos
+        # usan "liga". Se leen ambas claves para no caer todo en "Desconocida".
+        liga = p.get("league") or p.get("liga") or "Desconocida"
         if liga not in ligas:
             ligas[liga] = {"total": 0, "aciertos": 0}
         ligas[liga]["total"] += 1
@@ -8304,7 +8488,7 @@ def _obtener_picks_live_ahora(score_min=7.5, riesgo_max=2):
                 continue
 
             cuota = _cuota_segura(mejor)
-            if cuota < 1.20:
+            if cuota < CUOTA_MINIMA_PICK:
                 continue
 
             # Excluir BTTS de combinadas live
@@ -8441,9 +8625,8 @@ def _armar_combinada_live():
             "motivo": f"No hay picks live con score 8.5+ y riesgo 2 en este momento",
         }
 
-    CUOTA_MIN = 2.50
     mejor = None
-    mejor_valor = -1.0
+    mejor_valor = 0.0   # solo combinadas con VE > 0
     mejor_razon = ""
 
     for n in [3, 2]:
@@ -8459,7 +8642,9 @@ def _armar_combinada_live():
             for p in grupo:
                 cuota_comb *= float(p.get("cuota", 1.0) or 1.0)
             cuota_comb = round(cuota_comb, 2)
-            if cuota_comb < CUOTA_MIN:
+            if cuota_comb < CUOTA_COMBINADA_MIN:
+                continue
+            if cuota_comb > CUOTA_COMBINADA_MAX:
                 continue
             valor = _valor_combinada(grupo)
             if valor > mejor_valor:
@@ -8467,7 +8652,7 @@ def _armar_combinada_live():
                 mejor = grupo
                 mejor_razon = (
                     f"{'Triple' if n==3 else 'Doble'} live optima — "
-                    f"cuota {cuota_comb}x | valor={valor}"
+                    f"cuota {cuota_comb}x | VE={valor}"
                 )
 
     if not mejor:
@@ -8590,9 +8775,8 @@ def _armar_combinada_mixta():
         })
         return {"sin_combinada": True, "subtipo": "mixta", "fecha": hoy, "motivo": motivo}
 
-    CUOTA_MIN = 2.50
     mejor = None
-    mejor_valor = -1.0
+    mejor_valor = 0.0   # solo combinadas con VE > 0
     mejor_razon = ""
 
     for n in [3, 2]:
@@ -8612,7 +8796,9 @@ def _armar_combinada_mixta():
             for p in grupo:
                 cuota_comb *= max(_cuota_segura(p), 1.0)
             cuota_comb = round(cuota_comb, 2)
-            if cuota_comb < CUOTA_MIN:
+            if cuota_comb < CUOTA_COMBINADA_MIN:
+                continue
+            if cuota_comb > CUOTA_COMBINADA_MAX:
                 continue
             valor = _valor_combinada(grupo)
             if valor > mejor_valor:
@@ -8622,7 +8808,7 @@ def _armar_combinada_mixta():
                 n_liv = fuentes.count("live")
                 mejor_razon = (
                     f"Mixta {n_pre} prematch + {n_liv} live — "
-                    f"cuota {cuota_comb}x | valor={valor}"
+                    f"cuota {cuota_comb}x | VE={valor}"
                 )
 
     if not mejor:
