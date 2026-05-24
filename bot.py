@@ -61,6 +61,9 @@ COMBINADAS_FILE = _tmp_path("combinadas.json")
 APRENDIZAJE_FILE = _tmp_path("aprendizaje.json")
 ESCALERA_FILE = _tmp_path("escalera.json")
 BANK_ACUMULADO_FILE = _tmp_path("bank_acumulado.json")
+# Suscriptores a alertas live. Un solo job global atiende a todos: asi el
+# consumo de API es constante con 1 o con 30 usuarios suscritos.
+ALERTAS_SUBS_FILE = _tmp_path("alertas_suscriptores.json")
 
 CACHE = {}
 CACHE_TTL = 300
@@ -2929,8 +2932,17 @@ def sugerir_live_ht(
 
     return sugerencias
 
-def analizar_live_fixture(fixture_id):
-    fixture = api_get(f"/fixtures?id={fixture_id}", use_cache=False)
+def analizar_live_fixture(fixture_id, cache_ttl=0):
+    """
+    Analiza un partido en vivo.
+    cache_ttl: si es > 0, las llamadas a la API usan cache con ese TTL
+    (en segundos). El job de alertas lo usa para no repetir llamadas
+    identicas en cada ciclo; los comandos bajo demanda usan 0 (sin cache)
+    para tener siempre datos frescos.
+    """
+    _usar_cache = cache_ttl > 0
+    fixture = api_get(f"/fixtures?id={fixture_id}",
+                      use_cache=_usar_cache, ttl=cache_ttl or CACHE_TTL)
 
     if not fixture:
         return None
@@ -2959,7 +2971,8 @@ def analizar_live_fixture(fixture_id):
         }
 
     stats = extraer_stats_live(
-        api_get(f"/fixtures/statistics?fixture={fixture_id}", use_cache=False)
+        api_get(f"/fixtures/statistics?fixture={fixture_id}",
+                use_cache=_usar_cache, ttl=cache_ttl or CACHE_TTL)
     )
 
     hs = stats.get(home, {})
@@ -3783,24 +3796,103 @@ def filtrar_picks_mes_actual():
 
     return filtrados
 
-async def revisar_alertas_live(context: ContextTypes.DEFAULT_TYPE):
-    chat_id = context.job.chat_id
-    fixtures = api_get("/fixtures?live=all", use_cache=False)
+# ══════════════════════════════════════════════════════════════════════
+# ALERTAS LIVE — sistema global de un solo job (ahorro de API)
+# Antes: 1 job por usuario, cada 90s, sin cache -> 3 usuarios = 3x consumo.
+# Ahora: 1 job global cada 150s, con cache; escanea UNA vez y notifica a
+# todos los suscriptores. El consumo de API ya no escala con los usuarios.
+# ══════════════════════════════════════════════════════════════════════
 
+# Intervalo del escaneo live global (segundos). 150s es suficiente para
+# alertas live y reduce el consumo frente a los 90s anteriores.
+ALERTAS_INTERVALO = 150
+# TTL de cache del escaneo live: algo menor que el intervalo para que
+# cada ciclo traiga datos frescos pero cualquier otra llamada a
+# /fixtures?live=all dentro de la ventana reuse el resultado.
+ALERTAS_CACHE_TTL = 120
+
+
+def cargar_suscriptores_alertas():
+    """Lista de chat_ids suscritos a alertas live (persistida en disco)."""
+    data = leer_json(ALERTAS_SUBS_FILE)
+    if isinstance(data, list):
+        return [c for c in data if c is not None]
+    return []
+
+
+def guardar_suscriptores_alertas(subs):
+    """Persiste la lista de suscriptores (sin duplicados)."""
+    unicos = sorted({c for c in subs if c is not None}, key=str)
+    guardar_json_lista(ALERTAS_SUBS_FILE, unicos)
+    return unicos
+
+
+def suscribir_alerta(chat_id):
+    """Anade un chat a la lista de alertas. True si quedo suscrito."""
+    subs = cargar_suscriptores_alertas()
+    if chat_id not in subs:
+        subs.append(chat_id)
+        guardar_suscriptores_alertas(subs)
+    return True
+
+
+def desuscribir_alerta(chat_id):
+    """Quita un chat de la lista de alertas. True si estaba y se quito."""
+    subs = cargar_suscriptores_alertas()
+    if chat_id in subs:
+        subs = [c for c in subs if c != chat_id]
+        guardar_suscriptores_alertas(subs)
+        return True
+    return False
+
+
+async def revisar_alertas_live(context: ContextTypes.DEFAULT_TYPE):
+    """
+    Job GLOBAL de alertas live. Escanea los partidos en vivo UNA sola vez
+    y envia las alertas a todos los suscriptores. El escaneo usa cache, de
+    modo que el consumo de API es el mismo con 1 o con N usuarios.
+    """
+    subs = cargar_suscriptores_alertas()
+    if not subs:
+        return  # nadie suscrito: no se gasta ni una llamada extra
+
+    # Escaneo unico con cache (mejora de consumo de API).
+    fixtures = api_get("/fixtures?live=all",
+                        use_cache=True, ttl=ALERTAS_CACHE_TTL)
+    if not fixtures:
+        return
+
+    # Detectar las alertas una sola vez (no por usuario).
+    nuevas = []
     for m in fixtures:
         fixture_id = str(m["fixture"]["id"])
-
         if fixture_id in ALERTED_LIVE:
             continue
-
-        analisis = analizar_live_fixture(fixture_id)
-
-        if analisis and analisis["alerta"]:
+        analisis = analizar_live_fixture(fixture_id,
+                                         cache_ttl=ALERTAS_CACHE_TTL)
+        if analisis and analisis.get("alerta"):
             ALERTED_LIVE.add(fixture_id)
-            await context.bot.send_message(
-                chat_id=chat_id,
-                text=f"🚨 ALERTA AUTOMÁTICA LIVE\n\n{analisis['texto']}"
-            )
+            nuevas.append(analisis["texto"])
+
+    if not nuevas:
+        return
+
+    # Difundir a todos los suscriptores. Si un envio falla (chat borrado,
+    # bot bloqueado), se quita ese suscriptor para no reintentar siempre.
+    caidos = []
+    for chat_id in subs:
+        for texto in nuevas:
+            try:
+                await context.bot.send_message(
+                    chat_id=chat_id,
+                    text=f"🚨 ALERTA AUTOMÁTICA LIVE\n\n{texto}"
+                )
+            except Exception:
+                caidos.append(chat_id)
+                break
+    if caidos:
+        restantes = [c for c in subs if c not in caidos]
+        guardar_suscriptores_alertas(restantes)
 
 
 async def enviar_reporte_semanal(context: ContextTypes.DEFAULT_TYPE):
@@ -4722,27 +4814,36 @@ async def top(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def alertas_on(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
 
+    # Limpiar cualquier job por-usuario heredado del esquema antiguo
+    # (compatibilidad: instalaciones previas creaban un job con name=chat_id).
     for job in context.job_queue.get_jobs_by_name(str(chat_id)):
         job.schedule_removal()
 
-    context.job_queue.run_repeating(
-        revisar_alertas_live,
-        interval=90,
-        first=5,
-        chat_id=chat_id,
-        name=str(chat_id)
-    )
+    suscribir_alerta(chat_id)
+    total = len(cargar_suscriptores_alertas())
 
-    await update.message.reply_text("✅ Alertas LIVE activadas. Revisaré cada 90 segundos.")
+    await update.message.reply_text(
+        f"✅ Alertas LIVE activadas. El bot revisa cada "
+        f"{ALERTAS_INTERVALO} segundos.\n"
+        f"({total} usuario(s) suscrito(s) — el consumo de API es el mismo "
+        f"para todos)."
+    )
 
 
 async def alertas_off(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
 
+    # Limpiar job heredado del esquema antiguo, si existiera.
     for job in context.job_queue.get_jobs_by_name(str(chat_id)):
         job.schedule_removal()
 
-    await update.message.reply_text("🛑 Alertas LIVE desactivadas.")
+    estaba = desuscribir_alerta(chat_id)
+    if estaba:
+        await update.message.reply_text("🛑 Alertas LIVE desactivadas.")
+    else:
+        await update.message.reply_text(
+            "ℹ️ No tenías alertas activas."
+        )
 
 def generar_pdf_resumentop():
     picks, cambios = actualizar_resultados_automaticos()
@@ -11417,4 +11518,15 @@ async def _registrar_comandos_bot(context):
         pass
 
 app.job_queue.run_once(_registrar_comandos_bot, when=3)
+
+# Job GLOBAL de alertas live: uno solo para todos los suscriptores.
+# Se registra siempre al arrancar; si no hay suscriptores el job retorna
+# de inmediato sin gastar llamadas a la API.
+app.job_queue.run_repeating(
+    revisar_alertas_live,
+    interval=ALERTAS_INTERVALO,
+    first=20,
+    name="alertas_live_global",
+)
+
 app.run_polling()
