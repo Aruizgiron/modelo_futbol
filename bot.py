@@ -1556,56 +1556,16 @@ def agregar_doble_oportunidad(recomendaciones, home, away, home_general, away_ge
 
 
 def agregar_mercados_extra_prematch(recomendaciones, home_id, away_id, home_general, away_general):
-    home_m = calcular_stats_mercados(home_id, last=5)
-    away_m = calcular_stats_mercados(away_id, last=5)
-
-    if not home_m or not away_m:
-        return recomendaciones
-
-    # corners/shots/sog ya no se usan aqui: corners prematch fue eliminado.
-    cards_total = home_m["cards_prom"] + away_m["cards_prom"]
-
-    def add_extra(jugada, prob, score, riesgo, motivo):
-        recomendaciones.append({
-            "mercado": mercado_categoria(jugada),
-            "jugada": jugada,
-            "prob": prob,
-            "score": score,
-            "riesgo": riesgo,
-            "confianza": etiqueta_confianza(score),
-            "motivo": motivo,
-            "cuota_justa": cuota_justa(prob),
-            "cuota_minima": cuota_minima(prob, riesgo),
-        })
-
-    # CORNERS PREMATCH ELIMINADO: efectividad real 33-40% (9-15 picks)
-    # frente a 79.5% en corners live. No se sugieren corners en prematch;
-    # los corners live (calcular_corners_avanzado con elapsed>0) se mantienen.
-
-    # PUNTO 4: tope maximo Tarjetas Over 3.5 (el Over 4.5 se queda corto
-    # con demasiada frecuencia). Aunque el promedio combinado sea alto,
-    # se sugiere como mucho la linea 3.5, que tiene mayor tasa de acierto.
-    if cards_total >= 5:
-        add_extra(
-            "Tarjetas Over 3.5",
-            80,
-            8.0,
-            3.2,
-            "Promedio alto de tarjetas y posible partido friccionado (linea conservadora 3.5)."
-        )
-    elif cards_total >= 4:
-        add_extra(
-            "Tarjetas Over 3.5",
-            74,
-            7.2,
-            3.8,
-            "Tendencia moderada-alta de tarjetas."
-        )
-
-    # BTTS PREMATCH ELIMINADO: efectividad real 41.6%. Tambien excluido de
-    # combinadas y alertas de edge.
-
-    recomendaciones.sort(key=lambda x: (x["score"], x["prob"]), reverse=True)
+    # MERCADOS EXTRA PREMATCH DESACTIVADOS.
+    # Esta funcion emitia corners, tarjetas y BTTS en prematch. Los tres
+    # mercados fueron eliminados de la generacion:
+    #   - BTTS: efectividad real 41.6%
+    #   - Corners prematch: 33-40% (vs 79.5% en corners live)
+    #   - Tarjetas: dependen del arbitro y del animo de los jugadores,
+    #     factores que el modelo no mide; efectividad inestable.
+    # La funcion se conserva (la llama preparar_analisis) pero ya no
+    # agrega nada. Los picks prematch provienen solo de
+    # obtener_recomendaciones (goles, doble oportunidad).
     return recomendaciones
 
 
@@ -1708,13 +1668,23 @@ def preparar_analisis(fixture_id, incluir_odds=False, incluir_contexto=False):
         r for r in recomendaciones if cuota_pick_suficiente(r)
     ]
 
-    # Reordenar tras recalibrar: la PROBABILIDAD recalibrada manda como
-    # clave primaria (discrimina mejor que el score), score como desempate.
-    recomendaciones.sort(
-        key=lambda x: (float(x.get("prob", 0) or 0),
-                       float(x.get("score", 0) or 0)),
-        reverse=True,
-    )
+    # Reordenar tras recalibrar. Ordenar solo por probabilidad recalibrada
+    # es muy chato: la recalibracion colapsa los valores a pocas bandas
+    # (62/78/88/94) y se generan grandes empates. Se ordena por VALOR
+    # ESPERADO del pick = prob_recalibrada * cuota, un numero continuo que
+    # ademas es la metrica que de verdad importa para el bank.
+    def _clave_orden(x):
+        prob = float(x.get("prob", 0) or 0) / 100.0
+        cuota = (x.get("cuota_api") or x.get("cuota")
+                 or x.get("cuota_minima") or 0)
+        try:
+            cuota = float(cuota)
+        except (ValueError, TypeError):
+            cuota = 0.0
+        ve = prob * cuota          # valor esperado bruto
+        return (ve, float(x.get("prob", 0) or 0))
+
+    recomendaciones.sort(key=_clave_orden, reverse=True)
 
     return {
         "fixture_id": str(fixture_id),
@@ -3096,19 +3066,11 @@ def analizar_live_fixture(fixture_id, cache_ttl=0):
 
     sugerencias = []
 
-    # BTTS (Ambos marcan) ELIMINADO tambien de live: efectividad real
-    # 38-41%. Antes se anadia aqui con sugerir_live_btts; esa llamada se
-    # elimina para que /live_all y las alertas dejen de sugerirlo.
-    # (la funcion sugerir_live_btts se conserva definida por compatibilidad)
-
-    sugerencias.extend(
-        sugerir_live_tarjetas(
-            elapsed,
-            total_yellow,
-            total_red,
-            abs(gh - ga) <= 1
-        )
-    )
+    # BTTS (Ambos marcan) ELIMINADO de live: efectividad real 38-41%.
+    # TARJETAS ELIMINADO de live: dependen del arbitro y del animo de los
+    # jugadores, factores que el modelo no mide.
+    # Las funciones sugerir_live_btts y sugerir_live_tarjetas se conservan
+    # definidas por compatibilidad, pero ya no se invocan.
 
     sugerencias.extend(
         sugerir_live_ht(
@@ -11152,23 +11114,8 @@ def analizar_seleccion(fixture_id, home, away, league, country, hora, round_name
             "motivo": f"Ranking diff: {diff_ranking} | Descanso visitante: {desc_away} dias",
         })
 
-    # Tarjetas (fases eliminatorias — motivacion alta = mas tarjetas)
-    if any("Tarjeta" in m for m in mercados_pref):
-        tarj_jugada = next((m for m in mercados_pref if "Tarjeta" in m), "Tarjetas Over 3.5")
-        prob_tarj = 65 if es_motivacion_alta else 55
-        if altitud > 2000:
-            prob_tarj += 3  # altitud genera mas friccion fisica
-        sugerencias.append({
-            "mercado": "Tarjetas",
-            "jugada": tarj_jugada,
-            "prob": prob_tarj,
-            "score": round(score_final - 0.2, 1),
-            "riesgo": 2.5,
-            "cuota_minima": cuota_minima(prob_tarj/100, 2.5),
-            "cuota": cuota_minima(prob_tarj/100, 2.5),
-            "confianza": etiqueta_confianza(score_final - 0.2),
-            "motivo": f"Eliminatoria — alta tension | Bajas home:{bajas_home} away:{bajas_away}",
-        })
+    # TARJETAS ELIMINADO tambien para selecciones: dependen del arbitro y
+    # del animo de los jugadores, factores que el modelo no mide.
 
     # Corners (equipos ofensivos generan mas corners)
     if any("Corner" in m for m in mercados_pref):
