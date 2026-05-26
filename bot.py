@@ -246,6 +246,22 @@ def aplicar_recalibracion(rec, liga=None):
     return rec
 
 
+def umbral_prob_desde_score_legado(score_minimo):
+    """
+    Traduce los umbrales de score que el codigo usaba antes de la
+    recalibracion (7.5 = top normal, 9 = elite/anclas) a umbrales de
+    PROBABILIDAD recalibrada. Tras la recalibracion el score cambio de
+    rango y un corte fijo de score descartaria casi todo; el criterio
+    unico del sistema es ahora la probabilidad recalibrada.
+      score_minimo >= 9  -> elite  -> prob recalibrada >= 85%
+      score_minimo  < 9  -> normal -> prob recalibrada >= 70%
+    """
+    try:
+        return 85.0 if float(score_minimo) >= 9 else 70.0
+    except (ValueError, TypeError):
+        return 70.0
+
+
 def cuota_pick_suficiente(rec):
     """
     True si el pick supera la cuota minima. Usa la mejor cuota disponible
@@ -568,14 +584,18 @@ def porcentaje(v):
 
 
 def mercado_categoria(jugada):
+    # El orden importa: "Tarjetas Over 3.5" contiene "Over", asi que
+    # Tarjetas y Corners deben evaluarse ANTES que Over/Under.
     if "Corners" in jugada:
         return "Corners"
-    if "Over" in jugada or "Under" in jugada:
-        return "Goles totales"
+    if "Tarjeta" in jugada:
+        return "Tarjetas"
     if "Ambos marcan" in jugada:
         return "Ambos marcan"
     if "1X" in jugada or "X2" in jugada:
         return "Doble oportunidad"
+    if "Over" in jugada or "Under" in jugada:
+        return "Goles totales"
     return "Otro"
 
 def calcular_forma(team_id, modo=None, last=10):
@@ -2307,6 +2327,7 @@ def obtener_partidos_configurados():
 
 def generar_top(score_minimo=7.5):
     oportunidades = []
+    _umbral_prob_top = umbral_prob_desde_score_legado(score_minimo)
 
     ligas = {}
     ligas.update(EUROPA_LEAGUES)
@@ -2345,7 +2366,10 @@ def generar_top(score_minimo=7.5):
 
                 top = data["recomendaciones"][0]
 
-                if top["score"] < score_minimo:
+                # Criterio unico V14: filtrar por PROBABILIDAD recalibrada,
+                # no por score crudo (tras recalibrar el score cambio de
+                # rango). score_minimo se traduce a umbral de probabilidad.
+                if float(top.get("prob", 0) or 0) < _umbral_prob_top:
                     continue
 
                 oportunidades.append({
@@ -2451,6 +2475,7 @@ def _formatear_pick_mensaje(o, idx=None, mostrar_id=True):
 
 def generar_top_fecha(fecha, score_minimo=7.5):
     oportunidades = []
+    _umbral_prob_top = umbral_prob_desde_score_legado(score_minimo)
 
     ligas = {}
     ligas.update(EUROPA_LEAGUES)
@@ -2472,7 +2497,8 @@ def generar_top_fecha(fecha, score_minimo=7.5):
 
             top = data["recomendaciones"][0]
 
-            if top["score"] < score_minimo:
+            # Criterio unico V14: filtrar por probabilidad recalibrada.
+            if float(top.get("prob", 0) or 0) < _umbral_prob_top:
                 continue
 
             oportunidades.append({
@@ -3070,21 +3096,10 @@ def analizar_live_fixture(fixture_id, cache_ttl=0):
 
     sugerencias = []
 
-    sugerencias.extend(
-        sugerir_live_btts(
-            elapsed,
-            gh,
-            ga,
-            h_shots,
-            a_shots,
-            h_sog,
-            a_sog,
-            h_corners,
-            a_corners,
-            h_da,
-            a_da
-        )
-    )
+    # BTTS (Ambos marcan) ELIMINADO tambien de live: efectividad real
+    # 38-41%. Antes se anadia aqui con sugerir_live_btts; esa llamada se
+    # elimina para que /live_all y las alertas dejen de sugerirlo.
+    # (la funcion sugerir_live_btts se conserva definida por compatibilidad)
 
     sugerencias.extend(
         sugerir_live_tarjetas(
@@ -7723,7 +7738,9 @@ def generar_pdf_rendimiento(datos):
         story.append(Paragraph(resumen_comb, sc))
     else:
         story.append(Paragraph(
-            "No hay combinada para hoy (se requieren picks con score >= 7.5 y riesgo <= 2).",
+            "No hay combinada para hoy: ninguna combinacion alcanza "
+            "valor esperado positivo con los criterios actuales "
+            "(cada eslabon requiere prob 80%+, cuota 1.50+, sin BTTS).",
             styles["Normal"]
         ))
 
@@ -8005,11 +8022,16 @@ async def live_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             score_live = analisis.get("score_live", 0)
 
-            if score_live < 7.5:
-                continue
-
             # Tomar la mejor sugerencia
             mejor = analisis["sugerencias"][0]
+
+            # Criterio V14: el live se filtra por la probabilidad de la
+            # sugerencia (>= 70%). El sistema de scoring live es propio y
+            # NO se recalibra con las tablas prematch; por eso aqui se usa
+            # la probabilidad live directa, no recalibrar_probabilidad.
+            prob_live = float(mejor.get("prob", 0) or 0)
+            if prob_live < 70:
+                continue
 
             # PUNTO 5: refrescar la cuota con la cuota REAL EN VIVO.
             # analizar_live_fixture trae una cuota estimada/estatica;
@@ -8284,7 +8306,14 @@ async def analizar_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 top = data["recomendaciones"][0]
                 score = float(top.get("score", 0) or 0)
 
-                if score < 7.5:
+                # El pick ya paso por preparar_analisis: recalibracion +
+                # filtro de cuota 1.50 ya aplicados. Aqui solo se exige una
+                # probabilidad recalibrada minima para guardar (mismo
+                # criterio que el resto del sistema). NO se filtra por score
+                # crudo: tras recalibrar, el score 7.5+ descartaria casi
+                # todo y los picks no entrarian al resumen.
+                prob_rec = float(top.get("prob", 0) or 0)
+                if prob_rec < 70:
                     continue
 
                 # Usar cuota real de la API si existe, si no la calculada
@@ -8346,12 +8375,18 @@ async def analizar_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Resumen final
     if not picks_encontrados:
         await update.message.reply_text(
-            f"📊 Analisis completo.\nPartidos analizados: {analizados}\nNo se encontraron picks con score 7.5+ hoy."
+            f"📊 Analisis completo.\nPartidos analizados: {analizados}\n"
+            f"No se encontraron picks que superen los criterios de hoy "
+            f"(prob recalibrada 70%+, cuota 1.50+)."
         )
         return
 
-    elite = [p for p in picks_encontrados if float(p.get("score",0) or 0) >= 9.0]
-    top75 = [p for p in picks_encontrados if 7.5 <= float(p.get("score",0) or 0) < 9.0]
+    # Clasificacion por PROBABILIDAD recalibrada (coherente con el filtro
+    # de guardado). Elite = prob >= 85%, resto = los demas guardados.
+    elite = [p for p in picks_encontrados
+             if float(p.get("prob", 0) or 0) >= 85]
+    top75 = [p for p in picks_encontrados
+             if float(p.get("prob", 0) or 0) < 85]
 
     # Intentar armar combinada del dia
     comb = _armar_combinada_del_dia()
@@ -8362,8 +8397,8 @@ async def analizar_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"📊 *Resumen /analizar_all — {hoy}*",
         "━━━━━━━━━━",
         f"Partidos analizados: {analizados} | Errores: {errores}",
-        f"🌟 Elite (9.0+): {len(elite)} picks",
-        f"⭐ TOP (7.5-8.9): {len(top75)} picks",
+        f"🌟 Elite (prob 85%+): {len(elite)} picks",
+        f"⭐ Resto guardados: {len(top75)} picks",
         f"Total guardados: {len(picks_encontrados)}",
         "━━━━━━━━━━",
     ]
@@ -9093,7 +9128,10 @@ async def combinada_mixta(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ─────────────────────────────────────────────
 
 CUOTA_MIN_ALTA = 3.0
-CUOTA_MIN_PICK_ALTA = 1.40
+# Migrado a criterios V14: cuota minima por eslabon 1.50 (igual que el
+# resto del sistema). Estos comandos buscan cuota combinada alta, pero
+# cada eslabon debe seguir siendo rentable individualmente.
+CUOTA_MIN_PICK_ALTA = 1.50
 SCORE_MIN_ALTA = 7.5
 RIESGO_MAX_ALTA = 3
 
@@ -9244,8 +9282,27 @@ def _evaluar_comb3(candidatos, subtipo, hoy, mixta=False):
         })
         return {"sin_combinada": True, "subtipo": subtipo, "fecha": hoy, "motivo": motivo}
 
+    # Filtro por eslabon (criterios V14): cada pick debe ser valido
+    # individualmente. Estos comandos buscan cuota combinada alta, pero
+    # un eslabon flojo invalida el ticket igual que en /combinada.
+    candidatos = [p for p in candidatos if _eslabon_valido_combinada(p)]
+    if not candidatos:
+        motivo = ("Ningun pick pasa el filtro por eslabon V14 "
+                  f"(prob>={COMB_PROB_MIN}%, score>={COMB_SCORE_MIN}, "
+                  f"cuota>={CUOTA_MINIMA_ESLABON}, sin BTTS)")
+        agregar_json(APRENDIZAJE_FILE, {
+            "tipo": "sin_comb3",
+            "subtipo": subtipo,
+            "fecha": hoy,
+            "motivo": motivo,
+            "candidatos": 0,
+            "timestamp": fecha_hora_peru(),
+        })
+        return {"sin_combinada": True, "subtipo": subtipo,
+                "fecha": hoy, "motivo": motivo}
+
     mejor = None
-    mejor_valor = -1.0
+    mejor_valor = 0.0   # solo combinadas con VALOR ESPERADO > 0
     mejor_razon = ""
 
     for n in [3, 2]:
@@ -9266,6 +9323,8 @@ def _evaluar_comb3(candidatos, subtipo, hoy, mixta=False):
             for p in grupo:
                 cuota_comb *= max(_cuota_segura(p), 1.0)
             cuota_comb = round(cuota_comb, 2)
+            # Cuota combinada minima alta (proposito de estos comandos).
+            # No hay tope superior: el filtro de VE descarta lo fragil.
             if cuota_comb < CUOTA_MIN_ALTA:
                 continue
             valor = _valor_combinada(grupo)
@@ -9274,15 +9333,17 @@ def _evaluar_comb3(candidatos, subtipo, hoy, mixta=False):
                 mejor = grupo
                 fuentes_str = ""
                 if mixta:
-                    fs = [p.get("_fuente","pre") for p in grupo]
-                    fuentes_str = f" ({fs.count('prematch')}pre+{fs.count('live')}live)"
+                    fs = [p.get("_fuente", "pre") for p in grupo]
+                    fuentes_str = (f" ({fs.count('prematch')}pre+"
+                                   f"{fs.count('live')}live)")
                 mejor_razon = (
-                    f"{'Triple' if n==3 else 'Doble'}{fuentes_str} cuota alta — "
-                    f"{cuota_comb}x | valor={valor}"
+                    f"{'Triple' if n==3 else 'Doble'}{fuentes_str} "
+                    f"cuota alta — {cuota_comb}x | VE={valor}"
                 )
 
     if not mejor:
-        motivo = f"Ninguna combinacion supera {CUOTA_MIN_ALTA}x ({len(candidatos)} candidatos con cuota {CUOTA_MIN_PICK_ALTA}+)"
+        motivo = (f"Ninguna combinacion con VE>0 supera {CUOTA_MIN_ALTA}x "
+                  f"({len(candidatos)} candidatos validos)")
         agregar_json(APRENDIZAJE_FILE, {
             "tipo": "sin_comb3",
             "subtipo": subtipo,
@@ -10367,8 +10428,11 @@ async def cancelar_escalera(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 CUOTA_MIN_4X = 4.0
 CUOTA_MIN_5X = 5.0
-CUOTA_MIN_PICK_4X = 1.30   # 1.35^4 = 3.32 minimo, con mejores picks llega a 4x
-CUOTA_MIN_PICK_5X = 1.40   # 1.45^4 = 4.42, con 1.50x llega a 5.06x
+# Migrado a criterios V14: cuota minima por eslabon 1.50, igual que todo
+# el sistema. El filtro por eslabon (_eslabon_valido_combinada) y el VE>0
+# son los que garantizan que la combinada de cuota alta tenga valor real.
+CUOTA_MIN_PICK_4X = 1.50
+CUOTA_MIN_PICK_5X = 1.50
 N_PICKS_ALTA = 4            # Minimo 4 picks para estas combinadas
 
 
@@ -10439,8 +10503,13 @@ def _armar_comb_alta(subtipo, cuota_min_comb, cuota_min_pick, hoy, mixta=False):
     else:
         todos = candidatos_pre + candidatos_live
 
+    # Filtro por eslabon (criterios V14): cada pick valido individualmente.
+    todos = [p for p in todos if _eslabon_valido_combinada(p)]
+
     if not todos:
-        motivo = f"No hay picks con cuota >= {cuota_min_pick} disponibles"
+        motivo = (f"Ningun pick pasa el filtro por eslabon V14 "
+                  f"(prob>={COMB_PROB_MIN}%, score>={COMB_SCORE_MIN}, "
+                  f"cuota>={CUOTA_MINIMA_ESLABON}, sin BTTS)")
         agregar_json(APRENDIZAJE_FILE, {
             "tipo": f"sin_comb_{int(cuota_min_comb)}x",
             "subtipo": subtipo,
@@ -10451,7 +10520,7 @@ def _armar_comb_alta(subtipo, cuota_min_comb, cuota_min_pick, hoy, mixta=False):
         return {"sin_combinada": True, "subtipo": subtipo, "fecha": hoy, "motivo": motivo}
 
     mejor = None
-    mejor_valor = -1.0
+    mejor_valor = 0.0   # solo combinadas con VALOR ESPERADO > 0
     mejor_razon = ""
 
     # Evaluar combinaciones de 4 y 3 picks
