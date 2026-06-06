@@ -1068,13 +1068,27 @@ def buscar_cuota_live(fixture_id, jugada):
                             linea = float(seg.strip().split()[0].replace(",", "."))
                         except Exception:
                             linea = None
-                        es_mkt = (("corner" in bet_name.lower() and "corner" in jugada_l)
-                                  or (("card" in bet_name.lower() or "booking" in bet_name.lower())
-                                      and "tarjeta" in jugada_l))
+                        # Ampliar matching: "Total Corners", "Corner Kicks", "Corners", etc.
+                        es_mkt_corner = (
+                            "corner" in jugada_l and (
+                                "corner" in bet_name.lower()
+                                or "corners" in bet_name.lower()
+                                or "corner kicks" in bet_name.lower()
+                                or "total corners" in bet_name.lower()
+                            )
+                        )
+                        es_mkt_tarjeta = (
+                            "tarjeta" in jugada_l and (
+                                "card" in bet_name.lower()
+                                or "booking" in bet_name.lower()
+                                or "yellow" in bet_name.lower()
+                            )
+                        )
+                        es_mkt = es_mkt_corner or es_mkt_tarjeta
                         if linea is not None and es_mkt and tipo in nombre.lower():
                             import re as _re_l3
                             mnum3 = _re_l3.search(r"(\d+\.?\d*)", nombre)
-                            if mnum3 and abs(float(mnum3.group(1)) - linea) < 0.01:
+                            if mnum3 and abs(float(mnum3.group(1)) - linea) < 0.26:
                                 match = True
                     # Resultado 1X2
                     elif jugada_l.strip() in ("1", "2", "x"):
@@ -3326,6 +3340,21 @@ def analizar_live_fixture(fixture_id, cache_ttl=0):
     if sugerencias:
         sugerencias.sort(key=lambda x: (x["score"], x["prob"]), reverse=True)
         top_live = sugerencias[0]
+
+        # Refrescar la cuota con la cuota REAL EN VIVO antes de guardar.
+        # La cuota estimada del modelo (ej: cuota_corner de linea_corners_recomendada)
+        # es estatica y puede diferir mucho de la cuota live real del mercado.
+        try:
+            cuota_live_real, book_live_real = buscar_cuota_live(
+                fixture_id, top_live.get("jugada", "")
+            )
+            if cuota_live_real and cuota_live_real > 1.0:
+                top_live["cuota"] = cuota_live_real
+                top_live["cuota_api"] = cuota_live_real
+                top_live["bookmaker"] = book_live_real
+        except Exception as e:
+            print(f"WARN cuota live en analizar_live_fixture: {e}")
+
         guardar_pick_live_automatico(
             fixture_id,
             home,
