@@ -2459,6 +2459,7 @@ def obtener_partidos_configurados():
     ligas.update(EUROPA_LEAGUES)
     ligas.update(SUDAMERICA_LEAGUES)
     ligas.update(OTRAS_LEAGUES)
+    ligas.update(SELECCIONES_LEAGUES)
 
     partidos = []
 
@@ -4593,22 +4594,23 @@ def texto_fixtures_fecha(titulo, ligas, fecha):
     return texto[:3900]
 
 async def fixtures_manana(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("📅 Buscando fixtures Europa + Sudamérica de mañana...")
+    await update.message.reply_text("📅 Buscando fixtures de mañana (todas las ligas + selecciones)...")
 
     ligas = {}
     ligas.update(EUROPA_LEAGUES)
     ligas.update(SUDAMERICA_LEAGUES)
     ligas.update(OTRAS_LEAGUES)
+    ligas.update(SELECCIONES_LEAGUES)
 
     fecha = fecha_manana_peru()
 
     texto = texto_fixtures_fecha(
-        "FIXTURES EUROPA + SUDAMÉRICA MAÑANA",
+        "FIXTURES MAÑANA — TODAS LAS LIGAS + SELECCIONES",
         ligas,
         fecha
     )
 
-    await update.message.reply_text(texto[:3900])
+    await _enviar_mensaje_paginado(update, texto, parse_mode=None)
 
 
 async def top_manana(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -4908,7 +4910,8 @@ async def fixtures(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ligas.update(EUROPA_LEAGUES)
     ligas.update(SUDAMERICA_LEAGUES)
     ligas.update(OTRAS_LEAGUES)
-    await fixtures_ligas(update, context, ligas, "Europa + Sudamérica + Otras")
+    ligas.update(SELECCIONES_LEAGUES)
+    await fixtures_ligas(update, context, ligas, "Europa + Sudamérica + Selecciones + Mundial")
 
 
 async def scanear_ligas(update: Update, context: ContextTypes.DEFAULT_TYPE, leagues, titulo):
@@ -5000,8 +5003,9 @@ async def scanear(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ligas.update(EUROPA_LEAGUES)
     ligas.update(SUDAMERICA_LEAGUES)
     ligas.update(OTRAS_LEAGUES)
+    ligas.update(SELECCIONES_LEAGUES)
 
-    await scanear_ligas(update, context, ligas, "Europa + Sudamérica + Otras")
+    await scanear_ligas(update, context, ligas, "Europa + Sudamérica + Selecciones + Mundial")
 
 
 async def elite(update: Update, context: ContextTypes.DEFAULT_TYPE):
