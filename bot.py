@@ -11,6 +11,7 @@ import requests
 import os
 import json
 import time
+import asyncio
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -64,9 +65,12 @@ BANK_ACUMULADO_FILE = _tmp_path("bank_acumulado.json")
 # Suscriptores a alertas live. Un solo job global atiende a todos: asi el
 # consumo de API es constante con 1 o con 30 usuarios suscritos.
 ALERTAS_SUBS_FILE = _tmp_path("alertas_suscriptores.json")
+# Chat IDs que reciben alarmas de combinadas — persistidos para sobrevivir reinicios
+CHAT_IDS_ALARMAS_FILE = _tmp_path("chat_ids_alarmas.json")
 
 CACHE = {}
 CACHE_TTL = 300
+CACHE_MAX_SIZE = 500   # maximo de entradas; purga las mas viejas al superarlo
 ALERTED_LIVE = set()
 
 EUROPA_LEAGUES = {
@@ -109,6 +113,19 @@ OTRAS_LEAGUES = {
     "J-League": {"id": 98, "season": 2026, "country": "Japan"},
 }
 
+# ── SELECCIONES NACIONALES Y MUNDIAL ────────────────────────────────────
+# Incluidas en analizar_all y generar_top con motor analizar_seleccion.
+# El Mundial 2026 arranca el 11 de junio (league=1, season=2026).
+SELECCIONES_LEAGUES = {
+    "FIFA World Cup 2026":            {"id": 1,   "season": 2026, "country": "World"},
+    "Friendlies Internacionales":     {"id": 667, "season": 2026, "country": "World"},
+    "WC Qualif. CONMEBOL":            {"id": 35,  "season": 2026, "country": "World"},
+    "WC Qualif. UEFA":                {"id": 32,  "season": 2026, "country": "World"},
+    "WC Qualif. CONCACAF":            {"id": 30,  "season": 2026, "country": "World"},
+    "WC Qualif. AFC":                 {"id": 36,  "season": 2026, "country": "World"},
+    "WC Qualif. CAF":                 {"id": 29,  "season": 2026, "country": "World"},
+}
+
 
 # ══════════════════════════════════════════════════════════════════════
 # RECALIBRACION V14 — capa de correccion basada en datos reales
@@ -137,6 +154,22 @@ COMB_SCORE_MIN = 7.5
 # un score recalibrado mas alto que al resto.
 COMB_SCORE_MIN_OVER15 = 8.0
 
+# ── MODO CONSERVADOR V14.2 ─────────────────────────────────────────────
+# Maximo de picks diarios (solo los mejores pasan).
+MAX_PICKS_DIA = 8
+# Mercados permitidos en modo conservador.
+MERCADOS_CONSERVADOR = {"Goles totales", "Doble oportunidad"}
+# Score minimo dinamico segun cuota: mas cuota exige mas conviccion.
+SCORE_MIN_POR_CUOTA = [
+    (1.50, 2.20, 7.5),   # cuota 1.50-2.20 -> score >= 7.5
+    (2.21, 3.00, 8.0),   # cuota 2.21-3.00 -> score >= 8.0
+    (3.01, 99.0, 8.5),   # cuota 3.01+     -> score >= 8.5
+]
+# Freno de bank: si el bank cae por debajo de este % del inicial, no se generan picks.
+BANK_FRENO_PCT = 0.35   # 35% -> S/175 sobre S/500 inicial
+# Racha de fallos consecutivos que dispara alerta.
+RACHA_FALLOS_ALERTA = 5
+
 # Multiplicador de score por liga. Medido sobre efectividad real por liga.
 # Ligas con muestra < 10 picks quedan neutras (1.00) por falta de datos.
 MULTIPLICADOR_LIGA = {
@@ -156,46 +189,48 @@ MULTIPLICADOR_LIGA = {
 def recalibrar_probabilidad(prob):
     """
     Corrige la probabilidad declarada hacia la efectividad real medida.
-    La banda 75-79% concentraba el 64% de los picks y rendia solo 62%.
+    Tabla corregida V14.2: monotonica (a mayor prob declarada -> mayor recalibrada).
+    Eliminada la anomalia 70-74% -> 88% que promovia picks debiles.
     """
     try:
         prob = float(prob)
     except (ValueError, TypeError):
         return prob
     if prob >= 90:
-        return 94.0
-    if prob >= 85:
         return 88.0
+    if prob >= 85:
+        return 84.0
     if prob >= 80:
-        return 78.0          # tramo interpolado (sin datos directos)
+        return 78.0
     if prob >= 75:
-        return 62.0          # banda peor calibrada: -14 pp reales
+        return 72.0
     if prob >= 70:
-        return 88.0          # banda 70-74 rinde 91% real
+        return 66.0
     return prob
 
 
 def recalibrar_score(score):
     """
-    Re-mapea el score a la efectividad real. El score original no ordena
-    (7.0-7.4 rinde mas que 8.0-8.4); esta tabla lo corrige.
+    Re-mapea el score a la efectividad real.
+    Tabla corregida V14.2: monotonica (a mayor score -> mayor recalibrado).
+    Eliminada la anomalia 7.0-7.4 -> 8.5 que promovia picks con score bajo.
     """
     try:
         score = float(score)
     except (ValueError, TypeError):
         return score
     if score >= 9.5:
-        return 9.0
+        return 9.5
     if score >= 9.0:
-        return 7.5
+        return 8.5
     if score >= 8.5:
-        return 7.2           # tramo sin datos: interpolado conservador
+        return 8.0
     if score >= 8.0:
-        return 6.8
+        return 7.5
     if score >= 7.5:
-        return 6.7
+        return 7.0
     if score >= 7.0:
-        return 8.5           # tramo 7.0-7.4 rinde 85% real
+        return 6.5
     return 5.0
 
 
@@ -248,18 +283,18 @@ def aplicar_recalibracion(rec, liga=None):
 
 def umbral_prob_desde_score_legado(score_minimo):
     """
-    Traduce los umbrales de score que el codigo usaba antes de la
-    recalibracion (7.5 = top normal, 9 = elite/anclas) a umbrales de
-    PROBABILIDAD recalibrada. Tras la recalibracion el score cambio de
-    rango y un corte fijo de score descartaria casi todo; el criterio
-    unico del sistema es ahora la probabilidad recalibrada.
-      score_minimo >= 9  -> elite  -> prob recalibrada >= 85%
-      score_minimo  < 9  -> normal -> prob recalibrada >= 70%
+    Traduce umbrales de score a umbrales de probabilidad recalibrada.
+    V14.2: el score vuelve a ser el criterio principal. La prob es desempate.
+      score_minimo >= 9.0 -> elite  -> prob recalibrada >= 80%
+      score_minimo >= 7.5 -> normal -> prob recalibrada >= 66%
     """
     try:
-        return 85.0 if float(score_minimo) >= 9 else 70.0
+        s = float(score_minimo)
+        if s >= 9.0:
+            return 80.0
+        return 66.0
     except (ValueError, TypeError):
-        return 70.0
+        return 66.0
 
 
 def cuota_pick_suficiente(rec):
@@ -301,6 +336,17 @@ def api_get(endpoint, use_cache=True, ttl=CACHE_TTL):
         data = r.json().get("response", [])
 
         if use_cache:
+            # Purgar entradas viejas si el cache supera el limite
+            if len(CACHE) >= CACHE_MAX_SIZE:
+                now2 = time.time()
+                viejos = [k for k, (t, _) in CACHE.items() if now2 - t > CACHE_TTL]
+                for k in viejos:
+                    CACHE.pop(k, None)
+                # Si sigue lleno, eliminar la mitad mas antigua
+                if len(CACHE) >= CACHE_MAX_SIZE:
+                    ordenados = sorted(CACHE.items(), key=lambda x: x[1][0])
+                    for k, _ in ordenados[:CACHE_MAX_SIZE // 2]:
+                        CACHE.pop(k, None)
             CACHE[endpoint] = (now, data)
 
         return data
@@ -387,8 +433,19 @@ def leer_json(path):
 
 
 def guardar_json_lista(path, data):
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2, ensure_ascii=False)
+    """Escritura atomica: escribe a .tmp y luego renombra para evitar
+    corrupcion si el proceso se interrumpe a mitad de escritura."""
+    path_tmp = path + ".tmp"
+    try:
+        with open(path_tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+        os.replace(path_tmp, path)
+    except Exception as e:
+        print(f"ERROR guardar_json_lista({path}): {e}")
+        try:
+            os.remove(path_tmp)
+        except Exception:
+            pass
 
 
 def agregar_json(path, item):
@@ -1577,7 +1634,12 @@ def enriquecer_con_odds(fixture_id, recomendaciones):
         r["bookmaker"] = book
 
         if cuota:
-            r["edge"] = edge_estimado(r["prob"], cuota)
+            # Edge se calcula con prob ORIGINAL (antes de recalibrar) para
+            # no introducir sesgos de la tabla de recalibracion en el filtro.
+            prob_para_edge = float(
+                r.get("prob_original", r.get("prob", 0)) or 0
+            )
+            r["edge"] = edge_estimado(prob_para_edge, cuota)
             r["movimiento"] = guardar_snapshot_odds(
                 fixture_id,
                 r["jugada"],
@@ -1590,7 +1652,8 @@ def enriquecer_con_odds(fixture_id, recomendaciones):
     return recomendaciones
 
 def preparar_analisis(fixture_id, incluir_odds=False, incluir_contexto=False):
-    fixture = api_get(f"/fixtures?id={fixture_id}", use_cache=False)
+    # Datos base del fixture: cacheados 1h (no cambian antes del partido)
+    fixture = api_get(f"/fixtures?id={fixture_id}", use_cache=True, ttl=3600)
 
     if not fixture:
         return None
@@ -1656,33 +1719,125 @@ def preparar_analisis(fixture_id, incluir_odds=False, incluir_contexto=False):
             recomendaciones
         )
 
-    # ── RECALIBRACION V14 ────────────────────────────────────────────
+    # ── RECALIBRACION V14.2 ───────────────────────────────────────────
     # Se aplica DESPUES de enriquecer con odds para que el filtro de
     # cuota use la cuota real de mercado cuando exista.
     for r in recomendaciones:
         aplicar_recalibracion(r, liga=league)
 
+    # ── BONUS H2H EN MERCADOS DE GOLES ────────────────────────────────
+    # Si en los ultimos 5 H2H el mercado elegido fue consistente, +0.5 score.
+    try:
+        home_id_ha = fixture["teams"]["home"]["id"]
+        away_id_ha = fixture["teams"]["away"]["id"]
+        h2h_bonus = api_get(
+            f"/fixtures/headtohead?h2h={home_id_ha}-{away_id_ha}&last=5",
+            use_cache=True, ttl=7200
+        )
+        if h2h_bonus and len(h2h_bonus) >= 3:
+            goles_h2h = [(m["goals"]["home"] or 0) + (m["goals"]["away"] or 0)
+                         for m in h2h_bonus
+                         if m["goals"]["home"] is not None]
+            if goles_h2h:
+                over15_h2h = sum(1 for g in goles_h2h if g >= 2) / len(goles_h2h)
+                under35_h2h = sum(1 for g in goles_h2h if g <= 3) / len(goles_h2h)
+                for r in recomendaciones:
+                    jugada_r = (r.get("jugada") or "").lower()
+                    if "over 1.5" in jugada_r and over15_h2h >= 0.7:
+                        r["score"] = round(min(10.0, r["score"] + 0.5), 1)
+                        r["motivo"] = r.get("motivo", "") + f" H2H refuerza Over1.5 ({int(over15_h2h*100)}%)."
+                    elif ("over 2.5" in jugada_r) and over15_h2h >= 0.8:
+                        r["score"] = round(min(10.0, r["score"] + 0.3), 1)
+                    elif "under 3.5" in jugada_r and under35_h2h >= 0.8:
+                        r["score"] = round(min(10.0, r["score"] + 0.5), 1)
+                        r["motivo"] = r.get("motivo", "") + f" H2H refuerza Under3.5 ({int(under35_h2h*100)}%)."
+    except Exception as e:
+        print(f"WARN H2H bonus: {e}")
+
+    # ── xG DE PREDICTIONS COMO SEÑAL PREMATCH ─────────────────────────
+    # /predictions devuelve goles esperados por equipo — usarlos para
+    # reforzar o penalizar mercados de goles.
+    try:
+        pred_data = api_get(
+            f"/predictions?fixture={fixture_id}",
+            use_cache=True, ttl=3600
+        )
+        if pred_data:
+            p0 = pred_data[0] if isinstance(pred_data, list) else pred_data
+            goals_pred = p0.get("predictions", {}).get("goals", {})
+            xg_home = float(goals_pred.get("home", 0) or 0)
+            xg_away = float(goals_pred.get("away", 0) or 0)
+            xg_total = round(xg_home + xg_away, 2)
+            if xg_total > 0:
+                for r in recomendaciones:
+                    jugada_r = (r.get("jugada") or "").lower()
+                    if "over 1.5" in jugada_r:
+                        if xg_total >= 2.5:
+                            r["score"] = round(min(10.0, r["score"] + 0.4), 1)
+                        elif xg_total < 1.2:
+                            r["score"] = round(max(0.0, r["score"] - 0.3), 1)
+                    elif "over 2.5" in jugada_r:
+                        if xg_total >= 3.0:
+                            r["score"] = round(min(10.0, r["score"] + 0.4), 1)
+                        elif xg_total < 1.8:
+                            r["score"] = round(max(0.0, r["score"] - 0.3), 1)
+                    elif "under 3.5" in jugada_r:
+                        if xg_total <= 2.0:
+                            r["score"] = round(min(10.0, r["score"] + 0.3), 1)
+                        elif xg_total > 3.0:
+                            r["score"] = round(max(0.0, r["score"] - 0.4), 1)
+                    # Guardar xG en el pick para aprendizaje ML
+                    r["xg_pred_home"] = xg_home
+                    r["xg_pred_away"] = xg_away
+                    r["xg_pred_total"] = xg_total
+    except Exception as e:
+        print(f"WARN xG predictions: {e}")
+
     # Filtro de cuota minima: descarta picks que no pueden ser rentables.
-    # Si no se consultaron odds, cuota_minima (teorica) sirve de proxy.
     recomendaciones = [
         r for r in recomendaciones if cuota_pick_suficiente(r)
     ]
 
-    # Reordenar tras recalibrar. Ordenar solo por probabilidad recalibrada
-    # es muy chato: la recalibracion colapsa los valores a pocas bandas
-    # (62/78/88/94) y se generan grandes empates. Se ordena por VALOR
-    # ESPERADO del pick = prob_recalibrada * cuota, un numero continuo que
-    # ademas es la metrica que de verdad importa para el bank.
+    # ── FILTRO DE EDGE POSITIVO OBLIGATORIO ───────────────────────────
+    # Solo pasan picks donde el mercado paga mas de lo que Pinnacle implica.
+    # Si no hay cuota de Pinnacle se permite (edge=None -> no penalizar).
+    recomendaciones = [
+        r for r in recomendaciones
+        if r.get("edge") is None or r.get("edge", 0) >= 0
+    ]
+
+    # ── FILTRO DE SCORE DINAMICO POR CUOTA ────────────────────────────
+    # Mas cuota = mas score exigido (el modelo debe estar mas convencido).
+    def _score_min_para_cuota(cuota):
+        for c_min, c_max, s_min in SCORE_MIN_POR_CUOTA:
+            if c_min <= cuota <= c_max:
+                return s_min
+        return 7.5
+
+    def _pasa_filtro_score_cuota(r):
+        cuota = _cuota_segura(r)
+        if cuota <= 0:
+            return True   # sin cuota real no penalizar
+        score = float(r.get("score", 0) or 0)
+        return score >= _score_min_para_cuota(cuota)
+
+    recomendaciones = [r for r in recomendaciones if _pasa_filtro_score_cuota(r)]
+
+    # ── FILTRO DE MERCADOS CONSERVADOR ────────────────────────────────
+    recomendaciones = [
+        r for r in recomendaciones
+        if r.get("mercado", "") in MERCADOS_CONSERVADOR
+    ]
+
+    # ── ORDENAR: score primario, VE como desempate ─────────────────────
+    # V14.2: score vuelve a ser el criterio principal.
+    # VE (prob * cuota) rompe empates entre picks con mismo score.
     def _clave_orden(x):
+        score = float(x.get("score", 0) or 0)
         prob = float(x.get("prob", 0) or 0) / 100.0
-        cuota = (x.get("cuota_api") or x.get("cuota")
-                 or x.get("cuota_minima") or 0)
-        try:
-            cuota = float(cuota)
-        except (ValueError, TypeError):
-            cuota = 0.0
-        ve = prob * cuota          # valor esperado bruto
-        return (ve, float(x.get("prob", 0) or 0))
+        cuota = _cuota_segura(x)
+        ve = prob * cuota
+        return (score, ve)
 
     recomendaciones.sort(key=_clave_orden, reverse=True)
 
@@ -1850,8 +2005,8 @@ def guardar_pick_live_automatico(fixture_id, home, away, country, league, hora, 
 
     picks.append({
         "fixture_id": str(fixture_id),
-        "fecha": fecha_hoy_peru(),
-        "fecha_partido": fecha_hoy_peru(),
+        "fecha": fecha_hoy_peru(),          # fecha Peru al momento de guardar
+        "fecha_partido": fecha_hoy_peru(),  # mismo — el partido es hoy (live)
         "hora": hora,
         "country": country,
         "league": league,
@@ -1911,7 +2066,16 @@ def actualizar_resultados_automaticos():
             continue
 
         fixture_id = p.get("fixture_id")
-        fixture = api_get(f"/fixtures?id={fixture_id}", use_cache=False)
+
+        # B: Saltar fixture_id sinteticos (REC-xxxx) generados por reconstruccion
+        if not fixture_id or str(fixture_id).startswith("REC-"):
+            continue
+
+        try:
+            fixture = api_get(f"/fixtures?id={fixture_id}", use_cache=False)
+        except Exception as e:
+            print(f"WARN actualizar fixture {fixture_id}: {e}")
+            continue
 
         if not fixture:
             continue
@@ -1919,7 +2083,7 @@ def actualizar_resultados_automaticos():
         fixture = fixture[0]
         status = fixture["fixture"]["status"]["short"]
 
-        # Corregir hora del pick si está mal (reconvertir de UTC a Peru)
+        # Corregir hora del pick si esta mal (reconvertir de UTC a Peru)
         fecha_api = fixture["fixture"].get("date","")
         if fecha_api:
             hora_correcta = hora_peru(fecha_api)
@@ -1943,7 +2107,10 @@ def actualizar_resultados_automaticos():
         corners_total = None
         tarjetas_total = None
 
-        stats = api_get(f"/fixtures/statistics?fixture={fixture_id}", use_cache=False)
+        try:
+            stats = api_get(f"/fixtures/statistics?fixture={fixture_id}", use_cache=False)
+        except Exception:
+            stats = None
 
         if stats:
             total_corners = 0
@@ -1954,7 +2121,6 @@ def actualizar_resultados_automaticos():
                     tipo = item.get("type")
                     raw = item.get("value")
 
-                    # La API puede devolver valores como string ("8"), porcentaje ("45%") o None
                     try:
                         if raw is None:
                             valor = 0
@@ -1967,10 +2133,8 @@ def actualizar_resultados_automaticos():
 
                     if tipo == "Corner Kicks":
                         total_corners += valor
-
                     elif tipo == "Yellow Cards":
                         total_cards += valor
-
                     elif tipo == "Red Cards":
                         total_cards += (valor * 2)
 
@@ -1986,8 +2150,33 @@ def actualizar_resultados_automaticos():
 
         jugada_lower = jugada.lower()
 
+        # ── HT (primer tiempo) — usar marcador de halftime, NO el final ──
+        if "ht" in jugada_lower and ("over" in jugada_lower or "under" in jugada_lower):
+            linea = _linea(jugada)
+            # Intentar obtener marcador de primer tiempo desde la API
+            try:
+                score_ht = fixture.get("score", {}).get("halftime", {})
+                gh_ht = score_ht.get("home")
+                ga_ht = score_ht.get("away")
+                if gh_ht is not None and ga_ht is not None:
+                    total_ht = gh_ht + ga_ht
+                    if "over" in jugada_lower:
+                        acierto = total_ht > linea if linea is not None else None
+                    else:
+                        acierto = total_ht < linea if linea is not None else None
+                    p["resultado_real"] = f"HT {gh_ht}-{ga_ht}"
+                else:
+                    # Sin datos HT, dejar pendiente_manual
+                    p["estado"] = "pendiente_manual"
+                    p["resultado"] = "pendiente_manual"
+                    continue
+            except Exception:
+                p["estado"] = "pendiente_manual"
+                p["resultado"] = "pendiente_manual"
+                continue
+
         # ── Goles ────────────────────────────────────────────────────────
-        if "under" in jugada_lower and "gol" in jugada_lower:
+        elif "under" in jugada_lower and "gol" in jugada_lower:
             linea = _linea(jugada)
             acierto = total < linea if linea is not None else None
 
@@ -2038,18 +2227,11 @@ def actualizar_resultados_automaticos():
         elif "12" in jugada_lower:
             acierto = gh != ga
 
-        # ── HT (primer tiempo) ───────────────────────────────────────────
-        elif "ht" in jugada_lower and "over" in jugada_lower:
-            linea = _linea(jugada)
-            acierto = total > linea if linea is not None else None
-
         if "Corners" in jugada:
             p["resultado_real"] = f"{corners_total} corners"
-
         elif "Tarjetas" in jugada:
             p["resultado_real"] = f"{tarjetas_total} tarjetas"
-
-        else:
+        elif "resultado_real" not in p:
             p["resultado_real"] = f"{gh}-{ga}"
 
         if acierto is True:
@@ -2072,10 +2254,27 @@ def actualizar_resultados_automaticos():
     if cambios > 0:
         try:
             _actualizar_resultado_combinada()
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"WARN _actualizar_resultado_combinada: {e}")
 
     return picks, cambios
+
+
+async def _enviar_mensaje_paginado(update, texto, parse_mode="Markdown", chunk=3900):
+    """Divide mensajes largos en partes para no superar el limite de Telegram."""
+    if len(texto) <= chunk:
+        await update.message.reply_text(texto, parse_mode=parse_mode)
+        return
+    partes = []
+    while texto:
+        partes.append(texto[:chunk])
+        texto = texto[chunk:]
+    for i, parte in enumerate(partes):
+        sufijo = f"\n_(parte {i+1}/{len(partes)})_" if len(partes) > 1 else ""
+        try:
+            await update.message.reply_text(parte + sufijo, parse_mode=parse_mode)
+        except Exception:
+            await update.message.reply_text(parte + sufijo)
 
 
 def resumen_historial():
@@ -2297,12 +2496,12 @@ def obtener_partidos_configurados():
 
 def generar_top(score_minimo=7.5):
     oportunidades = []
-    _umbral_prob_top = umbral_prob_desde_score_legado(score_minimo)
 
     ligas = {}
     ligas.update(EUROPA_LEAGUES)
     ligas.update(SUDAMERICA_LEAGUES)
     ligas.update(OTRAS_LEAGUES)
+    ligas.update(SELECCIONES_LEAGUES)
 
     today = fecha_hoy_peru()
 
@@ -2336,10 +2535,9 @@ def generar_top(score_minimo=7.5):
 
                 top = data["recomendaciones"][0]
 
-                # Criterio unico V14: filtrar por PROBABILIDAD recalibrada,
-                # no por score crudo (tras recalibrar el score cambio de
-                # rango). score_minimo se traduce a umbral de probabilidad.
-                if float(top.get("prob", 0) or 0) < _umbral_prob_top:
+                # V14.2: filtrar por SCORE como criterio principal
+                score_top = float(top.get("score", 0) or 0)
+                if score_top < score_minimo:
                     continue
 
                 oportunidades.append({
@@ -2355,7 +2553,7 @@ def generar_top(score_minimo=7.5):
             except Exception as e:
                 print("ERROR TOP:", e)
 
-    # PUNTO 2: orden descendente (mejores primero). Antes faltaba reverse=True
+    # Ordenar: score descendente, riesgo ascendente como desempate
     oportunidades.sort(
         key=lambda x: (float(x.get("score", 0) or 0),
                        -int(x.get("riesgo", 9) or 9),
@@ -2363,7 +2561,7 @@ def generar_top(score_minimo=7.5):
         reverse=True,
     )
 
-    return oportunidades[:10]
+    return oportunidades[:MAX_PICKS_DIA]
 
 def _formatear_pick_mensaje(o, idx=None, mostrar_id=True):
     """
@@ -2445,12 +2643,12 @@ def _formatear_pick_mensaje(o, idx=None, mostrar_id=True):
 
 def generar_top_fecha(fecha, score_minimo=7.5):
     oportunidades = []
-    _umbral_prob_top = umbral_prob_desde_score_legado(score_minimo)
 
     ligas = {}
     ligas.update(EUROPA_LEAGUES)
     ligas.update(SUDAMERICA_LEAGUES)
     ligas.update(OTRAS_LEAGUES)
+    ligas.update(SELECCIONES_LEAGUES)
 
     partidos = obtener_fixtures_por_fecha(ligas, fecha)
 
@@ -2467,8 +2665,9 @@ def generar_top_fecha(fecha, score_minimo=7.5):
 
             top = data["recomendaciones"][0]
 
-            # Criterio unico V14: filtrar por probabilidad recalibrada.
-            if float(top.get("prob", 0) or 0) < _umbral_prob_top:
+            # V14.2: score como criterio principal
+            score_top = float(top.get("score", 0) or 0)
+            if score_top < score_minimo:
                 continue
 
             oportunidades.append({
@@ -2485,11 +2684,11 @@ def generar_top_fecha(fecha, score_minimo=7.5):
             print("ERROR TOP FECHA:", e)
 
     oportunidades.sort(
-        key=lambda x: x["score"],
+        key=lambda x: float(x.get("score", 0) or 0),
         reverse=True
     )
 
-    return oportunidades
+    return oportunidades[:MAX_PICKS_DIA]
 
 def extraer_stats_live(stats_response):
     stats = {}
@@ -4096,14 +4295,81 @@ async def enviar_rendimiento_nocturno(context: ContextTypes.DEFAULT_TYPE):
         )
 
 
-async def _check_combinadas_job(context: ContextTypes.DEFAULT_TYPE):
+async def _job_actualizar_estados(context: ContextTypes.DEFAULT_TYPE):
+    """
+    Job global cada 20 minutos: actualiza estados de picks y combinadas
+    pendientes automaticamente, independientemente de si hay alertas activas.
+    Tambien detecta rachas de fallos y freno de bank.
+    """
+    try:
+        picks, cambios = actualizar_resultados_automaticos()
+        if cambios > 0:
+            print(f"[auto-update] {cambios} picks actualizados")
+
+        # V: Alerta de racha de fallos consecutivos
+        picks_cerrados_recientes = [
+            p for p in picks
+            if p.get("estado", "").lower() in ("acierto", "fallo")
+        ]
+        picks_cerrados_recientes.sort(
+            key=lambda p: p.get("timestamp", ""), reverse=True
+        )
+        ultimos = picks_cerrados_recientes[:RACHA_FALLOS_ALERTA]
+        if (len(ultimos) == RACHA_FALLOS_ALERTA
+                and all(p.get("estado") == "fallo" for p in ultimos)):
+            chats = _cargar_chat_ids_alarmas()
+            for cid in chats:
+                try:
+                    await context.bot.send_message(
+                        chat_id=cid,
+                        text=(
+                            f"⚠️ *ALERTA: {RACHA_FALLOS_ALERTA} fallos consecutivos*\n"
+                            f"El sistema detectó una racha negativa. "
+                            f"Considera revisar los criterios antes de continuar."
+                        ),
+                        parse_mode="Markdown"
+                    )
+                except Exception:
+                    pass
+
+        # U: Freno de bank
+        try:
+            bank_data = _leer_bank_acumulado()
+            if bank_data:
+                bank_actual = bank_data[-1].get("bank", BANK_INICIAL)
+                freno = BANK_INICIAL * BANK_FRENO_PCT
+                if bank_actual <= freno:
+                    chats = _cargar_chat_ids_alarmas()
+                    for cid in chats:
+                        try:
+                            await context.bot.send_message(
+                                chat_id=cid,
+                                text=(
+                                    f"🛑 *FRENO DE BANK ACTIVADO*\n"
+                                    f"Bank actual: S/ {bank_actual:.2f} "
+                                    f"(límite: S/ {freno:.2f})\n"
+                                    f"No se generarán nuevos picks hasta revisión manual."
+                                ),
+                                parse_mode="Markdown"
+                            )
+                        except Exception:
+                            pass
+        except Exception as e:
+            print(f"WARN freno bank: {e}")
+
+    except Exception as e:
+        print(f"ERROR _job_actualizar_estados: {e}")
     """
     Job periodico cada 15 minutos.
     Actualiza resultados de picks y combinadas pendientes automaticamente.
     Si alguna combinada se cierra, notifica al chat.
     """
     try:
-        # Verificar estado antes de actualizar
+        # Siempre actualizar picks individuales (no solo cuando hay combinadas)
+        actualizar_resultados_automaticos()
+        _actualizar_resultado_combinada()
+
+        # Verificar cuales combinadas cambiaron
         combinadas_antes = leer_json(COMBINADAS_FILE)
         pendientes_antes = {
             c.get("ticket_id",""): c.get("estado","pendiente")
@@ -4112,14 +4378,6 @@ async def _check_combinadas_job(context: ContextTypes.DEFAULT_TYPE):
             and not c.get("sin_combinada")
         }
 
-        if not pendientes_antes:
-            return  # No hay pendientes, no hacer nada
-
-        # Actualizar picks y combinadas
-        actualizar_resultados_automaticos()
-        _actualizar_resultado_combinada()
-
-        # Verificar cuales cambiaron
         combinadas_despues = leer_json(COMBINADAS_FILE)
         chat_id = context.job.chat_id
 
@@ -4247,6 +4505,8 @@ def obtener_fixtures_por_fecha(ligas, fecha):
                 "home": m["teams"]["home"]["name"],
                 "away": m["teams"]["away"]["name"],
                 "league": titulo_liga,
+                "country": country,
+                "round": m["league"].get("round", ""),
                 "hour": hora_peru(m["fixture"]["date"]),
                 "timestamp": m["fixture"]["timestamp"]
             })
@@ -4345,17 +4605,23 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     programar_reportes(context, chat_id)
 
     menu = (
-        "🤖 *HarryNine V14* activo 😎🔥\n"
+        "🤖 *HarryNine V14.2* activo 😎🔥\n"
         "━━━━━━━━━━\n"
         "📋 *FIXTURES*\n"
         "/fixtures — Partidos de hoy (todas las ligas)\n"
         "/fixtures_manana — Manana todas\n"
         "━━━━━━━━━━\n"
         "🔍 *ANALISIS*\n"
-        "/analizar_all — Analiza TODAS las ligas automaticamente\n"
+        "/analizar_all — Analiza TODAS las ligas + selecciones + Mundial\n"
         "/analizar ID — Analiza un partido especifico\n"
         "/detalle ID — Detalle completo de un partido\n"
         "/scanear — Escanea todas las ligas\n"
+        "━━━━━━━━━━\n"
+        "🌍 *SELECCIONES Y MUNDIAL 2026*\n"
+        "Los comandos /top, /elite y /analizar_all ya incluyen:\n"
+        "• FIFA World Cup 2026 (desde 11 jun)\n"
+        "• Amistosos internacionales\n"
+        "• Clasificatorias activas\n"
         "━━━━━━━━━━\n"
         "🎯 *PICKS PREMATCH*\n"
         "/top — Mejores picks de hoy (score 7.5+)\n"
@@ -4365,7 +4631,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "━━━━━━━━━━\n"
         "🔴 *PICKS LIVE*\n"
         "/live_all — Analiza TODOS los partidos live auto\n"
-        "/live ID — Analisis de un partido live por ID\n"
         "/alertas_on — Activa alertas automaticas live\n"
         "/alertas_off — Desactiva alertas\n"
         "━━━━━━━━━━\n"
@@ -4373,39 +4638,26 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/combinada — Combinada optima prematch del dia\n"
         "/combinada_live — Combinada optima picks live ahora\n"
         "/combinada_mixta — Combinada mixta prematch + live\n"
-        "/comb3 — Combinada cuota 3x+ prematch\n"
-        "/comb3_live — Combinada cuota 3x+ live\n"
-        "/comb3_mixta — Combinada cuota 3x+ mixta\n"
-        "/comb4 — Combinada 4x+ prematch (3-4 picks)\n"
-        "/comb4_live — Combinada 4x+ live\n"
-        "/comb4_mixta — Combinada 4x+ mixta\n"
-        "/comb5 — Combinada 5x+ prematch (3-4 picks)\n"
-        "/comb5_live — Combinada 5x+ live\n"
-        "/comb5_mixta — Combinada 5x+ mixta\n"
+        "/comb3 /comb4 /comb5 — Combinadas cuota alta\n"
         "━━━━━━━━━━\n"
-        "📊 *REPORTES PDF*\n"
-        "/resumen — Resumen del dia (todos los picks)\n"
+        "📊 *REPORTES*\n"
+        "/resumen — Resumen del dia (actualiza estados)\n"
         "/resumen_ayer — Resumen de ayer + combinadas\n"
         "/resumen_prematch — Solo picks prematch de hoy\n"
         "/resumen_live — Solo picks live de hoy\n"
         "/resumen_combinadas — Solo combinadas de hoy\n"
         "/estado — Dashboard rapido del dia\n"
         "/escalera — Escalera cronologica de picks\n"
-        "/confirmar_escalera — Confirma la escalera\n"
-        "/cancelar_escalera — Cancela la escalera activa\n"
-        "/resumentop — Solo picks prematch\n"
-        "/resumentoplive — Solo picks live\n"
-        "/pdf_semana — Reporte semanal completo\n"
-        "/pdf_mes — Reporte mensual completo\n"
         "/rendimiento — Reporte de rendimiento + bank\n"
+        "/pdf_semana — Reporte semanal PDF\n"
+        "/pdf_mes — Reporte mensual PDF\n"
         "━━━━━━━━━━\n"
         "🔧 *UTILIDADES*\n"
-        "/feedback ID acierto — Marcar pick como acierto\n"
-        "/feedback ID fallo — Marcar pick como fallo\n"
+        "/feedback ID acierto|fallo — Marcar resultado\n"
         "━━━━━━━━━━\n"
-        "⏰ *REPORTES AUTOMATICOS*\n"
+        "⏰ *AUTOMATICO*\n"
+        "Estados: actualiza cada 20 min\n"
         "Semanal: domingos 9:00 PM hora Peru\n"
-        "Mensual: diario 9:10 PM hora Peru\n"
         "Rendimiento nocturno: 11:59 PM hora Peru\n"
     )
     _registrar_chat_alarma(update.effective_chat.id)
@@ -4726,15 +4978,8 @@ async def elite(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def top(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ops = generar_top()
+    # generar_top ya ordena correctamente por score — no re-ordenar aqui
 
-    ops = sorted(
-    ops,
-    key=lambda x: (
-        -x["score"],
-        x["riesgo"]
-    )
-)
-    
     if not ops:
         await update.message.reply_text("❌ No encontré oportunidades fuertes.")
         return
@@ -5071,7 +5316,13 @@ def construir_resumen_textual(picks, titulo="Resumen Diario"):
 
 async def resumen(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
-    await update.message.reply_text("📄 Generando resumen del día...")
+    await update.message.reply_text("📄 Actualizando estados y generando resumen del día...")
+
+    # C: Actualizar estados ANTES de construir el texto
+    try:
+        actualizar_resultados_automaticos()
+    except Exception as e:
+        print(f"WARN resumen actualizar: {e}")
 
     # PUNTO 5: resumen textual estilo Telegram (sin abrir archivos)
     try:
@@ -5079,7 +5330,7 @@ async def resumen(update: Update, context: ContextTypes.DEFAULT_TYPE):
                      if p.get("fecha") == fecha_hoy_peru()
                      or p.get("fecha_partido") == fecha_hoy_peru()]
         texto = construir_resumen_textual(picks_hoy, "Resumen Diario")
-        await update.message.reply_text(texto, parse_mode="Markdown")
+        await _enviar_mensaje_paginado(update, texto)
     except Exception as e:
         await update.message.reply_text(f"⚠️ No se pudo generar el resumen textual: {e}")
 
@@ -5570,13 +5821,21 @@ def _registrar_aprendizaje(pick, resultado):
         "away": away,
         "liga": pick.get("league") or pick.get("liga") or "Desconocida",
         "pais": pick.get("country", ""),
-        # Pick
+        # Pick — valores originales Y recalibrados para ML
         "mercado": pick.get("mercado", ""),
         "jugada": pick.get("jugada", ""),
         "score": float(pick.get("score", 0) or 0),
+        "score_original": float(pick.get("score_original", pick.get("score", 0)) or 0),
         "riesgo": float(pick.get("riesgo", 5) or 5),
         "probabilidad": float(pick.get("probabilidad", 0) or 0),
+        "prob_original": float(pick.get("prob_original", pick.get("probabilidad", 0)) or 0),
         "cuota": float(pick.get("cuota", 1.0) or 1.0),
+        "edge": pick.get("edge"),
+        "valor_esperado": pick.get("valor_esperado"),
+        # xG de predictions (si estuvo disponible)
+        "xg_pred_home": pick.get("xg_pred_home"),
+        "xg_pred_away": pick.get("xg_pred_away"),
+        "xg_pred_total": pick.get("xg_pred_total"),
         "tipo": pick.get("tipo", "prematch"),
         "minuto_consulta": pick.get("minuto_consulta"),  # para picks live
         "resultado": resultado,
@@ -5720,8 +5979,9 @@ def _guardar_snapshot_aprendizaje():
 # ─────────────────────────────────────────────
 
 def _cuota_segura(pick):
-    """Extrae la cuota de un pick de forma segura, tolerando None, 0 y strings."""
-    for campo in ("cuota", "cuota_minima"):
+    """Extrae la cuota de un pick de forma segura, tolerando None, 0 y strings.
+    Orden: cuota_api (Pinnacle real) > cuota_pinnacle > cuota > cuota_minima."""
+    for campo in ("cuota_api", "cuota_pinnacle", "cuota", "cuota_minima"):
         val = pick.get(campo)
         if val is None:
             continue
@@ -6071,6 +6331,10 @@ def _armar_combinada_del_dia():
             continue
         for grupo in _comb(candidatos, n):
             grupo = list(grupo)
+            # G: Verificar que todos sean partidos DISTINTOS (no correlacionados)
+            ids_grupo = [str(p.get("fixture_id", "")) for p in grupo]
+            if len(set(ids_grupo)) < len(ids_grupo):
+                continue
             cuota_comb = 1.0
             for p in grupo:
                 cuota_comb *= max(_cuota_segura(p), 1.0)
@@ -6165,12 +6429,34 @@ def _guardar_combinada(combinada):
     guardar_json_lista(COMBINADAS_FILE, combinadas)
 
 
-# Chat IDs que reciben alarmas de combinadas
+# Chat IDs que reciben alarmas de combinadas — persistidos en JSON
 _CHAT_IDS_ALARMAS = set()
+
+
+def _cargar_chat_ids_alarmas():
+    """Carga los chat_ids desde disco al arrancar."""
+    global _CHAT_IDS_ALARMAS
+    try:
+        data = leer_json(CHAT_IDS_ALARMAS_FILE)
+        if isinstance(data, list):
+            _CHAT_IDS_ALARMAS = set(str(c) for c in data)
+    except Exception:
+        pass
+    return _CHAT_IDS_ALARMAS
+
+
+def _guardar_chat_ids_alarmas():
+    """Persiste los chat_ids a disco."""
+    try:
+        guardar_json_lista(CHAT_IDS_ALARMAS_FILE, list(_CHAT_IDS_ALARMAS))
+    except Exception as e:
+        print(f"WARN guardar chat_ids_alarmas: {e}")
+
 
 def _registrar_chat_alarma(chat_id):
     """Registra un chat_id para recibir alarmas de combinadas."""
     _CHAT_IDS_ALARMAS.add(str(chat_id))
+    _guardar_chat_ids_alarmas()
 
 def _actualizar_resultado_combinada():
     """
@@ -8133,6 +8419,7 @@ async def analizar_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ligas_todas.update(EUROPA_LEAGUES)
     ligas_todas.update(SUDAMERICA_LEAGUES)
     ligas_todas.update(OTRAS_LEAGUES)
+    ligas_todas.update(SELECCIONES_LEAGUES)
 
     partidos = obtener_fixtures_por_fecha(ligas_todas, hoy)
 
@@ -8275,7 +8562,13 @@ async def analizar_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 # crudo: tras recalibrar, el score 7.5+ descartaria casi
                 # todo y los picks no entrarian al resumen.
                 prob_rec = float(top.get("prob", 0) or 0)
-                if prob_rec < 70:
+                score_rec = float(top.get("score", 0) or 0)
+                # V14.2: filtrar por SCORE como criterio principal (no prob)
+                if score_rec < 7.5:
+                    continue
+
+                # Limit: max MAX_PICKS_DIA picks por dia
+                if len(picks_encontrados) >= MAX_PICKS_DIA:
                     continue
 
                 # Usar cuota real de la API si existe, si no la calculada
@@ -8678,7 +8971,7 @@ def _obtener_picks_live_ahora(score_min=7.5, riesgo_max=2):
                 "minuto_consulta": minuto,
                 "marcador": f"{gh}-{ga}",
                 "score": score_live,
-                "riesgo": riesgo,
+                "riesgo": float(mejor.get("riesgo", 5) or 5),
                 "probabilidad": mejor.get("prob", 0),
                 "cuota": cuota if cuota > 1.0 else 0.0,
                 "cuota_minima": cuota if cuota > 1.0 else 0.0,
@@ -9929,7 +10222,7 @@ async def actualizar_combinadas_cmd(update: Update, context: ContextTypes.DEFAUL
 
 ESCALERA_STAKE_INICIAL = 20.0
 ESCALERA_SCORE_MIN = 8.5
-ESCALERA_CUOTA_MIN = 1.30
+ESCALERA_CUOTA_MIN = 1.50   # Consistente con CUOTA_MINIMA_PICK del sistema
 
 _escaleras_activas = {}  # chat_id -> escalera dict
 
@@ -11534,6 +11827,18 @@ async def _registrar_comandos_bot(context):
         pass
 
 app.job_queue.run_once(_registrar_comandos_bot, when=3)
+
+# Cargar chat_ids de alarmas persistidos (sobreviven reinicios)
+_cargar_chat_ids_alarmas()
+
+# Job GLOBAL de actualizacion de estados cada 20 minutos
+# Independiente de alertas — siempre activo.
+app.job_queue.run_repeating(
+    _job_actualizar_estados,
+    interval=1200,   # cada 20 minutos
+    first=30,
+    name="auto_update_estados_global",
+)
 
 # Job GLOBAL de alertas live: uno solo para todos los suscriptores.
 # Se registra siempre al arrancar; si no hay suscriptores el job retorna
