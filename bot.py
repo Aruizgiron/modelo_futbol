@@ -548,6 +548,9 @@ def clamp(valor, minimo, maximo):
 def cuota_justa(probabilidad):
     if probabilidad <= 0:
         return None
+    # Si la probabilidad viene como decimal (0-1), convertir a porcentaje
+    if probabilidad < 1:
+        probabilidad = probabilidad * 100
     return round(100 / probabilidad, 2)
 
 
