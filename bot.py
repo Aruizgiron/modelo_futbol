@@ -116,14 +116,19 @@ OTRAS_LEAGUES = {
 # ── SELECCIONES NACIONALES Y MUNDIAL ────────────────────────────────────
 # Incluidas en analizar_all y generar_top con motor analizar_seleccion.
 # El Mundial 2026 arranca el 11 de junio (league=1, season=2026).
+# ID=10: Friendlies internacionales de selecciones mayores (Portugal vs Chile, etc.)
+# ID=667: Friendlies de clubes (NO de selecciones — excluido)
 SELECCIONES_LEAGUES = {
     "FIFA World Cup 2026":            {"id": 1,   "season": 2026, "country": "World"},
-    "Friendlies Internacionales":     {"id": 667, "season": 2026, "country": "World"},
+    "Friendlies Internacionales":     {"id": 10,  "season": 2026, "country": "World"},
+    "Friendlies Women":               {"id": 666, "season": 2026, "country": "World"},
     "WC Qualif. CONMEBOL":            {"id": 35,  "season": 2026, "country": "World"},
     "WC Qualif. UEFA":                {"id": 32,  "season": 2026, "country": "World"},
     "WC Qualif. CONCACAF":            {"id": 30,  "season": 2026, "country": "World"},
     "WC Qualif. AFC":                 {"id": 36,  "season": 2026, "country": "World"},
     "WC Qualif. CAF":                 {"id": 29,  "season": 2026, "country": "World"},
+    "UEFA U19 Championship Qual":     {"id": 893, "season": 2026, "country": "World"},
+    "Baltic Cup":                     {"id": 849, "season": 2026, "country": "World"},
 }
 
 
