@@ -4295,6 +4295,62 @@ async def enviar_rendimiento_nocturno(context: ContextTypes.DEFAULT_TYPE):
         )
 
 
+async def _check_combinadas_job(context: ContextTypes.DEFAULT_TYPE):
+    """
+    Job periodico cada 15 minutos.
+    Actualiza resultados de picks y combinadas pendientes automaticamente.
+    Si alguna combinada se cierra, notifica al chat.
+    """
+    try:
+        # Siempre actualizar picks individuales (no solo cuando hay combinadas)
+        actualizar_resultados_automaticos()
+        _actualizar_resultado_combinada()
+
+        # Verificar cuales combinadas cambiaron
+        combinadas_antes = leer_json(COMBINADAS_FILE)
+        pendientes_antes = {
+            c.get("ticket_id",""): c.get("estado","pendiente")
+            for c in combinadas_antes
+            if c.get("estado","pendiente") == "pendiente"
+            and not c.get("sin_combinada")
+        }
+
+        combinadas_despues = leer_json(COMBINADAS_FILE)
+        chat_id = context.job.chat_id
+
+        for c in combinadas_despues:
+            ticket = c.get("ticket_id","")
+            if ticket not in pendientes_antes:
+                continue
+            nuevo_estado = c.get("estado","pendiente")
+            if nuevo_estado == pendientes_antes[ticket]:
+                continue
+            if nuevo_estado.lower() == "acierto":
+                emoji = "✅"
+                cuota = c.get("cuota_combinada", "?")
+                picks_txt = " + ".join(
+                    p.get("jugada","?") for p in c.get("picks",[])
+                )
+                await context.bot.send_message(
+                    chat_id=chat_id,
+                    text=(
+                        f"{emoji} *COMBINADA CERRADA — ACIERTO*\n"
+                        f"Ticket: {ticket}\n"
+                        f"Cuota: {cuota}x\n"
+                        f"Picks: {picks_txt}"
+                    ),
+                    parse_mode="Markdown"
+                )
+            elif nuevo_estado.lower() == "fallo":
+                await context.bot.send_message(
+                    chat_id=chat_id,
+                    text=f"❌ *Combinada {ticket} — fallo*",
+                    parse_mode="Markdown"
+                )
+    except Exception as e:
+        print(f"ERROR _check_combinadas_job: {e}")
+
+
 async def _job_actualizar_estados(context: ContextTypes.DEFAULT_TYPE):
     """
     Job global cada 20 minutos: actualiza estados de picks y combinadas
