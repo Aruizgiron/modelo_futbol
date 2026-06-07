@@ -5097,20 +5097,40 @@ async def analizar(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     "cuota": cuota_r,
                 })
 
-        # Sin Tarjeta Roja para este partido
+        # Sin Tarjeta Roja para este partido - solo con cuota real de Pinnacle
         fase_p = _detectar_fase_torneo(league, "")
         prob_sr = calcular_prob_sin_roja(home_gen, away_gen, fase_p)
         if prob_sr >= 75:
-            cuota_sr = round(100 / prob_sr + 0.05, 2)
-            if MINI_TICKET_CUOTA_MIN <= cuota_sr <= MINI_TICKET_CUOTA_MAX:
+            odds_sr_p = api_get(f"/odds?fixture={fixture_id}", use_cache=True, ttl=600)
+            cuota_sr_real = None
+            if odds_sr_p:
+                PINNACLE_NAMES_SR = {"Pinnacle", "Pinnacle Sports"}
+                RED_CARD_MARKETS_SR = {"Red Card", "Will There Be a Red Card",
+                                       "Red Cards", "Tarjeta Roja"}
+                for casa_sr in odds_sr_p:
+                    for book_sr in casa_sr.get("bookmakers", []):
+                        if book_sr.get("name","") not in PINNACLE_NAMES_SR:
+                            continue
+                        for bet_sr in book_sr.get("bets", []):
+                            if not any(rc.lower() in bet_sr.get("name","").lower()
+                                       for rc in RED_CARD_MARKETS_SR):
+                                continue
+                            for val_sr in bet_sr.get("values", []):
+                                if str(val_sr.get("value","")).lower() in ("no","nein","non"):
+                                    try:
+                                        c_r = float(val_sr.get("odd"))
+                                        if c_r > 1.0:
+                                            cuota_sr_real = round(c_r, 3)
+                                    except Exception:
+                                        pass
+            if cuota_sr_real and MINI_TICKET_CUOTA_MIN <= cuota_sr_real <= MINI_TICKET_CUOTA_MAX:
                 eslabones_p.append({
                     "fixture_id": fixture_id,
                     "partido": f"{home} vs {away}",
                     "mercado": "Sin Tarjeta Roja",
                     "jugada": "Sin Tarjeta Roja",
                     "prob": prob_sr,
-                    "cuota": cuota_sr,
-                    "cuota_estimada": True,
+                    "cuota": cuota_sr_real,
                 })
 
         # Armar combinaciones de 2 eslabones del mismo partido
@@ -7734,8 +7754,8 @@ def generar_mini_tickets_dia():
                             "fecha": hoy,
                         })
 
-            # 3. Sin Tarjeta Roja — solo para ligas con estadisticas disponibles
-            # Excluir ligas menores donde la API no devuelve stats
+            # 3. Sin Tarjeta Roja — SOLO si hay cuota real de Pinnacle
+            # No usar cuota estimada en mini-tickets (mismo criterio que handicap)
             liga_sin_stats = any(
                 ls.lower() in league.lower()
                 for ls in LIGAS_SIN_STATS
@@ -7747,9 +7767,37 @@ def generar_mini_tickets_dia():
                     fase_p = _detectar_fase_torneo(league, round_p)
 
                 prob_sin_roja = calcular_prob_sin_roja(home_gen, away_gen, fase_p)
-                if prob_sin_roja >= 75:  # solo si hay confianza suficiente
-                    cuota_sin_roja = round(100 / prob_sin_roja + 0.05, 2)
-                    if MINI_TICKET_CUOTA_MIN <= cuota_sin_roja <= MINI_TICKET_CUOTA_MAX:
+                if prob_sin_roja >= 75:
+                    # Buscar cuota REAL de Pinnacle en odds
+                    odds_sr = api_get(
+                        f"/odds?fixture={fixture_id}",
+                        use_cache=True, ttl=600
+                    )
+                    cuota_sin_roja_real = None
+                    if odds_sr:
+                        PINNACLE_NAMES = {"Pinnacle", "Pinnacle Sports"}
+                        RED_CARD_MARKETS = {"Red Card", "Will There Be a Red Card",
+                                           "Red Cards", "Tarjeta Roja"}
+                        for casa in odds_sr:
+                            for book in casa.get("bookmakers", []):
+                                if book.get("name","") not in PINNACLE_NAMES:
+                                    continue
+                                for bet in book.get("bets", []):
+                                    bet_name = bet.get("name","")
+                                    if not any(rc.lower() in bet_name.lower()
+                                               for rc in RED_CARD_MARKETS):
+                                        continue
+                                    for value in bet.get("values", []):
+                                        if str(value.get("value","")).lower() in ("no","nein","non"):
+                                            try:
+                                                c_real = float(value.get("odd"))
+                                                if c_real > 1.0:
+                                                    cuota_sin_roja_real = round(c_real, 3)
+                                            except Exception:
+                                                pass
+
+                    # Solo agregar si hay cuota real de Pinnacle
+                    if cuota_sin_roja_real and MINI_TICKET_CUOTA_MIN <= cuota_sin_roja_real <= MINI_TICKET_CUOTA_MAX:
                         jugada_sr = "Sin Tarjeta Roja"
                         clave_sr = (fixture_id, jugada_sr)
                         if clave_sr not in picks_ya_usados:
@@ -7763,10 +7811,10 @@ def generar_mini_tickets_dia():
                                 "mercado": "Sin Tarjeta Roja",
                                 "jugada": jugada_sr,
                                 "prob": prob_sin_roja,
-                                "cuota": cuota_sin_roja,
+                                "cuota": cuota_sin_roja_real,
                                 "score": 7.0,
                                 "fecha": hoy,
-                                "cuota_estimada": True,
+                                # Sin cuota_estimada=True porque es real
                             })
 
         except Exception as e:
