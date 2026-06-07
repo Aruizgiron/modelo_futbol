@@ -3682,7 +3682,7 @@ def generar_pdf_resumen():
         except Exception:
             pass
 
-    # ── Seccion combinada del dia ────────────────────────────────────
+    # ── Seccion combinadas y mini-tickets del dia ────────────────────
     y -= 10
     c.setFont("Helvetica-Bold", 12)
     c.drawString(40, y, "COMBINADA DEL DIA")
@@ -3690,9 +3690,25 @@ def generar_pdf_resumen():
     c.setFont("Helvetica", 10)
 
     comb_hoy = None
+    mini_tickets_hoy = []
     try:
         combinadas = leer_json(COMBINADAS_FILE)
-        comb_hoy = next((c2 for c2 in combinadas if c2.get("fecha") == hoy), None)
+        # Combinada principal (no MT)
+        comb_hoy = next(
+            (c2 for c2 in combinadas
+             if c2.get("fecha") == hoy
+             and c2.get("subtipo") not in ("MT",)
+             and not c2.get("sin_combinada")
+             and c2.get("picks")),
+            None
+        )
+        # Mini-tickets del dia
+        mini_tickets_hoy = [
+            c2 for c2 in combinadas
+            if c2.get("fecha") == hoy
+            and c2.get("subtipo") == "MT"
+            and c2.get("picks")
+        ]
     except Exception:
         pass
 
@@ -3704,18 +3720,46 @@ def generar_pdf_resumen():
         y -= 14
         for i, pk in enumerate(comb_hoy.get("picks", []), 1):
             cuota_p = pk.get("cuota") or pk.get("cuota_minima") or "?"
-            linea = f"  {i}. {pk.get('partido','')} — {pk.get('jugada','')} | Score: {pk.get('score','')} | Cuota: {cuota_p}"
+            estado_pk = pk.get("estado", "pendiente")
+            linea = f"  {i}. {pk.get('partido','')} — {pk.get('jugada','')} | Score: {pk.get('score','')} | Cuota: {cuota_p} | {estado_pk.upper()}"
             c.drawString(40, y, linea[:110])
             y -= 14
-        if comb_hoy.get("fallo_en"):
+        # Solo mostrar "Fallo en" si el estado real es fallo
+        if comb_hoy.get("estado","").lower() == "fallo" and comb_hoy.get("fallo_en"):
             c.drawString(40, y, f"  Fallo en: {comb_hoy.get('fallo_en','')}")
             y -= 14
     elif comb_hoy and comb_hoy.get("sin_combinada"):
         c.drawString(40, y, f"Sin combinada rentable: {comb_hoy.get('motivo','')}")
         y -= 14
     else:
-        c.drawString(40, y, "No se genero combinada hoy (usa /combinada para generarla)")
+        c.drawString(40, y, "No se genero combinada hoy (usa /combinada_dia para generarla)")
         y -= 14
+
+    # Mini-tickets del dia
+    if mini_tickets_hoy:
+        y -= 10
+        c.setFont("Helvetica-Bold", 11)
+        c.drawString(40, y, f"MINI-TICKETS DEL DIA ({len(mini_tickets_hoy)} tickets)")
+        y -= 16
+        c.setFont("Helvetica", 9)
+        for mt in mini_tickets_hoy:
+            estado_mt = mt.get("estado", "pendiente").upper()
+            cuota_mt = mt.get("cuota_combinada", "?")
+            prob_mt = mt.get("prob_conjunta", "?")
+            ticket_id = mt.get("ticket_id", "")
+            c.drawString(40, y, f"Ticket: {ticket_id} | Cuota: {cuota_mt}x | Prob: {prob_mt}% | Estado: {estado_mt}")
+            y -= 12
+            for i, pk in enumerate(mt.get("picks", []), 1):
+                cuota_p = pk.get("cuota") or "?"
+                estado_pk = pk.get("estado", "pendiente")
+                linea = f"  {i}. {pk.get('partido','')} — {pk.get('jugada','')} | {cuota_p}x | {estado_pk.upper()}"
+                c.drawString(40, y, linea[:110])
+                y -= 11
+            y -= 5
+            if y < 80:
+                c.showPage()
+                y = 780
+                c.setFont("Helvetica", 9)
 
     c.save()
 
@@ -6408,7 +6452,7 @@ def _actualizar_bank_acumulado():
                 "partido": p.get("partido", ""),
             })
 
-        # 2. Combinadas cerradas del mes
+        # 2. Combinadas y mini-tickets cerrados del mes
         combinadas = leer_json(COMBINADAS_FILE)
         for c in combinadas:
             estado = (c.get("estado") or "").lower()
@@ -6421,6 +6465,16 @@ def _actualizar_bank_acumulado():
                 continue
             cuota = float(c.get("cuota_combinada", 1.0) or 1.0)
             cuota = min(max(cuota, 1.01), 50.0)
+            # Mini-tickets usan stake fijo S/10, combinadas normales usan STAKE_COMBINADA
+            if c.get("subtipo") == "MT":
+                stake_pct_c = 10.0 / max(bank, 1.0)  # S/10 fijos
+                stake_fijo = 10.0
+            elif c.get("subtipo") == "DIA":
+                stake_pct_c = STAKE_COMBINADA_DIA / max(bank, 1.0)
+                stake_fijo = STAKE_COMBINADA_DIA
+            else:
+                stake_pct_c = STAKE_COMBINADA
+                stake_fijo = None
             operaciones.append({
                 "timestamp": c.get("timestamp", fecha_c),
                 "fecha": fecha_c,
@@ -6428,7 +6482,8 @@ def _actualizar_bank_acumulado():
                 "ticket": c.get("ticket_id", ""),
                 "subtipo": c.get("subtipo", "combinada"),
                 "cuota": cuota,
-                "stake_pct": STAKE_COMBINADA,
+                "stake_pct": stake_pct_c,
+                "stake_fijo": stake_fijo,
                 "estado": estado,
             })
 
@@ -6436,8 +6491,11 @@ def _actualizar_bank_acumulado():
         operaciones.sort(key=lambda x: x.get("timestamp", ""))
 
         for op in operaciones:
-            stake_pct = op["stake_pct"]
-            stake = round(bank * stake_pct, 2)
+            stake_fijo = op.get("stake_fijo")
+            if stake_fijo:
+                stake = round(stake_fijo, 2)
+            else:
+                stake = round(bank * op["stake_pct"], 2)
             cuota = op["cuota"]
             estado = op["estado"]
 
