@@ -2324,10 +2324,12 @@ def actualizar_resultados_automaticos():
                 for td_sr in stats:
                     for item_sr in td_sr.get("statistics", []):
                         if item_sr.get("type") == "Red Cards":
-                            try:
-                                rojas_pick += int(str(item_sr.get("value") or 0))
-                            except Exception:
-                                pass
+                            val_sr = item_sr.get("value")
+                            if val_sr is not None:
+                                try:
+                                    rojas_pick += int(str(val_sr))
+                                except Exception:
+                                    pass
             acierto = rojas_pick == 0
             p["resultado_real"] = f"{rojas_pick} rojas"
 
@@ -7416,17 +7418,18 @@ def _actualizar_resultado_combinada():
                                 elif "1X" in jugada_comb: acierto = gh >= ga
                                 elif "X2" in jugada_comb: acierto = ga >= gh
                                 elif "sin tarjeta roja" in jugada_comb.lower():
-                                    # Sin Tarjeta Roja: verificar rojas en estadisticas
                                     stats_sr = api_get(f"/fixtures/statistics?fixture={fid}", use_cache=False)
                                     rojas_totales = 0
                                     if stats_sr:
                                         for td_sr in stats_sr:
                                             for item_sr in td_sr.get("statistics", []):
                                                 if item_sr.get("type") == "Red Cards":
-                                                    try:
-                                                        rojas_totales += int(str(item_sr.get("value") or 0))
-                                                    except Exception:
-                                                        pass
+                                                    val_sr = item_sr.get("value")
+                                                    if val_sr is not None:
+                                                        try:
+                                                            rojas_totales += int(str(val_sr))
+                                                        except Exception:
+                                                            pass
                                     acierto = rojas_totales == 0
                                     pick_c["resultado_real"] = f"{rojas_totales} rojas"
 
