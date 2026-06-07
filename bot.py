@@ -5327,16 +5327,20 @@ def construir_resumen_textual(picks, titulo="Resumen Diario"):
     efectividad = (len(aciertos) / n_cerr * 100) if n_cerr else 0.0
 
     # Simulacion profit/loss: stake fijo 1 unidad por pick cerrado
+    # Cuota se limita a 10.0 para evitar picks con cuotas incorrectas
+    # (ej: cuotas de selecciones mal calculadas en versiones anteriores)
     profit = 0.0
     for p in cerrados:
-        cuota = p.get("cuota") or p.get("cuota_pinnacle") or p.get("cuota_minima") or 0
+        cuota = p.get("cuota_api") or p.get("cuota") or p.get("cuota_pinnacle") or p.get("cuota_minima") or 0
         try:
             cuota = float(cuota)
         except Exception:
             cuota = 0
+        # Limitar cuota a rango razonable (max 10.0) para evitar distorsiones
+        cuota = min(cuota, 10.0)
         if _es_acierto(p) and cuota > 1.0:
             profit += (cuota - 1)
-        else:
+        elif not _es_acierto(p):
             profit -= 1
     roi = (profit / n_cerr * 100) if n_cerr else 0.0
 
@@ -6112,22 +6116,15 @@ def _guardar_bank_acumulado(entradas):
 
 def _actualizar_bank_acumulado():
     """
-    Recorre todas las combinadas cerradas del mes actual y reconstruye
-    el bank acumulado (S/500 al inicio del mes, stake 10%).
-    Se reinicia a S/500 el primer dia de cada mes (a las 11:59 PM del ultimo dia).
+    Recorre todas las operaciones cerradas del mes actual (picks individuales
+    Y combinadas) y reconstruye el bank acumulado.
+    Stake por pick individual: _stake_pct() segun score.
+    Stake por combinada: STAKE_COMBINADA (10%).
+    Se reinicia a BANK_INICIAL el primer dia de cada mes.
     """
     try:
-        combinadas = leer_json(COMBINADAS_FILE)
         hoy = fecha_hoy_peru()
         mes_actual = hoy[:7]  # YYYY-MM
-
-        cerradas = [
-            c for c in combinadas
-            if c.get("estado","").lower() in ("acierto","fallo")
-            and not c.get("sin_combinada")
-            and c.get("fecha","")[:7] == mes_actual
-        ]
-        cerradas.sort(key=lambda c: c.get("timestamp", c.get("fecha","")))
 
         bank = BANK_INICIAL
         historial = [{
@@ -6137,37 +6134,96 @@ def _actualizar_bank_acumulado():
             "nota": f"Reinicio mensual — S/ {BANK_INICIAL:.2f}"
         }]
 
-        for c in cerradas:
-            stake = round(bank * STAKE_COMBINADA, 2)
+        # Recopilar todas las operaciones del mes (picks + combinadas)
+        operaciones = []
+
+        # 1. Picks individuales cerrados del mes
+        picks = leer_json(PICKS_FILE)
+        for p in picks:
+            estado = (p.get("estado") or p.get("resultado") or "").lower()
+            if estado not in ("acierto", "fallo"):
+                continue
+            fecha_p = (p.get("fecha_partido") or p.get("fecha") or "")[:10]
+            if fecha_p[:7] != mes_actual:
+                continue
+            score = float(p.get("score", 0) or 0)
+            riesgo = float(p.get("riesgo", 5) or 5)
+            stake_pct = _stake_pct(score, riesgo)
+            if stake_pct <= 0:
+                continue  # pick no apto para simulacion de bank
+            cuota = float(p.get("cuota_api") or p.get("cuota") or p.get("cuota_minima") or 1.5)
+            cuota = min(max(cuota, 1.01), 10.0)  # limitar a rango razonable
+            operaciones.append({
+                "timestamp": p.get("timestamp", fecha_p),
+                "fecha": fecha_p,
+                "tipo": "pick",
+                "ticket": p.get("fixture_id", ""),
+                "subtipo": p.get("mercado", "pick"),
+                "cuota": cuota,
+                "stake_pct": stake_pct,
+                "estado": estado,
+                "partido": p.get("partido", ""),
+            })
+
+        # 2. Combinadas cerradas del mes
+        combinadas = leer_json(COMBINADAS_FILE)
+        for c in combinadas:
+            estado = (c.get("estado") or "").lower()
+            if estado not in ("acierto", "fallo"):
+                continue
+            if c.get("sin_combinada"):
+                continue
+            fecha_c = (c.get("fecha") or "")[:10]
+            if fecha_c[:7] != mes_actual:
+                continue
             cuota = float(c.get("cuota_combinada", 1.0) or 1.0)
-            estado = c.get("estado","").lower()
-            subtipo = c.get("subtipo","?")
-            ticket = c.get("ticket_id","")
-            fecha = c.get("fecha","")
+            cuota = min(max(cuota, 1.01), 50.0)
+            operaciones.append({
+                "timestamp": c.get("timestamp", fecha_c),
+                "fecha": fecha_c,
+                "tipo": "combinada",
+                "ticket": c.get("ticket_id", ""),
+                "subtipo": c.get("subtipo", "combinada"),
+                "cuota": cuota,
+                "stake_pct": STAKE_COMBINADA,
+                "estado": estado,
+            })
+
+        # Ordenar por timestamp
+        operaciones.sort(key=lambda x: x.get("timestamp", ""))
+
+        for op in operaciones:
+            stake_pct = op["stake_pct"]
+            stake = round(bank * stake_pct, 2)
+            cuota = op["cuota"]
+            estado = op["estado"]
 
             if estado == "acierto":
                 ganancia = round(stake * (cuota - 1), 2)
                 bank = round(bank + ganancia, 2)
-                op = f"+S/{ganancia:.2f}"
+                op_txt = f"+S/{ganancia:.2f}"
             else:
                 bank = round(bank - stake, 2)
-                op = f"-S/{stake:.2f}"
+                op_txt = f"-S/{stake:.2f}"
 
             historial.append({
-                "fecha": fecha,
-                "ticket": ticket,
-                "subtipo": subtipo,
+                "fecha": op["fecha"],
+                "ticket": op["ticket"],
+                "tipo": op["tipo"],
+                "subtipo": op["subtipo"],
                 "cuota": cuota,
-                "estado": estado,
                 "stake": stake,
-                "operacion": op,
+                "estado": estado,
+                "operacion": op_txt,
                 "bank": bank,
                 "mes": mes_actual,
+                "partido": op.get("partido", ""),
             })
 
         _guardar_bank_acumulado(historial)
         return historial
-    except Exception:
+    except Exception as e:
+        print(f"ERROR _actualizar_bank_acumulado: {e}")
         return []
 
 
