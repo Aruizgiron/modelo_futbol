@@ -7657,88 +7657,97 @@ def generar_mini_tickets_dia():
 
             home_gen = data.get("home_general") or {}
             away_gen = data.get("away_general") or {}
+            home_hh = data.get("home_home") or home_gen
+            away_aa = data.get("away_away") or away_gen
+
+            if not home_gen or not away_gen:
+                continue
+
             home = data["home"]
             away = data["away"]
             hora = data["hora"]
             league = data["league"]
             country = data.get("country", "")
 
-            # 1. Mercados de Goles y Doble Oportunidad del analisis normal
-            for r in data.get("recomendaciones", []):
-                jugada = r.get("jugada", "")
-                cuota = _cuota_segura(r)
-                prob = float(r.get("prob", 0) or 0)
-                mercado = r.get("mercado", "")
+            # Obtener odds directamente para cuotas reales
+            odds_mt = api_get(f"/odds?fixture={fixture_id}", use_cache=True, ttl=600)
 
-                if cuota < MINI_TICKET_CUOTA_MIN or cuota > MINI_TICKET_CUOTA_MAX:
-                    continue
-                if prob < 60:
-                    continue
+            # 1. Goles Over/Under — directo desde estadisticas sin filtros conservadores
+            base_home = home_hh or home_gen
+            base_away = away_aa or away_gen
+            total_prom = (base_home.get("total_prom", 0) + base_away.get("total_prom", 0)) / 2
+            under35 = (base_home.get("under35", 0) + base_away.get("under35", 0)) / 2
+            over15 = (base_home.get("over15", 0) + base_away.get("over15", 0)) / 2
 
-                clave = (fixture_id, jugada)
-                if clave in picks_ya_usados:
-                    continue
-                picks_ya_usados.add(clave)
-
-                eslabones.append({
-                    "fixture_id": fixture_id,
-                    "partido": f"{home} vs {away}",
-                    "home": home,
-                    "away": away,
-                    "league": league,
-                    "country": country,
-                    "hora": hora,
-                    "mercado": mercado,
-                    "jugada": jugada,
-                    "prob": prob,
-                    "cuota": cuota,
-                    "score": float(r.get("score", 0) or 0),
-                    "fecha": hoy,
-                })
-
-            # 2. Doble Oportunidad permisiva (aunque partido sea parejo)
-            # Para mini-tickets no exigimos diferencia >= 3
-            if home_gen and away_gen:
-                home_score_mt = (
-                    home_gen.get("gf_prom", 0) * 1.5
-                    + home_gen.get("forma", "").count("W") * 1.0
-                    + home_gen.get("forma", "").count("D") * 0.5
-                    - home_gen.get("forma", "").count("L") * 1.0
-                )
-                away_score_mt = (
-                    away_gen.get("gf_prom", 0) * 1.5
-                    + away_gen.get("forma", "").count("W") * 1.0
-                    + away_gen.get("forma", "").count("D") * 0.5
-                    - away_gen.get("forma", "").count("L") * 1.0
-                )
-                diff_mt = home_score_mt - away_score_mt
-
-                if diff_mt >= 1.5:  # local favorito moderado
-                    jugada_dc = f"1X ({home} o empate)"
-                    prob_dc = 72.0
-                    cuota_dc = round(100 / prob_dc + 0.05, 2)
-                    clave_dc = (fixture_id, jugada_dc)
-                    if clave_dc not in picks_ya_usados and MINI_TICKET_CUOTA_MIN <= cuota_dc <= MINI_TICKET_CUOTA_MAX:
-                        picks_ya_usados.add(clave_dc)
+            # Under 3.5
+            if under35 >= 0.65:
+                prob_u35 = round(under35 * 100, 1)
+                cuota_u35, _ = buscar_mejor_cuota(fixture_id, "Under 3.5 goles")
+                if cuota_u35 and MINI_TICKET_CUOTA_MIN <= cuota_u35 <= MINI_TICKET_CUOTA_MAX and prob_u35 >= 60:
+                    clave = (fixture_id, "Under 3.5 goles")
+                    if clave not in picks_ya_usados:
+                        picks_ya_usados.add(clave)
                         eslabones.append({
                             "fixture_id": fixture_id,
                             "partido": f"{home} vs {away}",
                             "home": home, "away": away,
                             "league": league, "country": country,
                             "hora": hora,
-                            "mercado": "Doble oportunidad",
-                            "jugada": jugada_dc,
-                            "prob": prob_dc,
-                            "cuota": cuota_dc,
+                            "mercado": "Goles totales",
+                            "jugada": "Under 3.5 goles",
+                            "prob": prob_u35,
+                            "cuota": cuota_u35,
                             "score": 7.5,
                             "fecha": hoy,
                         })
-                elif diff_mt <= -1.5:  # visitante favorito moderado
-                    jugada_dc = f"X2 ({away} o empate)"
-                    prob_dc = 72.0
-                    cuota_dc = round(100 / prob_dc + 0.05, 2)
+
+            # Over 1.5
+            if over15 >= 0.70:
+                prob_o15 = round(over15 * 100, 1)
+                cuota_o15, _ = buscar_mejor_cuota(fixture_id, "Over 1.5 goles")
+                if cuota_o15 and MINI_TICKET_CUOTA_MIN <= cuota_o15 <= MINI_TICKET_CUOTA_MAX and prob_o15 >= 65:
+                    clave = (fixture_id, "Over 1.5 goles")
+                    if clave not in picks_ya_usados:
+                        picks_ya_usados.add(clave)
+                        eslabones.append({
+                            "fixture_id": fixture_id,
+                            "partido": f"{home} vs {away}",
+                            "home": home, "away": away,
+                            "league": league, "country": country,
+                            "hora": hora,
+                            "mercado": "Goles totales",
+                            "jugada": "Over 1.5 goles",
+                            "prob": prob_o15,
+                            "cuota": cuota_o15,
+                            "score": 7.5,
+                            "fecha": hoy,
+                        })
+
+            # 2. Doble Oportunidad — buscar cuota real de Pinnacle
+            # Calcular fuerza relativa
+            gf_h = base_home.get("gf_prom", 0)
+            gc_h = base_home.get("gc_prom", 0)
+            gf_a = base_away.get("gf_prom", 0)
+            gc_a = base_away.get("gc_prom", 0)
+            fuerza_h = gf_h - gc_a
+            fuerza_a = gf_a - gc_h
+            diff = fuerza_h - fuerza_a
+
+            # Local favorito -> 1X, Visitante favorito -> X2
+            if diff >= 0.3:
+                jugada_dc = "1X"
+                prob_dc = min(85.0, 68.0 + diff * 5)
+            elif diff <= -0.3:
+                jugada_dc = "X2"
+                prob_dc = min(85.0, 68.0 + abs(diff) * 5)
+            else:
+                jugada_dc = None
+
+            if jugada_dc:
+                cuota_dc, _ = buscar_mejor_cuota(fixture_id, jugada_dc)
+                if cuota_dc and MINI_TICKET_CUOTA_MIN <= cuota_dc <= MINI_TICKET_CUOTA_MAX:
                     clave_dc = (fixture_id, jugada_dc)
-                    if clave_dc not in picks_ya_usados and MINI_TICKET_CUOTA_MIN <= cuota_dc <= MINI_TICKET_CUOTA_MAX:
+                    if clave_dc not in picks_ya_usados:
                         picks_ya_usados.add(clave_dc)
                         eslabones.append({
                             "fixture_id": fixture_id,
@@ -7748,7 +7757,7 @@ def generar_mini_tickets_dia():
                             "hora": hora,
                             "mercado": "Doble oportunidad",
                             "jugada": jugada_dc,
-                            "prob": prob_dc,
+                            "prob": round(prob_dc, 1),
                             "cuota": cuota_dc,
                             "score": 7.5,
                             "fecha": hoy,
