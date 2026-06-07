@@ -2320,8 +2320,10 @@ def actualizar_resultados_automaticos():
         # ── Sin Tarjeta Roja ─────────────────────────────────────────────
         elif "sin tarjeta roja" in jugada_lower:
             rojas_pick = 0
+            stats_disponibles = False
             if stats:
                 for td_sr in stats:
+                    stats_disponibles = True
                     for item_sr in td_sr.get("statistics", []):
                         if item_sr.get("type") == "Red Cards":
                             val_sr = item_sr.get("value")
@@ -2330,6 +2332,12 @@ def actualizar_resultados_automaticos():
                                     rojas_pick += int(str(val_sr))
                                 except Exception:
                                     pass
+            # Si no hay estadisticas disponibles (liga menor), dejar pendiente_manual
+            if not stats_disponibles:
+                p["estado"] = "pendiente_manual"
+                p["resultado"] = "pendiente_manual"
+                p["resultado_real"] = "Sin stats API — verificar manual"
+                continue
             acierto = rojas_pick == 0
             p["resultado_real"] = f"{rojas_pick} rojas"
 
@@ -5874,6 +5882,20 @@ BANK_INICIAL = 500.0
 STAKE_COMBINADA = 0.10  # 10% del bank para todas las combinadas
 STAKE_COMBINADA_DIA = 25.0  # S/25 fijos para la combinada garantizada diaria
 
+# Ligas que NO tienen estadisticas detalladas en API-Football
+# Para estas ligas NO se sugiere "Sin Tarjeta Roja" porque la API no puede verificarlo
+LIGAS_SIN_STATS = {
+    "Uruguay Uruguay Primera División",
+    "Uruguay Primera Division",
+    "Peru Liga 1",
+    "Bolivia Liga Profesional",
+    "Ecuador Liga Pro",
+    "Paraguay Division Profesional",
+    "Venezuela Primera Division",
+    "Baltic Cup",
+    "Friendlies Clubs",
+}
+
 # ── MINI-TICKETS ──────────────────────────────────────────────────────────
 # Cuota individual minima y maxima para eslabones de mini-tickets
 MINI_TICKET_CUOTA_MIN = 1.10
@@ -7200,34 +7222,40 @@ def generar_mini_tickets_dia():
                             "fecha": hoy,
                         })
 
-            # 3. Sin Tarjeta Roja — calculado con historial real de rojas
-            fase_p = "group"
-            if _es_partido_selecciones(league, country):
-                round_p = p.get("round", "")
-                fase_p = _detectar_fase_torneo(league, round_p)
+            # 3. Sin Tarjeta Roja — solo para ligas con estadisticas disponibles
+            # Excluir ligas menores donde la API no devuelve stats
+            liga_sin_stats = any(
+                ls.lower() in league.lower()
+                for ls in LIGAS_SIN_STATS
+            )
+            if not liga_sin_stats:
+                fase_p = "group"
+                if _es_partido_selecciones(league, country):
+                    round_p = p.get("round", "")
+                    fase_p = _detectar_fase_torneo(league, round_p)
 
-            prob_sin_roja = calcular_prob_sin_roja(home_gen, away_gen, fase_p)
-            if prob_sin_roja >= 75:  # solo si hay confianza suficiente
-                cuota_sin_roja = round(100 / prob_sin_roja + 0.05, 2)
-                if MINI_TICKET_CUOTA_MIN <= cuota_sin_roja <= MINI_TICKET_CUOTA_MAX:
-                    jugada_sr = "Sin Tarjeta Roja"
-                    clave_sr = (fixture_id, jugada_sr)
-                    if clave_sr not in picks_ya_usados:
-                        picks_ya_usados.add(clave_sr)
-                        eslabones.append({
-                            "fixture_id": fixture_id,
-                            "partido": f"{home} vs {away}",
-                            "home": home, "away": away,
-                            "league": league, "country": country,
-                            "hora": hora,
-                            "mercado": "Sin Tarjeta Roja",
-                            "jugada": jugada_sr,
-                            "prob": prob_sin_roja,
-                            "cuota": cuota_sin_roja,
-                            "score": 7.0,
-                            "fecha": hoy,
-                            "cuota_estimada": True,  # marcar como estimada
-                        })
+                prob_sin_roja = calcular_prob_sin_roja(home_gen, away_gen, fase_p)
+                if prob_sin_roja >= 75:  # solo si hay confianza suficiente
+                    cuota_sin_roja = round(100 / prob_sin_roja + 0.05, 2)
+                    if MINI_TICKET_CUOTA_MIN <= cuota_sin_roja <= MINI_TICKET_CUOTA_MAX:
+                        jugada_sr = "Sin Tarjeta Roja"
+                        clave_sr = (fixture_id, jugada_sr)
+                        if clave_sr not in picks_ya_usados:
+                            picks_ya_usados.add(clave_sr)
+                            eslabones.append({
+                                "fixture_id": fixture_id,
+                                "partido": f"{home} vs {away}",
+                                "home": home, "away": away,
+                                "league": league, "country": country,
+                                "hora": hora,
+                                "mercado": "Sin Tarjeta Roja",
+                                "jugada": jugada_sr,
+                                "prob": prob_sin_roja,
+                                "cuota": cuota_sin_roja,
+                                "score": 7.0,
+                                "fecha": hoy,
+                                "cuota_estimada": True,
+                            })
 
         except Exception as e:
             print(f"WARN mini_ticket partido {p.get('id','?')}: {e}")
@@ -7478,8 +7506,10 @@ def _actualizar_resultado_combinada():
                                 elif "sin tarjeta roja" in jugada_comb.lower():
                                     stats_sr = api_get(f"/fixtures/statistics?fixture={fid}", use_cache=False)
                                     rojas_totales = 0
+                                    stats_disp = False
                                     if stats_sr:
                                         for td_sr in stats_sr:
+                                            stats_disp = True
                                             for item_sr in td_sr.get("statistics", []):
                                                 if item_sr.get("type") == "Red Cards":
                                                     val_sr = item_sr.get("value")
@@ -7488,8 +7518,13 @@ def _actualizar_resultado_combinada():
                                                             rojas_totales += int(str(val_sr))
                                                         except Exception:
                                                             pass
-                                    acierto = rojas_totales == 0
-                                    pick_c["resultado_real"] = f"{rojas_totales} rojas"
+                                    if not stats_disp:
+                                        pick_c["estado"] = "pendiente_manual"
+                                        pick_c["resultado_real"] = "Sin stats API — verificar manual"
+                                        acierto = None
+                                    else:
+                                        acierto = rojas_totales == 0
+                                        pick_c["resultado_real"] = f"{rojas_totales} rojas"
 
                                 if acierto is True:
                                     pick_c["estado"] = "acierto"
