@@ -3769,6 +3769,9 @@ def generar_pdf_resumen():
                 y = 780
                 c.setFont("Helvetica", 9)
 
+    # ── Seccion handicap del dia ──────────────────────────────────────
+    y = _seccion_handicap_pdf(c, y, hoy)
+
     c.save()
 
 def _seccion_combinadas_historico(elements, fecha_inicio, fecha_fin, styles):
@@ -4097,6 +4100,7 @@ def generar_pdf_reporte(picks, titulo, filename):
         fechas_ord = sorted([(p.get("fecha_partido") or p.get("fecha") or "")[:10] for p in picks_ord if (p.get("fecha_partido") or p.get("fecha"))])
         if fechas_ord:
             _seccion_combinadas_historico(elements, fechas_ord[0], fechas_ord[-1], styles)
+            _seccion_handicap_historico_pdf(elements, fechas_ord[0], fechas_ord[-1], styles)
 
     # Seccion prematch vs live
     elements.append(Spacer(1, 14))
@@ -4550,6 +4554,14 @@ async def _job_actualizar_estados(context: ContextTypes.DEFAULT_TYPE):
         if cambios > 0:
             print(f"[auto-update] {cambios} picks actualizados")
 
+        # Cerrar handicaps pendientes
+        try:
+            cambios_ha = cerrar_handicaps_pendientes()
+            if cambios_ha > 0:
+                print(f"[handicap] {cambios_ha} picks cerrados automaticamente")
+        except Exception as e:
+            print(f"WARN cerrar_handicaps: {e}")
+
         # V: Alerta de racha de fallos consecutivos
         picks_cerrados_recientes = [
             p for p in picks
@@ -4897,6 +4909,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "━━━━━━━━━━\n"
         "🔧 *UTILIDADES*\n"
         "/feedback ID acierto|fallo — Marcar resultado\n"
+        "━━━━━━━━━━\n"
+        "🔬 *HANDICAP ASIÁTICO*\n"
+        "/handicap — Picks de handicap del día (modo observación)\n"
+        "/handicap_stats — Estadísticas acumuladas de handicap\n"
         "━━━━━━━━━━\n"
         "⏰ *AUTOMATICO*\n"
         "Estados: actualiza cada 20 min\n"
@@ -5797,7 +5813,28 @@ async def resumen_ayer(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Bloque de combinadas de ayer
     bloque_comb = _resumen_combinadas_texto(ayer)
 
-    mensaje = texto + "\n\n" + bloque_comb
+    # Bloque handicap de ayer
+    bloque_ha = ""
+    try:
+        ha_ayer = [r for r in leer_json(HANDICAP_FILE)
+                   if r.get("fecha","")[:10] == ayer]
+        if ha_ayer:
+            cerrados_ha = [r for r in ha_ayer if r.get("estado") in ("acierto","fallo","push")]
+            aciertos_ha = sum(1 for r in cerrados_ha if r.get("estado") == "acierto")
+            fallos_ha = sum(1 for r in cerrados_ha if r.get("estado") == "fallo")
+            push_ha = sum(1 for r in cerrados_ha if r.get("estado") == "push")
+            validos_ha = aciertos_ha + fallos_ha
+            ef_ha = round(aciertos_ha / validos_ha * 100, 1) if validos_ha else 0
+            bloque_ha = (
+                f"\n\n🔬 *Handicap Asiático ayer (observación):*\n"
+                f"Total: {len(ha_ayer)} | Cerrados: {len(cerrados_ha)} | "
+                f"✅ {aciertos_ha} | ❌ {fallos_ha} | 🔄 {push_ha} push\n"
+                f"Efectividad: {ef_ha}%"
+            )
+    except Exception:
+        pass
+
+    mensaje = texto + "\n\n" + bloque_comb + bloque_ha
     await update.message.reply_text(mensaje, parse_mode="Markdown")
 
 
@@ -5861,6 +5898,15 @@ async def feedback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     guardar_json_lista(PICKS_FILE, picks)
 
+    # Tambien actualizar en HANDICAP_FILE si corresponde
+    handicaps = leer_json(HANDICAP_FILE)
+    for h in handicaps:
+        if str(h.get("fixture_id")) == str(fixture_id):
+            h["estado"] = resultado
+            h["resultado"] = resultado
+            actualizado = True
+    guardar_json_lista(HANDICAP_FILE, handicaps)
+
     agregar_json(FEEDBACK_FILE, {
         "fixture_id": fixture_id,
         "resultado": resultado,
@@ -5879,8 +5925,14 @@ async def feedback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 REPORTE_FILE_TEMPLATE = _os_bot.path.join(BOT_DIR, "reporte_{year}_{month:02d}.json")
 BANK_INICIAL = 500.0
-STAKE_COMBINADA = 0.10  # 10% del bank para todas las combinadas
-STAKE_COMBINADA_DIA = 25.0  # S/25 fijos para la combinada garantizada diaria
+STAKE_COMBINADA = 0.10
+STAKE_COMBINADA_DIA = 25.0
+
+# ── HANDICAP ASIATICO — MODO OBSERVACION ─────────────────────────────
+HANDICAP_FILE = _tmp_path("handicap_seguimiento.json")
+MAX_HANDICAP_DIA = 10          # maximo picks de handicap por dia
+HANDICAP_CUOTA_MIN = 1.75      # cuota minima para que valga registrar
+HANDICAP_PICKS_MIN_CONFIANZA = 30  # picks cerrados minimos para confiar
 
 # Ligas que NO tienen estadisticas detalladas en API-Football
 # Para estas ligas NO se sugiere "Sin Tarjeta Roja" porque la API no puede verificarlo
@@ -6269,27 +6321,33 @@ def _analizar_tendencias_aprendizaje():
     if not datos:
         return None
 
-    cerrados = [d for d in datos if d.get("resultado") in ("acierto", "fallo")]
+    cerrados = [d for d in datos if d.get("resultado") in ("acierto", "fallo", "push")]
     if len(cerrados) < 5:
         return {"insuficiente": True, "total": len(cerrados)}
 
     def efectividad_grupo(items):
         if not items:
             return 0.0
-        ac = sum(1 for i in items if i["resultado"] == "acierto")
-        return round(ac / len(items) * 100, 1)
+        # push no cuenta como acierto ni fallo para efectividad
+        validos = [i for i in items if i.get("resultado") in ("acierto", "fallo")]
+        if not validos:
+            return 0.0
+        ac = sum(1 for i in validos if i["resultado"] == "acierto")
+        return round(ac / len(validos) * 100, 1)
 
     mercados = {}
     for d in cerrados:
         m = d.get("mercado") or d.get("jugada", "Otro")
         if "Corner" in m:
             m = "Corners"
-        elif "goles" in m.lower():
+        elif "goles" in m.lower() or "over" in m.lower() or "under" in m.lower():
             m = "Goles"
         elif "Tarjeta" in m:
             m = "Tarjetas"
         elif "BTTS" in m or "Ambos" in m:
             m = "BTTS"
+        elif "Handicap" in m or "handicap" in m or "AH" in m:
+            m = "Handicap"
         else:
             m = "Otro"
         mercados.setdefault(m, []).append(d)
@@ -6921,6 +6979,460 @@ def _armar_combinada_dia_garantizada():
         "razon_seleccion": f"Combinada garantizada — cuota {cuota_final}x | VE={round(mejor_valor,3)}",
         "timestamp": fecha_hora_peru(),
     }
+
+
+def _extraer_cuota_handicap_pinnacle(odds, equipo, linea):
+    """
+    Extrae la cuota real de Asian Handicap de Pinnacle.
+    equipo: 'home' o 'away'
+    linea: -0.5, -0.25, -0.75, 0, +0.5, etc.
+    Devuelve (cuota, bookmaker) o (None, None) si no hay.
+    """
+    PINNACLE_NAMES = {"Pinnacle", "Pinnacle Sports"}
+    AH_MARKETS = {"Asian Handicap", "Asian handicap", "Handicap Asiatico",
+                  "Handicap Asian", "AH", "Asian"}
+    linea_str_variants = [
+        f"{linea:+.1f}", f"{linea:+.2f}",
+        f"{linea:.1f}", f"{linea:.2f}",
+        str(linea),
+    ]
+    equipo_label = "Home" if equipo == "home" else "Away"
+
+    for casa in odds:
+        for book in casa.get("bookmakers", []):
+            if book.get("name", "") not in PINNACLE_NAMES:
+                continue
+            for bet in book.get("bets", []):
+                bet_name = bet.get("name", "")
+                if not any(ah.lower() in bet_name.lower() for ah in AH_MARKETS):
+                    continue
+                for value in bet.get("values", []):
+                    nombre = str(value.get("value", ""))
+                    # nombre puede ser "Home -0.5", "Away +0.5", "-0.5", etc.
+                    coincide_equipo = equipo_label.lower() in nombre.lower()
+                    coincide_linea = any(v in nombre for v in linea_str_variants)
+                    if coincide_equipo and coincide_linea:
+                        try:
+                            cuota = float(value.get("odd"))
+                            if cuota > 1.0:
+                                return round(cuota, 3), "Pinnacle"
+                        except Exception:
+                            pass
+    return None, None
+
+
+def calcular_handicap_recomendado_club(home_general, away_general,
+                                        home_home, away_away, odds):
+    """
+    Calcula el handicap asiatico recomendado para un partido de clubes.
+    Usa gf_prom, gc_prom y forma de calcular_forma.
+    Solo recomienda si hay cuota real de Pinnacle >= HANDICAP_CUOTA_MIN.
+    Devuelve dict con jugada, equipo, linea, cuota, prob_estimada o None.
+    """
+    base_home = home_home or home_general
+    base_away = away_away or away_general
+
+    if not base_home or not base_away:
+        return None
+
+    gf_home = float(base_home.get("gf_prom", 0) or 0)
+    gc_home = float(base_home.get("gc_prom", 0) or 0)
+    gf_away = float(base_away.get("gf_prom", 0) or 0)
+    gc_away = float(base_away.get("gc_prom", 0) or 0)
+
+    # Fuerza atacante vs defensiva
+    ataque_home = gf_home - gc_away   # positivo = local domina
+    ataque_away = gf_away - gc_home   # positivo = visitante domina
+    diferencia = ataque_home - ataque_away
+
+    # Decidir linea y equipo
+    if diferencia >= 1.5:
+        equipo, linea = "home", -0.75
+        prob_est = 55.0
+    elif diferencia >= 0.8:
+        equipo, linea = "home", -0.5
+        prob_est = 62.0
+    elif diferencia >= 0.3:
+        equipo, linea = "home", -0.25
+        prob_est = 68.0
+    elif diferencia <= -1.5:
+        equipo, linea = "away", -0.75
+        prob_est = 55.0
+    elif diferencia <= -0.8:
+        equipo, linea = "away", -0.5
+        prob_est = 62.0
+    elif diferencia <= -0.3:
+        equipo, linea = "away", -0.25
+        prob_est = 68.0
+    else:
+        return None  # partido muy parejo, no recomendar
+
+    # Buscar cuota real de Pinnacle — Opcion B: solo con cuota real
+    cuota, book = _extraer_cuota_handicap_pinnacle(odds, equipo, linea)
+    if not cuota or cuota < HANDICAP_CUOTA_MIN:
+        return None  # sin cuota real o cuota insuficiente
+
+    return {
+        "equipo": equipo,
+        "linea": linea,
+        "cuota": cuota,
+        "bookmaker": book,
+        "prob_estimada": prob_est,
+        "diferencia_fuerza": round(diferencia, 2),
+    }
+
+
+def calcular_handicap_recomendado_seleccion(home, away, odds):
+    """
+    Calcula el handicap recomendado para selecciones usando ranking FIFA.
+    Solo recomienda si hay cuota real de Pinnacle >= HANDICAP_CUOTA_MIN.
+    """
+    rank_home = RANKING_FIFA.get(home, 60)
+    rank_away = RANKING_FIFA.get(away, 60)
+    diff_ranking = rank_away - rank_home  # positivo = local mejor rankeado
+
+    if diff_ranking >= 30:
+        equipo, linea = "home", -0.75
+        prob_est = 52.0
+    elif diff_ranking >= 15:
+        equipo, linea = "home", -0.5
+        prob_est = 60.0
+    elif diff_ranking >= 7:
+        equipo, linea = "home", -0.25
+        prob_est = 66.0
+    elif diff_ranking <= -30:
+        equipo, linea = "away", -0.75
+        prob_est = 52.0
+    elif diff_ranking <= -15:
+        equipo, linea = "away", -0.5
+        prob_est = 60.0
+    elif diff_ranking <= -7:
+        equipo, linea = "away", -0.25
+        prob_est = 66.0
+    else:
+        return None  # selecciones muy parejas, no recomendar
+
+    cuota, book = _extraer_cuota_handicap_pinnacle(odds, equipo, linea)
+    if not cuota or cuota < HANDICAP_CUOTA_MIN:
+        return None
+
+    return {
+        "equipo": equipo,
+        "linea": linea,
+        "cuota": cuota,
+        "bookmaker": book,
+        "prob_estimada": prob_est,
+        "diff_ranking": diff_ranking,
+    }
+
+
+def guardar_handicap(registro):
+    """
+    Guarda un pick de handicap en HANDICAP_FILE.
+    Evita duplicados por (fixture_id, equipo, linea).
+    """
+    data = leer_json(HANDICAP_FILE)
+    fid = str(registro.get("fixture_id", ""))
+    eq = registro.get("equipo", "")
+    ln = registro.get("linea", 0)
+
+    for r in data:
+        if (str(r.get("fixture_id","")) == fid
+                and r.get("equipo") == eq
+                and r.get("linea") == ln):
+            return False  # duplicado
+
+    data.append(registro)
+    guardar_json_lista(HANDICAP_FILE, data)
+    return True
+
+
+def filtrar_handicaps_por_dias(dias):
+    """Lee handicap_seguimiento.json y filtra por los ultimos N dias."""
+    cerrar_handicaps_pendientes()
+    data = leer_json(HANDICAP_FILE)
+    hoy = fecha_peru_obj()
+    limite = hoy - timedelta(days=dias)
+    filtrados = []
+    for r in data:
+        try:
+            fp = datetime.strptime(r.get("fecha","")[:10], "%Y-%m-%d")
+            if fp >= limite:
+                filtrados.append(r)
+        except Exception:
+            continue
+    return filtrados
+
+
+def filtrar_handicaps_mes_actual():
+    """Lee handicap_seguimiento.json y filtra por el mes actual."""
+    cerrar_handicaps_pendientes()
+    data = leer_json(HANDICAP_FILE)
+    hoy = fecha_peru_obj()
+    filtrados = []
+    for r in data:
+        try:
+            fp = datetime.strptime(r.get("fecha","")[:10], "%Y-%m-%d")
+            if fp.year == hoy.year and fp.month == hoy.month:
+                filtrados.append(r)
+        except Exception:
+            continue
+    return filtrados
+
+
+def cerrar_handicaps_pendientes():
+    """
+    Cierra automaticamente los picks de handicap pendientes.
+    Logica de cierre:
+      -0.5 / +0.5 : gana por 1+ -> acierto | empate/pierde -> fallo
+      -0.25       : gana por 1+ -> acierto | empate -> push | pierde -> fallo
+      -0.75       : gana por 2+ -> acierto | gana por 1 -> push | empata/pierde -> fallo
+      0           : gana -> acierto | empate -> push | pierde -> fallo
+    Registra resultado en aprendizaje.json.
+    """
+    data = leer_json(HANDICAP_FILE)
+    cambios = 0
+
+    for r in data:
+        if r.get("estado", "pendiente") not in ("pendiente",):
+            continue
+        fixture_id = r.get("fixture_id")
+        if not fixture_id:
+            continue
+        try:
+            fixture = api_get(f"/fixtures?id={fixture_id}", use_cache=False)
+        except Exception:
+            continue
+        if not fixture:
+            continue
+        fx = fixture[0]
+        status = fx["fixture"]["status"]["short"]
+        if status not in ("FT", "AET", "PEN"):
+            continue
+
+        gh = fx["goals"]["home"]
+        ga = fx["goals"]["away"]
+        if gh is None or ga is None:
+            continue
+
+        equipo = r.get("equipo", "home")
+        linea = float(r.get("linea", -0.5))
+
+        # Diferencia de goles desde perspectiva del equipo apostado
+        if equipo == "home":
+            diff = gh - ga
+        else:
+            diff = ga - gh
+
+        # Aplicar linea al diff
+        diff_ajustado = diff + linea
+
+        resultado = None
+        retorno = 0.0
+        cuota = float(r.get("cuota", 1.90) or 1.90)
+
+        if linea in (-0.5, 0.5, -1.0, 1.0, -1.5, 1.5):
+            # Linea entera: acierto o fallo
+            if diff_ajustado > 0:
+                resultado = "acierto"
+                retorno = round(cuota - 1, 3)
+            else:
+                resultado = "fallo"
+                retorno = -1.0
+
+        elif linea in (-0.25, 0.25, -1.25, 1.25):
+            # Linea cuarto: puede ser push parcial
+            if diff_ajustado > 0:
+                resultado = "acierto"
+                retorno = round(cuota - 1, 3)
+            elif diff_ajustado == 0:
+                # Si la linea es -0.25 y diff exacto es 0: push 50%
+                resultado = "push"
+                retorno = 0.0
+            else:
+                resultado = "fallo"
+                retorno = -1.0
+
+        elif linea in (-0.75, 0.75, -1.75, 1.75):
+            if diff_ajustado > 0:
+                resultado = "acierto"
+                retorno = round(cuota - 1, 3)
+            elif diff_ajustado == 0:
+                # gana por exactamente 1 con -0.75: push 50%
+                resultado = "push"
+                retorno = 0.0
+            else:
+                resultado = "fallo"
+                retorno = -1.0
+
+        elif linea == 0:
+            if diff > 0:
+                resultado = "acierto"
+                retorno = round(cuota - 1, 3)
+            elif diff == 0:
+                resultado = "push"
+                retorno = 0.0
+            else:
+                resultado = "fallo"
+                retorno = -1.0
+
+        else:
+            # Otras lineas: simplificar como entera
+            if diff_ajustado > 0:
+                resultado = "acierto"
+                retorno = round(cuota - 1, 3)
+            else:
+                resultado = "fallo"
+                retorno = -1.0
+
+        if resultado:
+            r["estado"] = resultado
+            r["resultado"] = resultado
+            r["retorno"] = retorno
+            r["gh"] = gh
+            r["ga"] = ga
+            r["resultado_real"] = f"{gh}-{ga}"
+            cambios += 1
+
+            # Registrar en aprendizaje.json para ML futuro
+            try:
+                ctx = {}
+                try:
+                    ctx = _enriquecer_contexto_pick(
+                        fixture_id,
+                        r.get("league_id"),
+                        r.get("season")
+                    )
+                except Exception:
+                    pass
+                entrada_ap = {
+                    "fecha": r.get("fecha", "")[:10],
+                    "fixture_id": fixture_id,
+                    "partido": r.get("partido", ""),
+                    "liga": r.get("league", ""),
+                    "pais": r.get("country", ""),
+                    "mercado": "Handicap Asiatico",
+                    "jugada": r.get("jugada", ""),
+                    "equipo": r.get("equipo", ""),
+                    "linea": r.get("linea"),
+                    "cuota": cuota,
+                    "prob_estimada": r.get("prob_estimada", 0),
+                    "tipo_equipo": r.get("tipo_equipo", "club"),
+                    "resultado": resultado,
+                    "retorno": retorno,
+                    "gh": gh,
+                    "ga": ga,
+                    "modo": "observacion",
+                    "timestamp_aprendizaje": fecha_hora_peru(),
+                    **ctx,
+                }
+                agregar_json(APRENDIZAJE_FILE, entrada_ap)
+            except Exception as e:
+                print(f"WARN aprendizaje handicap: {e}")
+
+    if cambios > 0:
+        guardar_json_lista(HANDICAP_FILE, data)
+        print(f"[handicap] {cambios} picks cerrados")
+
+    return cambios
+
+
+def _seccion_handicap_pdf(c, y, hoy):
+    """Agrega seccion de handicap al PDF del resumen diario."""
+    try:
+        data = leer_json(HANDICAP_FILE)
+        hoy_picks = [r for r in data if r.get("fecha","")[:10] == hoy]
+        if not hoy_picks:
+            return y
+
+        y -= 10
+        c.setFont("Helvetica-Bold", 11)
+        c.drawString(40, y, f"HANDICAP ASIATICO — MODO OBSERVACION ({len(hoy_picks)} picks)")
+        y -= 16
+        c.setFont("Helvetica", 9)
+
+        cerrados_h = [r for r in hoy_picks if r.get("estado") in ("acierto","fallo","push")]
+        if cerrados_h:
+            aciertos_h = sum(1 for r in cerrados_h if r.get("estado") == "acierto")
+            fallos_h = sum(1 for r in cerrados_h if r.get("estado") == "fallo")
+            push_h = sum(1 for r in cerrados_h if r.get("estado") == "push")
+            validos_h = aciertos_h + fallos_h
+            ef_h = round(aciertos_h / validos_h * 100, 1) if validos_h else 0
+            c.drawString(40, y, f"Cerrados: {len(cerrados_h)} | Aciertos: {aciertos_h} | Fallos: {fallos_h} | Push: {push_h} | Efectividad: {ef_h}%")
+            y -= 12
+
+        for r in hoy_picks:
+            estado = r.get("estado","pendiente").upper()
+            jugada = r.get("jugada","")
+            cuota = r.get("cuota","?")
+            resultado_real = r.get("resultado_real","")
+            linea = f"  • {r.get('partido','')} | {jugada} | {cuota}x | {estado}"
+            if resultado_real:
+                linea += f" | {resultado_real}"
+            c.drawString(40, y, linea[:110])
+            y -= 11
+            if y < 60:
+                c.showPage()
+                y = 780
+                c.setFont("Helvetica", 9)
+    except Exception as e:
+        print(f"WARN _seccion_handicap_pdf: {e}")
+    return y
+
+
+def _seccion_handicap_historico_pdf(elements, fecha_inicio, fecha_fin, styles):
+    """Agrega resumen historico de handicap al PDF semanal/mensual."""
+    try:
+        data = leer_json(HANDICAP_FILE)
+        periodo = [r for r in data
+                   if fecha_inicio <= r.get("fecha","")[:10] <= fecha_fin]
+        if not periodo:
+            return
+
+        cerrados = [r for r in periodo if r.get("estado") in ("acierto","fallo","push")]
+        if not cerrados:
+            return
+
+        aciertos = sum(1 for r in cerrados if r.get("estado") == "acierto")
+        fallos = sum(1 for r in cerrados if r.get("estado") == "fallo")
+        push = sum(1 for r in cerrados if r.get("estado") == "push")
+        validos = aciertos + fallos
+        ef = round(aciertos / validos * 100, 1) if validos else 0
+        roi_sim = sum(r.get("retorno", 0) for r in cerrados)
+
+        s_h2 = styles["Heading2"].clone("hh2")
+        s_h2.fontSize = 11
+        s_h2.spaceBefore = 10
+        elements.append(Paragraph("Handicap Asiatico — Modo Observacion", s_h2))
+        elements.append(Spacer(1, 4))
+
+        resumen_txt = (
+            f"Total picks: {len(periodo)} | Cerrados: {len(cerrados)} | "
+            f"Aciertos: {aciertos} | Fallos: {fallos} | Push: {push} | "
+            f"Efectividad: {ef}% | ROI simulado: {roi_sim:+.2f}u"
+        )
+        elements.append(Paragraph(resumen_txt, styles["Normal"]))
+        elements.append(Spacer(1, 6))
+
+        # Por tipo de linea
+        por_linea = {}
+        for r in cerrados:
+            ln = str(r.get("linea", "?"))
+            por_linea.setdefault(ln, {"ok": 0, "fallo": 0, "push": 0})
+            est = r.get("estado","")
+            if est == "acierto": por_linea[ln]["ok"] += 1
+            elif est == "fallo": por_linea[ln]["fallo"] += 1
+            elif est == "push": por_linea[ln]["push"] += 1
+
+        for ln, v in sorted(por_linea.items()):
+            tot = v["ok"] + v["fallo"]
+            ef_ln = round(v["ok"] / tot * 100, 1) if tot else 0
+            elements.append(Paragraph(
+                f"  Linea {ln}: {v['ok']}A / {v['fallo']}F / {v['push']}P — {ef_ln}%",
+                styles["Normal"]
+            ))
+    except Exception as e:
+        print(f"WARN _seccion_handicap_historico_pdf: {e}")
 
 
 def _armar_combinada_del_dia():
@@ -7812,6 +8324,272 @@ async def combinada_dia(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "\n".join(lineas),
         parse_mode="Markdown"
     )
+
+
+async def handicap(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    /handicap — Analiza todos los partidos del dia y sugiere handicap asiatico.
+    MODO OBSERVACION: no afecta el bank. Solo acumula base de datos.
+    Solo recomienda picks con cuota real de Pinnacle >= HANDICAP_CUOTA_MIN.
+    """
+    _registrar_chat_alarma(update.effective_chat.id)
+    hoy = fecha_hoy_peru()
+    ahora_ts = int(fecha_peru_obj().timestamp())
+
+    # Estadisticas acumuladas
+    data_ha = leer_json(HANDICAP_FILE)
+    total_ha = len(data_ha)
+    cerrados_ha = [r for r in data_ha if r.get("estado") in ("acierto","fallo","push")]
+    n_cerrados = len(cerrados_ha)
+    aciertos_ha = sum(1 for r in cerrados_ha if r.get("estado") == "acierto")
+    fallos_ha = sum(1 for r in cerrados_ha if r.get("estado") == "fallo")
+    validos_ha = aciertos_ha + fallos_ha
+    ef_ha = round(aciertos_ha / validos_ha * 100, 1) if validos_ha else 0
+
+    if n_cerrados < HANDICAP_PICKS_MIN_CONFIANZA:
+        nivel = f"⚠️ Modo observación — faltan {HANDICAP_PICKS_MIN_CONFIANZA - n_cerrados} picks para confiar"
+    elif n_cerrados < 60:
+        nivel = "🟡 Datos preliminares — usar con cautela"
+    else:
+        nivel = "✅ Base de datos suficiente"
+
+    await update.message.reply_text(
+        f"🔬 *Handicap Asiático — Modo Observación*\n"
+        f"📊 Base: {n_cerrados} cerrados / {total_ha} total | Efectividad: {ef_ha}%\n"
+        f"{nivel}\n\n"
+        f"Analizando partidos del día... esto puede tomar 1-2 minutos.",
+        parse_mode="Markdown"
+    )
+
+    # Construir lista de ligas
+    ligas = {}
+    ligas.update(EUROPA_LEAGUES)
+    ligas.update(SUDAMERICA_LEAGUES)
+    ligas.update(OTRAS_LEAGUES)
+    ligas.update(SELECCIONES_LEAGUES)
+
+    partidos = obtener_fixtures_por_fecha(ligas, hoy)
+    partidos_futuros = [
+        p for p in partidos
+        if p.get("timestamp", 0) - ahora_ts > 1800
+    ]
+
+    if not partidos_futuros:
+        await update.message.reply_text("❌ No hay partidos disponibles con más de 30 minutos de anticipación.")
+        return
+
+    # Prefetch de odds en paralelo
+    try:
+        import aiohttp as _aiohttp_ha
+        fixture_ids_ha = [str(p["id"]) for p in partidos_futuros]
+
+        async def _prefetch_ha(fids):
+            async with _aiohttp_ha.ClientSession() as sess:
+                tasks = [
+                    api_get_async(sess, f"/odds?fixture={fid}", use_cache=True, ttl=600)
+                    for fid in fids
+                ]
+                await asyncio.gather(*tasks, return_exceptions=True)
+
+        for i in range(0, len(fixture_ids_ha), 10):
+            await _prefetch_ha(fixture_ids_ha[i:i+10])
+            await asyncio.sleep(0.3)
+    except Exception:
+        pass
+
+    picks_ha = []
+    guardados_hoy = set(
+        (str(r.get("fixture_id","")), r.get("equipo",""), str(r.get("linea","")))
+        for r in data_ha if r.get("fecha","")[:10] == hoy
+    )
+
+    for p in partidos_futuros:
+        if len(picks_ha) >= MAX_HANDICAP_DIA:
+            break
+        try:
+            fixture_id = str(p["id"])
+            home = p["home"]
+            away = p["away"]
+            league = p["league"]
+            country = p.get("country","")
+            hora = p.get("hour","")
+
+            odds = api_get(f"/odds?fixture={fixture_id}", use_cache=True, ttl=600)
+            if not odds:
+                continue
+
+            es_seleccion = _es_partido_selecciones(league, country)
+
+            if es_seleccion:
+                rec_ha = calcular_handicap_recomendado_seleccion(home, away, odds)
+            else:
+                home_general = calcular_forma(p.get("home_id") or
+                    api_get(f"/fixtures?id={fixture_id}", use_cache=True, ttl=3600)[0]["teams"]["home"]["id"]
+                    if not p.get("home_id") else p["home_id"])
+                away_general = calcular_forma(p.get("away_id") or
+                    api_get(f"/fixtures?id={fixture_id}", use_cache=True, ttl=3600)[0]["teams"]["away"]["id"]
+                    if not p.get("away_id") else p["away_id"])
+
+                if not home_general or not away_general:
+                    continue
+
+                home_home = calcular_forma(
+                    api_get(f"/fixtures?id={fixture_id}", use_cache=True, ttl=3600)[0]["teams"]["home"]["id"],
+                    "home"
+                )
+                away_away = calcular_forma(
+                    api_get(f"/fixtures?id={fixture_id}", use_cache=True, ttl=3600)[0]["teams"]["away"]["id"],
+                    "away"
+                )
+                rec_ha = calcular_handicap_recomendado_club(
+                    home_general, away_general, home_home, away_away, odds
+                )
+
+            if not rec_ha:
+                continue
+
+            equipo = rec_ha["equipo"]
+            linea = rec_ha["linea"]
+            cuota = rec_ha["cuota"]
+
+            # Verificar duplicado del dia
+            clave = (fixture_id, equipo, str(linea))
+            if clave in guardados_hoy:
+                continue
+
+            equipo_nombre = home if equipo == "home" else away
+            jugada = f"{equipo_nombre} {linea:+.2f}"
+
+            registro = {
+                "fixture_id": fixture_id,
+                "partido": f"{home} vs {away}",
+                "home": home,
+                "away": away,
+                "league": league,
+                "country": country,
+                "hora": hora,
+                "fecha": hoy,
+                "equipo": equipo,
+                "linea": linea,
+                "jugada": jugada,
+                "cuota": cuota,
+                "bookmaker": rec_ha.get("bookmaker","Pinnacle"),
+                "prob_estimada": rec_ha.get("prob_estimada", 0),
+                "tipo_equipo": "seleccion" if es_seleccion else "club",
+                "modo": "observacion",
+                "estado": "pendiente",
+                "resultado": None,
+                "resultado_real": None,
+                "gh": None,
+                "ga": None,
+                "retorno": None,
+                "timestamp": fecha_hora_peru(),
+            }
+
+            guardado = guardar_handicap(registro)
+            if guardado:
+                picks_ha.append(registro)
+                guardados_hoy.add(clave)
+
+        except Exception as e:
+            print(f"WARN handicap partido {p.get('id','?')}: {e}")
+            continue
+
+    if not picks_ha:
+        await update.message.reply_text(
+            "❌ No encontré picks de handicap para hoy.\n"
+            "Pinnacle no tiene cuotas de Asian Handicap disponibles para los partidos de hoy, "
+            "o todos los partidos son muy parejos para recomendar."
+        )
+        return
+
+    texto = f"🔬 *Handicap Asiático del día — {hoy}*\n"
+    texto += f"_{len(picks_ha)} picks encontrados con cuota real de Pinnacle_\n"
+    texto += "⚠️ *MODO OBSERVACIÓN — No apostar hasta tener 30+ picks cerrados*\n"
+    texto += "━━━━━━━━━━\n\n"
+
+    for i, r in enumerate(picks_ha, 1):
+        tipo = "🌍 SELECCIÓN" if r.get("tipo_equipo") == "seleccion" else "⚽ Club"
+        texto += (
+            f"{i}. *{r['partido']}*\n"
+            f"   {r['league']} | {r['hora']} | {tipo}\n"
+            f"   ✅ *{r['jugada']}*\n"
+            f"   Cuota: *{r['cuota']}x* (Pinnacle) | Prob estimada: {r['prob_estimada']}%\n\n"
+        )
+
+    texto += (
+        f"📊 *Base acumulada:* {n_cerrados} cerrados | {ef_ha}% efectividad\n"
+        f"_Picks guardados en seguimiento. Usa /handicap_stats para ver estadísticas._"
+    )
+
+    await _enviar_mensaje_paginado(update, texto)
+
+
+async def handicap_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    /handicap_stats — Estadísticas acumuladas del handicap asiático.
+    """
+    cerrar_handicaps_pendientes()
+    data = leer_json(HANDICAP_FILE)
+
+    if not data:
+        await update.message.reply_text(
+            "📊 Aún no hay picks de handicap registrados.\nUsa /handicap para empezar."
+        )
+        return
+
+    cerrados = [r for r in data if r.get("estado") in ("acierto","fallo","push")]
+    pendientes = [r for r in data if r.get("estado") == "pendiente"]
+    aciertos = sum(1 for r in cerrados if r.get("estado") == "acierto")
+    fallos = sum(1 for r in cerrados if r.get("estado") == "fallo")
+    push = sum(1 for r in cerrados if r.get("estado") == "push")
+    validos = aciertos + fallos
+    ef = round(aciertos / validos * 100, 1) if validos else 0
+    roi_sim = sum(r.get("retorno", 0) for r in cerrados)
+
+    if validos < HANDICAP_PICKS_MIN_CONFIANZA:
+        nivel = f"⚠️ Insuficiente — faltan {HANDICAP_PICKS_MIN_CONFIANZA - validos} picks válidos"
+    elif validos < 60:
+        nivel = "🟡 Preliminar — usar con cautela"
+    else:
+        nivel = "✅ Confiable"
+
+    # Por linea
+    por_linea = {}
+    for r in cerrados:
+        ln = str(r.get("linea","?"))
+        por_linea.setdefault(ln, {"ok":0,"fallo":0,"push":0})
+        est = r.get("estado","")
+        if est == "acierto": por_linea[ln]["ok"] += 1
+        elif est == "fallo": por_linea[ln]["fallo"] += 1
+        elif est == "push": por_linea[ln]["push"] += 1
+
+    # Por tipo
+    clubs = [r for r in cerrados if r.get("tipo_equipo") != "seleccion"]
+    sels = [r for r in cerrados if r.get("tipo_equipo") == "seleccion"]
+    ef_club = round(sum(1 for r in clubs if r.get("estado")=="acierto") / max(len([r for r in clubs if r.get("estado") in ("acierto","fallo")]),1) * 100, 1)
+    ef_sel = round(sum(1 for r in sels if r.get("estado")=="acierto") / max(len([r for r in sels if r.get("estado") in ("acierto","fallo")]),1) * 100, 1)
+
+    texto = (
+        f"🔬 *Handicap Asiático — Estadísticas*\n"
+        f"━━━━━━━━━━\n"
+        f"📊 Total picks: {len(data)}\n"
+        f"✅ Cerrados: {len(cerrados)} | ⏳ Pendientes: {len(pendientes)}\n"
+        f"✅ Aciertos: {aciertos} | ❌ Fallos: {fallos} | 🔄 Push: {push}\n"
+        f"🎯 Efectividad: *{ef}%*\n"
+        f"💰 ROI simulado (1u/pick): *{roi_sim:+.2f}u*\n"
+        f"📈 Nivel: {nivel}\n\n"
+        f"*Por tipo de equipo:*\n"
+        f"⚽ Clubes: {ef_club}% ({len([r for r in clubs if r.get('estado') in ('acierto','fallo')])} válidos)\n"
+        f"🌍 Selecciones: {ef_sel}% ({len([r for r in sels if r.get('estado') in ('acierto','fallo')])} válidos)\n\n"
+        f"*Por línea de handicap:*\n"
+    )
+    for ln, v in sorted(por_linea.items()):
+        tot = v["ok"] + v["fallo"]
+        ef_ln = round(v["ok"] / tot * 100, 1) if tot else 0
+        texto += f"  Línea {ln}: {v['ok']}✅ {v['fallo']}❌ {v['push']}🔄 — {ef_ln}%\n"
+
+    await _enviar_mensaje_paginado(update, texto)
 
 
 async def combinada(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -12841,6 +13619,8 @@ async def _alerta_edge_excelente_job(context):
 app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
 
 app.add_handler(CommandHandler("start", start))
+app.add_handler(CommandHandler("handicap", handicap))
+app.add_handler(CommandHandler("handicap_stats", handicap_stats))
 app.add_handler(CommandHandler("combinada_dia", combinada_dia))
 app.add_handler(CommandHandler("analizar", analizar))
 app.add_handler(CommandHandler("detalle", detalle))
