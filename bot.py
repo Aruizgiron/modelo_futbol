@@ -5971,7 +5971,7 @@ LIGAS_SIN_STATS = {
 # ── MINI-TICKETS ──────────────────────────────────────────────────────────
 # Cuota individual minima y maxima para eslabones de mini-tickets
 MINI_TICKET_CUOTA_MIN = 1.10
-MINI_TICKET_CUOTA_MAX = 1.60
+MINI_TICKET_CUOTA_MAX = 1.80
 # Cuota total objetivo del mini-ticket
 MINI_TICKET_CUOTA_OBJ_MIN = 1.40
 MINI_TICKET_CUOTA_OBJ_MAX = 2.20
@@ -7919,8 +7919,9 @@ def generar_mini_tickets_dia():
     # Ordenar por probabilidad descendente
     tickets_generados.sort(key=lambda t: t["prob_conjunta"], reverse=True)
 
-    # Filtro final: cada mercado (fixture+jugada) solo puede aparecer en UN ticket
-    # Esto evita que un fallo en una jugada tire multiples tickets
+    # Filtro final: cada ticket debe tener al menos 2 jugadas
+    # que no hayan aparecido en tickets anteriores.
+    # Esto garantiza diversidad sin ser demasiado restrictivo.
     tickets_sin_repetir = []
     jugadas_usadas_global = set()
 
@@ -7928,12 +7929,32 @@ def generar_mini_tickets_dia():
         claves_ticket = set(
             (str(e["fixture_id"]), e["jugada"]) for e in ticket["picks"]
         )
-        if claves_ticket & jugadas_usadas_global:
-            continue  # este ticket repite una jugada ya usada
+        jugadas_nuevas = claves_ticket - jugadas_usadas_global
+        # Exigir al menos 2 jugadas nuevas para que el ticket sea suficientemente distinto
+        if len(jugadas_nuevas) < 2:
+            continue
         tickets_sin_repetir.append(ticket)
         jugadas_usadas_global.update(claves_ticket)
         if len(tickets_sin_repetir) >= MINI_TICKET_MAX_DIA:
             break
+
+    # Si con criterio estricto no hay suficientes, relajar a 1 jugada nueva
+    if len(tickets_sin_repetir) < 3:
+        jugadas_usadas_global2 = set()
+        tickets_sin_repetir2 = []
+        for ticket in tickets_generados:
+            claves_ticket = set(
+                (str(e["fixture_id"]), e["jugada"]) for e in ticket["picks"]
+            )
+            jugadas_nuevas = claves_ticket - jugadas_usadas_global2
+            if len(jugadas_nuevas) < 1:
+                continue
+            tickets_sin_repetir2.append(ticket)
+            jugadas_usadas_global2.update(claves_ticket)
+            if len(tickets_sin_repetir2) >= MINI_TICKET_MAX_DIA:
+                break
+        if len(tickets_sin_repetir2) > len(tickets_sin_repetir):
+            tickets_sin_repetir = tickets_sin_repetir2
 
     return tickets_sin_repetir
 
