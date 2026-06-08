@@ -7919,9 +7919,8 @@ def generar_mini_tickets_dia():
     # Ordenar por probabilidad descendente
     tickets_generados.sort(key=lambda t: t["prob_conjunta"], reverse=True)
 
-    # Filtro final: cada ticket debe tener al menos 2 jugadas
-    # que no hayan aparecido en tickets anteriores.
-    # Esto garantiza diversidad sin ser demasiado restrictivo.
+    # Cada ticket debe tener al menos 2 jugadas nuevas que no aparezcan
+    # en tickets anteriores. Esto garantiza diversidad real.
     tickets_sin_repetir = []
     jugadas_usadas_global = set()
 
@@ -7930,31 +7929,12 @@ def generar_mini_tickets_dia():
             (str(e["fixture_id"]), e["jugada"]) for e in ticket["picks"]
         )
         jugadas_nuevas = claves_ticket - jugadas_usadas_global
-        # Exigir al menos 2 jugadas nuevas para que el ticket sea suficientemente distinto
         if len(jugadas_nuevas) < 2:
             continue
         tickets_sin_repetir.append(ticket)
         jugadas_usadas_global.update(claves_ticket)
         if len(tickets_sin_repetir) >= MINI_TICKET_MAX_DIA:
             break
-
-    # Si con criterio estricto no hay suficientes, relajar a 1 jugada nueva
-    if len(tickets_sin_repetir) < 3:
-        jugadas_usadas_global2 = set()
-        tickets_sin_repetir2 = []
-        for ticket in tickets_generados:
-            claves_ticket = set(
-                (str(e["fixture_id"]), e["jugada"]) for e in ticket["picks"]
-            )
-            jugadas_nuevas = claves_ticket - jugadas_usadas_global2
-            if len(jugadas_nuevas) < 1:
-                continue
-            tickets_sin_repetir2.append(ticket)
-            jugadas_usadas_global2.update(claves_ticket)
-            if len(tickets_sin_repetir2) >= MINI_TICKET_MAX_DIA:
-                break
-        if len(tickets_sin_repetir2) > len(tickets_sin_repetir):
-            tickets_sin_repetir = tickets_sin_repetir2
 
     return tickets_sin_repetir
 
