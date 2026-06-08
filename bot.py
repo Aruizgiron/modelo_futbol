@@ -7916,9 +7916,26 @@ def generar_mini_tickets_dia():
             }
             tickets_generados.append(ticket)
 
-    # Ordenar por probabilidad conjunta descendente (los mas seguros primero)
+    # Ordenar por probabilidad descendente
     tickets_generados.sort(key=lambda t: t["prob_conjunta"], reverse=True)
-    return tickets_generados[:MINI_TICKET_MAX_DIA]
+
+    # Filtro final: cada mercado (fixture+jugada) solo puede aparecer en UN ticket
+    # Esto evita que un fallo en una jugada tire multiples tickets
+    tickets_sin_repetir = []
+    jugadas_usadas_global = set()
+
+    for ticket in tickets_generados:
+        claves_ticket = set(
+            (str(e["fixture_id"]), e["jugada"]) for e in ticket["picks"]
+        )
+        if claves_ticket & jugadas_usadas_global:
+            continue  # este ticket repite una jugada ya usada
+        tickets_sin_repetir.append(ticket)
+        jugadas_usadas_global.update(claves_ticket)
+        if len(tickets_sin_repetir) >= MINI_TICKET_MAX_DIA:
+            break
+
+    return tickets_sin_repetir
 
 
 def _guardar_combinada(combinada):
