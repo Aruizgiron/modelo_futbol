@@ -762,6 +762,99 @@ def calcular_forma(team_id, modo=None, last=10):
     }
 
 
+
+
+import math as _math_poisson
+
+# ── PERFIL DE GOLES POR LIGA ─────────────────────────────────────────────
+PERFIL_GOLES_LIGA = {
+    "Eredivisie": +0.08, "Jupiler Pro League": +0.07, "Belgian Pro League": +0.07,
+    "Austrian Bundesliga": +0.07, "Bundesliga": +0.05, "2. Bundesliga": +0.05,
+    "Bundesliga 2": +0.05, "Swedish Allsvenskan": +0.06, "Norwegian Eliteserien": +0.05,
+    "Premier League": +0.03, "Championship": +0.03,
+    "Ligue 1": -0.07, "La Liga": -0.05, "LaLiga": -0.05,
+    "Primeira Liga": -0.05, "Super Lig": -0.04, "Süper Lig": -0.04,
+    "Serie A": -0.03, "Friendlies": -0.05,
+    "Friendlies Internacionales": -0.05,
+    "World Friendlies Internacionales": -0.05,
+    "J-League": -0.02, "K League 1": -0.02,
+}
+
+
+def _ajuste_liga_goles(league):
+    """Retorna el ajuste de prob de goles para una liga dada."""
+    if not league:
+        return 0.0
+    for nombre, ajuste in PERFIL_GOLES_LIGA.items():
+        if nombre.lower() in league.lower():
+            return ajuste
+    return 0.0
+
+
+def _lam_partido(gf_home, gc_home, gf_away, gc_away, league=""):
+    """Calcula lambda total esperado del partido via Poisson."""
+    lam_h = max(0.3, (gf_home + gf_away) / 2 * 0.6 + (gc_home + gc_away) / 2 * 0.4)
+    lam_a = max(0.2, (gf_away + gf_home) / 2 * 0.5 + (gc_away + gc_home) / 2 * 0.5)
+    ajuste = _ajuste_liga_goles(league)
+    return (lam_h + lam_a) * (1 + ajuste)
+
+
+def prob_under35_poisson(gf_home, gc_home, gf_away, gc_away, league=""):
+    """Prob de Under 3.5 goles usando distribucion de Poisson."""
+    try:
+        lam = _lam_partido(gf_home, gc_home, gf_away, gc_away, league)
+        prob = sum(
+            (lam**k * _math_poisson.exp(-lam)) / _math_poisson.factorial(k)
+            for k in range(4)
+        )
+        return round(min(95.0, max(40.0, prob * 100)), 1)
+    except Exception:
+        return None
+
+
+def prob_over15_poisson(gf_home, gc_home, gf_away, gc_away, league=""):
+    """Prob de Over 1.5 goles usando distribucion de Poisson."""
+    try:
+        lam = _lam_partido(gf_home, gc_home, gf_away, gc_away, league)
+        prob = 1 - _math_poisson.exp(-lam) - lam * _math_poisson.exp(-lam)
+        return round(min(95.0, max(40.0, prob * 100)), 1)
+    except Exception:
+        return None
+
+
+def prob_under25_poisson(gf_home, gc_home, gf_away, gc_away, league=""):
+    """Prob de Under 2.5 goles usando distribucion de Poisson."""
+    try:
+        lam = _lam_partido(gf_home, gc_home, gf_away, gc_away, league)
+        prob = sum(
+            (lam**k * _math_poisson.exp(-lam)) / _math_poisson.factorial(k)
+            for k in range(3)
+        )
+        return round(min(92.0, max(35.0, prob * 100)), 1)
+    except Exception:
+        return None
+
+
+def _ajustar_prob_correlacion_mismo_partido(jugada1, jugada2, prob_conjunta_pct):
+    """
+    Ajusta la prob conjunta cuando dos mercados son del mismo partido.
+    La multiplicacion simple sobreestima porque los eventos no son independientes.
+    """
+    j1 = jugada1.lower()
+    j2 = jugada2.lower()
+    p = prob_conjunta_pct
+    if (("under 3.5" in j1 and "over 1.5" in j2) or
+            ("over 1.5" in j1 and "under 3.5" in j2)):
+        p = p * 0.92
+    elif (("under 3.5" in j1 and "over 2.5" in j2) or
+            ("over 2.5" in j1 and "under 3.5" in j2)):
+        p = p * 0.80
+    elif (("1x" in j1 or "x2" in j1) and "under" in j2):
+        p = p * 1.03
+    elif ("under" in j1 and ("1x" in j2 or "x2" in j2)):
+        p = p * 1.03
+    return round(min(95.0, p), 1)
+
 def calcular_prob_sin_roja(home_general, away_general, fase="group"):
     """
     Calcula la probabilidad de que el partido termine Sin Tarjeta Roja.
@@ -4939,6 +5032,53 @@ async def analizar(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Sin ID — muestra mini-tickets del dia
     if not context.args:
         _registrar_chat_alarma(update.effective_chat.id)
+        hoy = fecha_hoy_peru()
+
+        # Verificar si ya hay tickets generados hoy (cache del dia)
+        combinadas_hoy = leer_json(COMBINADAS_FILE)
+        mt_hoy = [c for c in combinadas_hoy
+                  if c.get("subtipo") == "MT"
+                  and c.get("fecha","")[:10] == hoy
+                  and c.get("estado") == "pendiente"]
+
+        if mt_hoy:
+            # Ya hay tickets del dia — mostrar los existentes sin regenerar
+            texto = f"💡 *Mini-tickets del día — {hoy}*\n"
+            texto += f"_{len(mt_hoy)} tickets (generados anteriormente hoy)_\n"
+            texto += "━━━━━━━━━━\n\n"
+
+            for i, mt in enumerate(mt_hoy, 1):
+                picks = mt.get("picks", [])
+                n = len(picks)
+                tipo = "Triple" if n == 3 else "Doble"
+                cuota = mt.get("cuota_combinada", 1.0)
+                prob = mt.get("prob_conjunta", 0)
+                ticket_id = mt.get("ticket_id", "")
+                ganancia_ref = round(10.0 * (cuota - 1), 2)
+
+                texto += f"🎫 *Ticket {i} — {tipo}* | `{ticket_id}`\n"
+                for j, e in enumerate(picks, 1):
+                    mismo_partido = sum(1 for x in picks if x["fixture_id"] == e["fixture_id"]) > 1
+                    est = " ⚠️est." if e.get("cuota_estimada") else ""
+                    mismo_txt = " 🔄" if mismo_partido else ""
+                    estado_e = e.get("estado","pendiente")
+                    icono = "✅" if estado_e == "acierto" else "❌" if estado_e == "fallo" else "✅"
+                    texto += (
+                        f"  {j}. *{e['partido']}*{mismo_txt}\n"
+                        f"     {e.get('league','')} | {e.get('hora','')}\n"
+                        f"     {icono} {e['jugada']}\n"
+                        f"     Cuota: {e['cuota']}x{est} | Prob: {e.get('prob',0)}%\n"
+                    )
+                texto += (
+                    f"📊 Cuota total: *{cuota}x* | Prob conjunta: *~{prob}%*\n"
+                    f"💰 Con S/10 → ganancia potencial: *S/ {ganancia_ref:.2f}*\n"
+                    f"━━━━━━━━━━\n\n"
+                )
+
+            texto += "_(Usa /analizar refresh para regenerar los tickets del día)_"
+            await _enviar_mensaje_paginado(update, texto)
+            return
+
         await update.message.reply_text(
             "💡 Generando mini-tickets del día...\n"
             "Analizando todos los partidos disponibles. Esto puede tomar 1-2 minutos."
@@ -4961,7 +5101,6 @@ async def analizar(update: Update, context: ContextTypes.DEFAULT_TYPE):
             _guardar_combinada(t)
 
         # Formatear y enviar
-        hoy = fecha_hoy_peru()
         texto = f"💡 *Mini-tickets del día — {hoy}*\n"
         texto += f"_{len(tickets)} tickets sugeridos, ordenados por seguridad_\n"
         texto += "━━━━━━━━━━\n\n"
@@ -4973,13 +5112,10 @@ async def analizar(update: Update, context: ContextTypes.DEFAULT_TYPE):
             cuota = mt["cuota_combinada"]
             prob = mt["prob_conjunta"]
             ticket_id = mt.get("ticket_id", "")
-
-            # Ganancia estimada con S/10 de stake
             stake_ref = 10.0
             ganancia_ref = round(stake_ref * (cuota - 1), 2)
 
             texto += f"🎫 *Ticket {i} — {tipo}* | `{ticket_id}`\n"
-
             for j, e in enumerate(picks, 1):
                 mismo_partido = sum(1 for x in picks if x["fixture_id"] == e["fixture_id"]) > 1
                 est = " ⚠️est." if e.get("cuota_estimada") else ""
@@ -4990,7 +5126,6 @@ async def analizar(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     f"     ✅ {e['jugada']}\n"
                     f"     Cuota: {e['cuota']}x{est} | Prob: {e['prob']}%\n"
                 )
-
             texto += (
                 f"📊 Cuota total: *{cuota}x* | Prob conjunta: *~{prob}%*\n"
                 f"💰 Con S/10 → ganancia potencial: *S/ {ganancia_ref:.2f}*\n"
@@ -5005,7 +5140,37 @@ async def analizar(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await _enviar_mensaje_paginado(update, texto)
         return
 
-    # Con ID — análisis del partido específico + mini-tickets del mismo partido
+    # Con ID o "refresh"
+    if context.args and context.args[0].lower() == "refresh":
+        # Eliminar tickets pendientes del dia y regenerar
+        hoy_r = fecha_hoy_peru()
+        combinadas_r = leer_json(COMBINADAS_FILE)
+        combinadas_r = [c for c in combinadas_r
+                        if not (c.get("subtipo") == "MT"
+                                and c.get("fecha","")[:10] == hoy_r
+                                and c.get("estado") == "pendiente")]
+        guardar_json_lista(COMBINADAS_FILE, combinadas_r)
+
+        await update.message.reply_text(
+            "🔄 Tickets del día eliminados. Regenerando...\n"
+            "Esto puede tomar 1-2 minutos."
+        )
+        try:
+            tickets_r = generar_mini_tickets_dia()
+        except Exception as e:
+            await update.message.reply_text(f"❌ Error: {e}")
+            return
+        if not tickets_r:
+            await update.message.reply_text("❌ No encontré mini-tickets válidos para hoy.")
+            return
+        for t in tickets_r:
+            _guardar_combinada(t)
+        await update.message.reply_text(
+            f"✅ {len(tickets_r)} tickets nuevos generados y guardados. Usa /analizar para verlos."
+        )
+        return
+
+    # Con ID — análisis del partido específico
     fixture_id = context.args[0]
 
     fixture = api_get(f"/fixtures?id={fixture_id}", use_cache=False)
