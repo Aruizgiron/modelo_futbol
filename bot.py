@@ -8175,14 +8175,17 @@ def _actualizar_resultado_combinada():
     if cambios:
         guardar_json_lista(PICKS_FILE, picks_todos)
 
-    # Indice por fixture_id y por partido+jugada
-    idx_picks_fid = {}
-    idx_picks_pj = {}  # partido+jugada -> pick
+    # Indice por (fixture_id + jugada) y por (partido + jugada)
+    # IMPORTANTE: la clave incluye la jugada para evitar que picks distintos
+    # del mismo partido (ej: Under 3.5 y Over 1.5) se confundan entre si.
+    idx_picks_fid_jug = {}   # "fixture_id|jugada" -> pick
+    idx_picks_pj = {}        # "partido|jugada" -> pick
     for p in picks_todos:
         fid = str(p.get("fixture_id",""))
+        jug = p.get("jugada","")
         if fid:
-            idx_picks_fid[fid] = p
-        clave_pj = f"{p.get('partido','')}|{p.get('jugada','')}"
+            idx_picks_fid_jug[f"{fid}|{jug}"] = p
+        clave_pj = f"{p.get('partido','')}|{jug}"
         idx_picks_pj[clave_pj] = p
 
     for c in combinadas:
@@ -8196,10 +8199,11 @@ def _actualizar_resultado_combinada():
             fid = str(pick_c.get("fixture_id", ""))
             jugada_comb = pick_c.get("jugada", "")
             partido_nombre = pick_c.get("partido", "")
+            clave_fid_jug = f"{fid}|{jugada_comb}"
             clave_pj = f"{partido_nombre}|{jugada_comb}"
 
-            # Buscar en picks_guardados.json
-            p_actual = idx_picks_fid.get(fid) or idx_picks_pj.get(clave_pj)
+            # Buscar en picks_guardados.json por fixture_id+jugada (exacto) o partido+jugada
+            p_actual = idx_picks_fid_jug.get(clave_fid_jug) or idx_picks_pj.get(clave_pj)
 
             if p_actual:
                 estado_p = p_actual.get("estado", "pendiente").lower()
@@ -8221,12 +8225,22 @@ def _actualizar_resultado_combinada():
                                 ga = fx[0]["goals"]["away"] or 0
                                 total = gh + ga
 
-                                # Evaluar jugada
+                                # Evaluar jugada — usar float para evitar errores de redondeo
+                                import re as _re_comb
+                                def _linea_comb(txt):
+                                    m = _re_comb.search(r"(\d+\.?\d*)", txt)
+                                    return float(m.group(1)) if m else None
+
                                 acierto = None
-                                if "Under 3.5" in jugada_comb: acierto = total <= 3
-                                elif "Over 2.5" in jugada_comb: acierto = total >= 3
-                                elif "Over 1.5" in jugada_comb: acierto = total >= 2
-                                elif "Ambos marcan" in jugada_comb: acierto = gh>0 and ga>0
+                                jugada_comb_l = jugada_comb.lower()
+                                if "under" in jugada_comb_l and "gol" in jugada_comb_l:
+                                    linea_c = _linea_comb(jugada_comb)
+                                    acierto = total < linea_c if linea_c is not None else None
+                                elif "over" in jugada_comb_l and "gol" in jugada_comb_l:
+                                    linea_c = _linea_comb(jugada_comb)
+                                    acierto = total > linea_c if linea_c is not None else None
+                                elif "ambos marcan" in jugada_comb_l or "btts" in jugada_comb_l:
+                                    acierto = gh > 0 and ga > 0
                                 elif "Corners Over" in jugada_comb:
                                     stats = api_get(f"/fixtures/statistics?fixture={fid}", use_cache=False)
                                     if stats:
@@ -8253,8 +8267,8 @@ def _actualizar_resultado_combinada():
                                         linea = float(''.join(c2 for c2 in jugada_comb.split("Over")[-1] if c2.isdigit() or c2=="."))
                                         acierto = tt > linea
                                         pick_c["resultado_real"] = f"{tt} tarjetas"
-                                elif "1X" in jugada_comb: acierto = gh >= ga
-                                elif "X2" in jugada_comb: acierto = ga >= gh
+                                elif "1x" in jugada_comb_l: acierto = gh >= ga
+                                elif "x2" in jugada_comb_l: acierto = ga >= gh
                                 elif "sin tarjeta roja" in jugada_comb.lower():
                                     stats_sr = api_get(f"/fixtures/statistics?fixture={fid}", use_cache=False)
                                     rojas_totales = 0
