@@ -188,6 +188,10 @@ MULTIPLICADOR_LIGA = {
     "Ligue 1": 0.88,          # 63.2% (n=19)
     "Serie A": 0.92,          # 67.7% (n=31)
     "Serie A Italia": 0.92,   # alias
+    # V14.3: Mundial — modelo de selecciones más fiable en mercados de goles
+    "FIFA World Cup 2026": 1.02,
+    "FIFA World Cup": 1.02,
+    "World Cup": 1.02,
 }
 
 
@@ -793,6 +797,11 @@ PERFIL_GOLES_LIGA = {
     "Friendlies Internacionales": -0.05,
     "World Friendlies Internacionales": -0.05,
     "J-League": -0.02, "K League 1": -0.02,
+    # V14.3: Mundial — fase de grupos promedia ~2.3 goles/partido históricamente
+    # Ajuste negativo similar a LaLiga (partidos cerrados, especulación táctica)
+    "FIFA World Cup 2026": -0.06,
+    "FIFA World Cup": -0.06,
+    "World Cup": -0.06,
 }
 
 # V14.3: Factor de penalización de score para competiciones juveniles/amistosas.
@@ -2073,6 +2082,21 @@ def preparar_analisis(fixture_id, incluir_odds=False, incluir_contexto=False):
             if goles_h2h:
                 over15_h2h = sum(1 for g in goles_h2h if g >= 2) / len(goles_h2h)
                 under35_h2h = sum(1 for g in goles_h2h if g <= 3) / len(goles_h2h)
+                prom_h2h = sum(goles_h2h) / len(goles_h2h)
+
+                # V14.3 FIX: Descarte directo por contradicción H2H.
+                # Si el promedio de goles H2H supera la línea, el pick Under
+                # es estadísticamente contradictorio y se elimina.
+                # Ej: promedio H2H 4.0 goles → Under 3.5 no tiene sentido.
+                recomendaciones = [
+                    r for r in recomendaciones
+                    if not (
+                        ("under 3.5" in (r.get("jugada") or "").lower() and prom_h2h >= 3.5)
+                        or ("under 2.5" in (r.get("jugada") or "").lower() and prom_h2h >= 2.5)
+                        or ("under 1.5" in (r.get("jugada") or "").lower() and prom_h2h >= 1.5)
+                    )
+                ]
+
                 for r in recomendaciones:
                     jugada_r = (r.get("jugada") or "").lower()
                     if "over 1.5" in jugada_r and over15_h2h >= 0.7:
@@ -8063,56 +8087,170 @@ def generar_mini_tickets_dia():
             # Obtener odds directamente para cuotas reales
             odds_mt = api_get(f"/odds?fixture={fixture_id}", use_cache=True, ttl=600)
 
-            # 1. Goles Over/Under — directo desde estadisticas sin filtros conservadores
+            # ── PUNTO 2: H2H como filtro de descarte para Under ──────────
+            # Calcular promedio H2H del partido específico
+            try:
+                h2h_mt = api_get(
+                    f"/fixtures/headtohead?h2h={p.get('home_id','')}-{p.get('away_id','')}&last=5",
+                    use_cache=True, ttl=7200
+                )
+                if not h2h_mt:
+                    # Intentar obtener IDs desde fixture
+                    fx_ids = api_get(f"/fixtures?id={fixture_id}", use_cache=True, ttl=3600)
+                    if fx_ids:
+                        hid = fx_ids[0]["teams"]["home"]["id"]
+                        aid = fx_ids[0]["teams"]["away"]["id"]
+                        h2h_mt = api_get(f"/fixtures/headtohead?h2h={hid}-{aid}&last=5",
+                                        use_cache=True, ttl=7200)
+                goles_h2h_mt = [
+                    (m["goals"]["home"] or 0) + (m["goals"]["away"] or 0)
+                    for m in (h2h_mt or [])
+                    if m["goals"]["home"] is not None
+                ]
+                prom_h2h_mt = sum(goles_h2h_mt) / len(goles_h2h_mt) if goles_h2h_mt else None
+            except Exception:
+                prom_h2h_mt = None
+
+            # ── PUNTO 8: Usar score real de preparar_analisis ────────────
+            # Obtener el score más alto de las recomendaciones del partido
+            recs_data = data.get("recomendaciones", [])
+            score_partido = max(
+                (float(r.get("score", 7.5) or 7.5) for r in recs_data),
+                default=7.5
+            )
+            # Mapa jugada → score real calculado por preparar_analisis
+            score_por_jugada = {
+                r.get("jugada", ""): float(r.get("score", 7.5) or 7.5)
+                for r in recs_data
+            }
+            # xG del partido si está disponible
+            xg_total_mt = None
+            for r in recs_data:
+                if r.get("xg_pred_total"):
+                    xg_total_mt = float(r["xg_pred_total"])
+                    break
+
             base_home = home_hh or home_gen
             base_away = away_aa or away_gen
             total_prom = (base_home.get("total_prom", 0) + base_away.get("total_prom", 0)) / 2
             under35 = (base_home.get("under35", 0) + base_away.get("under35", 0)) / 2
             over15 = (base_home.get("over15", 0) + base_away.get("over15", 0)) / 2
+            over25 = (base_home.get("over25", 0) + base_away.get("over25", 0)) / 2
+            under25 = 1 - over25  # aproximación
 
-            # Under 3.5
+            # ── PUNTO 5: Recalibrar probs individuales ───────────────────
+            def _prob_mt(prob_raw):
+                """Recalibra prob para evitar valores irreales (máx 88%)."""
+                return min(88.0, recalibrar_probabilidad(float(prob_raw or 0)))
+
+            # 1. Under 3.5 — con filtro H2H y score real
             if under35 >= 0.65:
-                prob_u35 = round(under35 * 100, 1)
-                cuota_u35, _ = buscar_mejor_cuota(fixture_id, "Under 3.5 goles")
-                if cuota_u35 and MINI_TICKET_CUOTA_MIN <= cuota_u35 <= MINI_TICKET_CUOTA_MAX and prob_u35 >= 60:
-                    clave = (fixture_id, "Under 3.5 goles")
-                    if clave not in picks_ya_usados:
-                        picks_ya_usados.add(clave)
-                        eslabones.append({
-                            "fixture_id": fixture_id,
-                            "partido": f"{home} vs {away}",
-                            "home": home, "away": away,
-                            "league": league, "country": country,
-                            "hora": hora,
-                            "mercado": "Goles totales",
-                            "jugada": "Under 3.5 goles",
-                            "prob": prob_u35,
-                            "cuota": cuota_u35,
-                            "score": 7.5,
-                            "fecha": hoy,
-                        })
+                prob_u35 = _prob_mt(under35 * 100)
+                # Punto 2: descartar si H2H promedio supera la línea
+                if prom_h2h_mt is not None and prom_h2h_mt >= 3.5:
+                    pass  # contradictorio con H2H
+                elif xg_total_mt is not None and xg_total_mt > 3.5:
+                    pass  # xG también contradice Under 3.5
+                elif prob_u35 >= 60:
+                    cuota_u35, _ = buscar_mejor_cuota(fixture_id, "Under 3.5 goles")
+                    if cuota_u35 and MINI_TICKET_CUOTA_MIN <= cuota_u35 <= MINI_TICKET_CUOTA_MAX:
+                        clave = (fixture_id, "Under 3.5 goles")
+                        if clave not in picks_ya_usados:
+                            picks_ya_usados.add(clave)
+                            score_u35 = score_por_jugada.get("Under 3.5 goles", score_partido)
+                            eslabones.append({
+                                "fixture_id": fixture_id,
+                                "partido": f"{home} vs {away}",
+                                "home": home, "away": away,
+                                "league": league, "country": country,
+                                "hora": hora,
+                                "mercado": "Goles totales",
+                                "jugada": "Under 3.5 goles",
+                                "prob": prob_u35,
+                                "cuota": cuota_u35,
+                                "score": round(score_u35, 1),
+                                "fecha": hoy,
+                            })
 
-            # Over 1.5
+            # 2. Over 1.5 — con filtro H2H y score real
             if over15 >= 0.70:
-                prob_o15 = round(over15 * 100, 1)
-                cuota_o15, _ = buscar_mejor_cuota(fixture_id, "Over 1.5 goles")
-                if cuota_o15 and MINI_TICKET_CUOTA_MIN <= cuota_o15 <= MINI_TICKET_CUOTA_MAX and prob_o15 >= 65:
-                    clave = (fixture_id, "Over 1.5 goles")
-                    if clave not in picks_ya_usados:
-                        picks_ya_usados.add(clave)
-                        eslabones.append({
-                            "fixture_id": fixture_id,
-                            "partido": f"{home} vs {away}",
-                            "home": home, "away": away,
-                            "league": league, "country": country,
-                            "hora": hora,
-                            "mercado": "Goles totales",
-                            "jugada": "Over 1.5 goles",
-                            "prob": prob_o15,
-                            "cuota": cuota_o15,
-                            "score": 7.5,
-                            "fecha": hoy,
-                        })
+                prob_o15 = _prob_mt(over15 * 100)
+                # Descartar si H2H promedio es muy bajo (partidos cerrados)
+                if prom_h2h_mt is not None and prom_h2h_mt < 1.0:
+                    pass  # H2H sugiere partidos 0-0 o 1-0
+                elif prob_o15 >= 65:
+                    cuota_o15, _ = buscar_mejor_cuota(fixture_id, "Over 1.5 goles")
+                    if cuota_o15 and MINI_TICKET_CUOTA_MIN <= cuota_o15 <= MINI_TICKET_CUOTA_MAX:
+                        clave = (fixture_id, "Over 1.5 goles")
+                        if clave not in picks_ya_usados:
+                            picks_ya_usados.add(clave)
+                            score_o15 = score_por_jugada.get("Over 1.5 goles", score_partido)
+                            eslabones.append({
+                                "fixture_id": fixture_id,
+                                "partido": f"{home} vs {away}",
+                                "home": home, "away": away,
+                                "league": league, "country": country,
+                                "hora": hora,
+                                "mercado": "Goles totales",
+                                "jugada": "Over 1.5 goles",
+                                "prob": prob_o15,
+                                "cuota": cuota_o15,
+                                "score": round(score_o15, 1),
+                                "fecha": hoy,
+                            })
+
+            # ── PUNTO 11: Over 2.5 y Under 2.5 como nuevos mercados ──────
+            # Over 2.5 — para partidos claramente ofensivos
+            if over25 >= 0.65 and total_prom >= 2.8:
+                prob_o25 = _prob_mt(over25 * 100)
+                if prom_h2h_mt is not None and prom_h2h_mt < 2.0:
+                    pass  # H2H sugiere partidos cerrados
+                elif prob_o25 >= 60:
+                    cuota_o25, _ = buscar_mejor_cuota(fixture_id, "Over 2.5 goles")
+                    if cuota_o25 and MINI_TICKET_CUOTA_MIN <= cuota_o25 <= MINI_TICKET_CUOTA_MAX:
+                        clave = (fixture_id, "Over 2.5 goles")
+                        if clave not in picks_ya_usados:
+                            picks_ya_usados.add(clave)
+                            score_o25 = score_por_jugada.get("Over 2.5 goles", score_partido - 0.3)
+                            eslabones.append({
+                                "fixture_id": fixture_id,
+                                "partido": f"{home} vs {away}",
+                                "home": home, "away": away,
+                                "league": league, "country": country,
+                                "hora": hora,
+                                "mercado": "Goles totales",
+                                "jugada": "Over 2.5 goles",
+                                "prob": prob_o25,
+                                "cuota": cuota_o25,
+                                "score": round(score_o25, 1),
+                                "fecha": hoy,
+                            })
+
+            # Under 2.5 — para partidos muy defensivos
+            if under25 >= 0.70 and total_prom <= 2.0:
+                prob_u25 = _prob_mt(under25 * 100)
+                if prom_h2h_mt is not None and prom_h2h_mt >= 2.5:
+                    pass  # H2H contradice Under 2.5
+                elif prob_u25 >= 62:
+                    cuota_u25, _ = buscar_mejor_cuota(fixture_id, "Under 2.5 goles")
+                    if cuota_u25 and MINI_TICKET_CUOTA_MIN <= cuota_u25 <= MINI_TICKET_CUOTA_MAX:
+                        clave = (fixture_id, "Under 2.5 goles")
+                        if clave not in picks_ya_usados:
+                            picks_ya_usados.add(clave)
+                            score_u25 = score_por_jugada.get("Under 2.5 goles", score_partido - 0.2)
+                            eslabones.append({
+                                "fixture_id": fixture_id,
+                                "partido": f"{home} vs {away}",
+                                "home": home, "away": away,
+                                "league": league, "country": country,
+                                "hora": hora,
+                                "mercado": "Goles totales",
+                                "jugada": "Under 2.5 goles",
+                                "prob": prob_u25,
+                                "cuota": cuota_u25,
+                                "score": round(score_u25, 1),
+                                "fecha": hoy,
+                            })
 
             # 2. Doble Oportunidad — buscar cuota real de Pinnacle
             # Calcular fuerza relativa
@@ -8148,6 +8286,8 @@ def generar_mini_tickets_dia():
                     clave_dc = (fixture_id, jugada_dc)
                     if clave_dc not in picks_ya_usados:
                         picks_ya_usados.add(clave_dc)
+                        prob_dc_cal = _prob_mt(prob_dc)
+                        score_dc = score_por_jugada.get(jugada_dc, score_partido)
                         eslabones.append({
                             "fixture_id": fixture_id,
                             "partido": f"{home} vs {away}",
@@ -8156,9 +8296,9 @@ def generar_mini_tickets_dia():
                             "hora": hora,
                             "mercado": "Doble oportunidad",
                             "jugada": jugada_dc,
-                            "prob": round(prob_dc, 1),
+                            "prob": round(prob_dc_cal, 1),
                             "cuota": cuota_dc,
-                            "score": 7.5,
+                            "score": round(score_dc, 1),
                             "fecha": hoy,
                         })
 
@@ -8272,13 +8412,27 @@ def generar_mini_tickets_dia():
                 continue
 
             # Calcular cuota y prob conjunta
+            # V14.3: aplicar recalibración individual y ajuste de correlación
             cuota_total = 1.0
             prob_conjunta = 1.0
             for e in grupo:
                 cuota_total *= e["cuota"]
-                prob_conjunta *= (e["prob"] / 100.0)
+                prob_e = min(88.0, float(e["prob"]))  # techo 88% por eslabon
+                prob_conjunta *= (prob_e / 100.0)
             cuota_total = round(cuota_total, 2)
-            prob_conjunta_pct = round(prob_conjunta * 100, 1)
+
+            # Ajuste de correlación entre mercados del mismo partido
+            for i in range(len(grupo)):
+                for j in range(i+1, len(grupo)):
+                    if grupo[i]["fixture_id"] == grupo[j]["fixture_id"]:
+                        prob_conjunta_pct_tmp = prob_conjunta * 100
+                        prob_ajustada = _ajustar_prob_correlacion_mismo_partido(
+                            grupo[i]["jugada"], grupo[j]["jugada"],
+                            prob_conjunta_pct_tmp
+                        )
+                        prob_conjunta = prob_ajustada / 100.0
+
+            prob_conjunta_pct = round(min(95.0, prob_conjunta * 100), 1)
 
             # Filtros de calidad
             if cuota_total < MINI_TICKET_CUOTA_OBJ_MIN:
@@ -8318,8 +8472,11 @@ def generar_mini_tickets_dia():
     # Ordenar por probabilidad descendente
     tickets_generados.sort(key=lambda t: t["prob_conjunta"], reverse=True)
 
-    # Cada ticket debe tener al menos 2 jugadas nuevas que no aparezcan
-    # en tickets anteriores. Esto garantiza diversidad real.
+    # V14.3: Diversidad adaptativa según cantidad de eslabones disponibles.
+    # Con pocos partidos (días de poca actividad) se relaja a 1 jugada nueva.
+    # Con muchos partidos (Mundial) se mantiene en 2 para máxima diversidad.
+    min_jugadas_nuevas = 2 if len(eslabones) >= 12 else 1
+
     tickets_sin_repetir = []
     jugadas_usadas_global = set()
 
@@ -8328,7 +8485,7 @@ def generar_mini_tickets_dia():
             (str(e["fixture_id"]), e["jugada"]) for e in ticket["picks"]
         )
         jugadas_nuevas = claves_ticket - jugadas_usadas_global
-        if len(jugadas_nuevas) < 2:
+        if len(jugadas_nuevas) < min_jugadas_nuevas:
             continue
         tickets_sin_repetir.append(ticket)
         jugadas_usadas_global.update(claves_ticket)
@@ -13460,15 +13617,36 @@ RANKING_FIFA = {
     "Ukraine": 28, "Norway": 29, "Panama": 30, "Poland": 31,
     "Wales": 32, "Chile": 32, "Algeria": 34, "Egypt": 35,
     "Scotland": 36, "Serbia": 37, "Nigeria": 38, "Paraguay": 39,
-    "Peru": 40, "Tunisia": 41, "Ivory Coast": 42, "Sweden": 43,
-    "Czech Republic": 44, "Czechia": 44, "Slovakia": 45, "Greece": 46,
-    "Romania": 47, "Venezuela": 48, "Costa Rica": 49, "Uzbekistan": 50,
-    # Equipos clasificados al Mundial 2026
-    "Qatar": 53, "Saudi Arabia": 60, "South Africa": 61,
+    "Peru": 40, "Tunisia": 41, "Ivory Coast": 42, "Côte d'Ivoire": 42,
+    "Sweden": 43, "Czech Republic": 44, "Czechia": 44, "Slovakia": 45,
+    "Greece": 46, "Romania": 47, "Venezuela": 48, "Costa Rica": 49,
+    "Uzbekistan": 50,
+    # Equipos clasificados al Mundial 2026 — V14.3 completado
+    "Qatar": 53, "Saudi Arabia": 56, "South Africa": 61,
     "Jordan": 64, "Cabo Verde": 67, "Cape Verde": 67,
     "Ghana": 72, "Curaçao": 82, "Curacao": 82, "Haiti": 84,
     "New Zealand": 87, "Honduras": 65, "Bolivia": 85,
     "Iraq": 64, "Indonesia": 130,
+    # V14.3: equipos adicionales del Mundial 2026
+    "Guatemala": 110, "El Salvador": 96,
+    "Congo DR": 55, "DR Congo": 55, "Tanzania": 121,
+    "Bahrain": 86, "China": 92, "Chinese Taipei": 130,
+    "Sudan": 130, "South Sudan": 130,
+    "Thailand": 113, "Philippines": 134, "Myanmar": 160,
+    "Cambodia": 175, "Vietnam": 116,
+    "Kosovo": 100, "Luxembourg": 95, "Gibraltar": 198,
+    "Faroe Islands": 115, "Armenia": 104, "Georgia": 75,
+    "Slovenia": 57, "Iceland": 68, "Albania": 69, "Finland": 52,
+    "North Macedonia": 73, "Bosnia": 63, "Bosnia and Herzegovina": 63,
+    "Bulgaria": 78, "Israel": 76, "Montenegro": 94,
+    "Cameroon": 47, "Mali": 56, "Zambia": 95, "Angola": 99,
+    "Benin": 96, "Guinea": 79, "Comoros": 102, "Namibia": 107,
+    "Libya": 111, "Ethiopia": 117, "Mozambique": 120,
+    "Trinidad and Tobago": 88, "Jamaica": 55, "Cuba": 116,
+    "Guyana": 122, "Suriname": 105, "Belize": 163,
+    "Oman": 80, "Kuwait": 130, "Lebanon": 101, "Kyrgyzstan": 109,
+    "Tajikistan": 108, "Myanmar": 160, "Mongolia": 185,
+    "Northern Ireland": 70, "Republic of Ireland": 51, "Ireland": 51,
 }
 
 # Fases del torneo y sus caracteristicas
@@ -13747,33 +13925,49 @@ def analizar_seleccion(fixture_id, home, away, league, country, hora, round_name
 
     # Under 2.5 goles (con probabilidad ajustada por fase y estilos)
     if "Under 2.5 goles" in mercados_pref and "Under 2.5 goles" not in mercados_evitar:
-        prob_u25 = min(85, prob_under25_base)
-        sugerencias.append({
-            "mercado": "Goles",
-            "jugada": "Under 2.5 goles",
-            "prob": prob_u25,
-            "score": score_final,
-            "riesgo": 1.5,
-            "cuota_minima": cuota_minima(prob_u25/100, 1.5),
-            "cuota": cuota_minima(prob_u25/100, 1.5),
-            "confianza": etiqueta_confianza(score_final),
-            "motivo": f"Fase {config_fase['label']} — hist {prob_under25_base}% Under 2.5",
-        })
+        # V14.3: Descarte directo si H2H promedio supera la línea
+        if goles_h2h_prom >= 2.5:
+            pass  # partido históricamente goleador — no recomendar Under 2.5
+        else:
+            prob_u25 = min(85, prob_under25_base)
+            sugerencias.append({
+                "mercado": "Goles",
+                "jugada": "Under 2.5 goles",
+                "prob": prob_u25,
+                "score": score_final,
+                "riesgo": 1.5,
+                "cuota_minima": cuota_minima(prob_u25/100, 1.5),
+                "cuota": cuota_minima(prob_u25/100, 1.5),
+                "confianza": etiqueta_confianza(score_final),
+                "motivo": f"Fase {config_fase['label']} — hist {prob_under25_base}% Under 2.5",
+            })
 
-    # Under 3.5 goles
+    # Under 3.5 goles — V14.3: usa Poisson+Dixon-Coles en lugar de Under2.5+14
     if "Under 3.5 goles" in mercados_pref:
-        prob_u35 = min(88, prob_under25_base + 14)
-        sugerencias.append({
-            "mercado": "Goles",
-            "jugada": "Under 3.5 goles",
-            "prob": prob_u35,
-            "score": score_final,
-            "riesgo": 1.2,
-            "cuota_minima": cuota_minima(prob_u35/100, 1.2),
-            "cuota": cuota_minima(prob_u35/100, 1.2),
-            "confianza": etiqueta_confianza(score_final),
-            "motivo": f"Partidos cerrados — {estilo_home} vs {estilo_away}",
-        })
+        # Descarte directo si H2H promedio supera la línea
+        if goles_h2h_prom >= 3.5:
+            pass  # partido históricamente muy goleador — no recomendar Under 3.5
+        else:
+            # Usar Poisson con datos reales en lugar de fórmula arbitraria
+            prob_u35_poisson = prob_under35_poisson(
+                gf_home, gc_home, gf_away, gc_away, league
+            )
+            prob_u35 = prob_u35_poisson if prob_u35_poisson else min(88, prob_under25_base + 14)
+            # Ajuste por fase — en grupos hay más Under 3.5 que en eliminatorias
+            if fase == "friendly":
+                prob_u35 = max(40, prob_u35 - 8)  # amistosos más abiertos
+            prob_u35 = min(88, prob_u35)
+            sugerencias.append({
+                "mercado": "Goles",
+                "jugada": "Under 3.5 goles",
+                "prob": round(prob_u35, 1),
+                "score": score_final,
+                "riesgo": 1.2,
+                "cuota_minima": cuota_minima(prob_u35/100, 1.2),
+                "cuota": cuota_minima(prob_u35/100, 1.2),
+                "confianza": etiqueta_confianza(score_final),
+                "motivo": f"Partidos cerrados — {estilo_home} vs {estilo_away} | Poisson: {prob_u35:.0f}%",
+            })
 
     # Doble Oportunidad (ajustada por ranking y motivacion)
     if "Doble Oportunidad" in mercados_pref or "1X o X2" in mercados_pref:
@@ -13789,17 +13983,29 @@ def analizar_seleccion(fixture_id, home, away, league, country, hora, round_name
         # Ajuste por cansancio del visitante
         if desc_away < 4:
             prob_do = min(85, prob_do + 5)
-        sugerencias.append({
-            "mercado": "Doble Oportunidad",
-            "jugada": jugada_do,
-            "prob": prob_do,
-            "score": score_final,
-            "riesgo": 1.3,
-            "cuota_minima": cuota_minima(prob_do/100, 1.3),
-            "cuota": cuota_minima(prob_do/100, 1.3),
-            "confianza": etiqueta_confianza(score_final),
-            "motivo": f"Ranking diff: {diff_ranking} | Descanso visitante: {desc_away} dias",
-        })
+
+        # V14.3: Filtro de prob de empate desde Pinnacle
+        # Si la prob de empate es baja (<18%) el pick DC tiene poco valor real
+        try:
+            odds_do = api_get(f"/odds?fixture={fixture_id}", use_cache=True, ttl=600)
+            cuotas_do = _extraer_cuotas_1x2_pinnacle(odds_do) if odds_do else {}
+            prob_empate_do = _prob_empate_desde_cuotas(cuotas_do)
+            dc_sel_tiene_valor = (prob_empate_do is None or prob_empate_do >= 0.18)
+        except Exception:
+            dc_sel_tiene_valor = True
+
+        if dc_sel_tiene_valor:
+            sugerencias.append({
+                "mercado": "Doble Oportunidad",
+                "jugada": jugada_do,
+                "prob": prob_do,
+                "score": score_final,
+                "riesgo": 1.3,
+                "cuota_minima": cuota_minima(prob_do/100, 1.3),
+                "cuota": cuota_minima(prob_do/100, 1.3),
+                "confianza": etiqueta_confianza(score_final),
+                "motivo": f"Ranking diff: {diff_ranking} | Descanso visitante: {desc_away} dias",
+            })
 
     # TARJETAS ELIMINADO tambien para selecciones: dependen del arbitro y
     # del animo de los jugadores, factores que el modelo no mide.
@@ -13864,6 +14070,12 @@ def analizar_seleccion(fixture_id, home, away, league, country, hora, round_name
             "confianza": etiqueta_confianza(score_final - 0.5),
             "motivo": f"Amistoso — menor presion defensiva | H2H prom: {goles_h2h_prom} goles",
         })
+
+    # V14.3: Aplicar penalización por tipo de competición (Sub-19/20/21)
+    pen_comp_sel = _penalizacion_competicion(league)
+    if pen_comp_sel != 0:
+        for s in sugerencias:
+            s["score"] = round(max(0, s["score"] + pen_comp_sel), 1)
 
     # Filtrar score >= 8.0
     sugerencias = [s for s in sugerencias if s["score"] >= 8.0]
