@@ -251,6 +251,7 @@ def aplicar_recalibracion(rec, liga=None):
     Aplica la recalibracion completa a una recomendacion (dict con claves
     prob/score). Guarda los valores originales y deja los recalibrados como
     los oficiales. Idempotente: si ya fue recalibrada, no la altera.
+    V14.3: incluye penalización por tipo de competición (Sub-XX, amistosos).
     """
     if not rec or rec.get("_recalibrado"):
         return rec
@@ -268,6 +269,9 @@ def aplicar_recalibracion(rec, liga=None):
     if score_orig is not None:
         score_nuevo = recalibrar_score(score_orig)
         score_nuevo = round(score_nuevo * multiplicador_liga(liga), 1)
+        # V14.3: penalización por competición juvenil/amistosa
+        pen_comp = _penalizacion_competicion(liga)
+        score_nuevo = round(score_nuevo + pen_comp, 1)
         score_nuevo = clamp(score_nuevo, 0, 10)
         rec["score_original"] = score_orig
         rec["score"] = score_nuevo
@@ -666,15 +670,27 @@ def mercado_categoria(jugada):
 def calcular_forma(team_id, modo=None, last=10):
     partidos = api_get(f"/fixtures?team={team_id}&last={last}")
 
+    # TIME DECAY V14.3: partidos mas recientes pesan mas.
+    # Pesos por posicion (indice 0 = mas reciente):
+    # pos 0-2: peso 1.0 | pos 3-5: peso 0.7 | pos 6+: peso 0.4
+    def _peso_decay(idx):
+        if idx <= 2:
+            return 1.0
+        elif idx <= 5:
+            return 0.7
+        return 0.4
+
     jugados = 0
-    gf_total = 0
-    gc_total = 0
-    over15 = 0
-    over25 = 0
-    under35 = 0
-    btts = 0
-    rojas_total = 0
+    gf_total = 0.0
+    gc_total = 0.0
+    over15 = 0.0
+    over25 = 0.0
+    under35 = 0.0
+    btts = 0.0
+    rojas_total = 0.0
+    peso_total = 0.0
     forma = []
+    idx_partido = 0  # indice para calcular peso (0 = mas reciente)
 
     for p in partidos:
         gh = p["goals"]["home"]
@@ -700,10 +716,12 @@ def calcular_forma(team_id, modo=None, last=10):
             continue
 
         total = gh + ga
+        peso = _peso_decay(idx_partido)
 
         jugados += 1
-        gf_total += gf
-        gc_total += gc
+        peso_total += peso
+        gf_total += gf * peso
+        gc_total += gc * peso
 
         # Tarjetas rojas del equipo en este partido
         try:
@@ -720,7 +738,7 @@ def calcular_forma(team_id, modo=None, last=10):
                     for item in team_data.get("statistics", []):
                         if item.get("type") == "Red Cards":
                             try:
-                                rojas_total += int(str(item.get("value") or 0))
+                                rojas_total += int(str(item.get("value") or 0)) * peso
                             except Exception:
                                 pass
         except Exception:
@@ -733,32 +751,29 @@ def calcular_forma(team_id, modo=None, last=10):
         else:
             forma.append("L")
 
-        if total >= 2:
-            over15 += 1
-        if total >= 3:
-            over25 += 1
-        if total <= 3:
-            under35 += 1
-        if gh > 0 and ga > 0:
-            btts += 1
+        over15 += peso if total >= 2 else 0
+        over25 += peso if total >= 3 else 0
+        under35 += peso if total <= 3 else 0
+        btts += peso if (gh > 0 and ga > 0) else 0
 
+        idx_partido += 1
         if jugados == 7:
             break
 
-    if jugados == 0:
+    if jugados == 0 or peso_total == 0:
         return None
 
     return {
         "jugados": jugados,
-        "gf_prom": gf_total / jugados,
-        "gc_prom": gc_total / jugados,
-        "total_prom": (gf_total + gc_total) / jugados,
-        "over15": over15 / jugados,
-        "over25": over25 / jugados,
-        "under35": under35 / jugados,
-        "btts": btts / jugados,
+        "gf_prom": round(gf_total / peso_total, 3),
+        "gc_prom": round(gc_total / peso_total, 3),
+        "total_prom": round((gf_total + gc_total) / peso_total, 3),
+        "over15": round(over15 / peso_total, 3),
+        "over25": round(over25 / peso_total, 3),
+        "under35": round(under35 / peso_total, 3),
+        "btts": round(btts / peso_total, 3),
         "forma": "".join(forma),
-        "rojas_prom": round(rojas_total / jugados, 2),
+        "rojas_prom": round(rojas_total / peso_total, 3),
     }
 
 
@@ -780,6 +795,42 @@ PERFIL_GOLES_LIGA = {
     "J-League": -0.02, "K League 1": -0.02,
 }
 
+# V14.3: Factor de penalización de score para competiciones juveniles/amistosas.
+# Los modelos estadísticos son menos fiables en estas competiciones porque:
+# - Rotación masiva de jugadores (amistosos)
+# - Menor muestra histórica (Sub-19/20/21)
+# - Alta varianza en resultados (equipos en formación)
+PENALIZACION_SCORE_COMPETICION = {
+    # Competiciones Sub-19
+    "u19": -0.8, "u-19": -0.8, "under 19": -0.8, "under-19": -0.8,
+    "sub-19": -0.8, "sub19": -0.8,
+    # Competiciones Sub-20
+    "u20": -0.6, "u-20": -0.6, "under 20": -0.6, "under-20": -0.6,
+    "sub-20": -0.6, "sub20": -0.6,
+    # Competiciones Sub-21
+    "u21": -0.4, "u-21": -0.4, "under 21": -0.4, "under-21": -0.4,
+    "sub-21": -0.4, "sub21": -0.4,
+    # Competiciones Sub-23
+    "u23": -0.3, "u-23": -0.3, "under 23": -0.3, "under-23": -0.3,
+    # Amistosos de clubes (menos predecibles por rotación)
+    "friendly games": -0.3, "friendlies clubs": -0.3,
+    "u20 friendly": -0.6, "u19 friendly": -0.8,
+}
+
+
+def _penalizacion_competicion(league_name):
+    """
+    Retorna el ajuste negativo de score según el tipo de competición.
+    Penaliza partidos juveniles y amistosos donde el modelo es menos fiable.
+    """
+    if not league_name:
+        return 0.0
+    ln = league_name.lower()
+    for clave, penalizacion in PENALIZACION_SCORE_COMPETICION.items():
+        if clave in ln:
+            return penalizacion
+    return 0.0
+
 
 def _ajuste_liga_goles(league):
     """Retorna el ajuste de prob de goles para una liga dada."""
@@ -791,45 +842,96 @@ def _ajuste_liga_goles(league):
     return 0.0
 
 
+def _correccion_dixon_coles(k_home, k_away, lam_h, lam_a, rho=-0.13):
+    """
+    Corrección Dixon-Coles para resultados de baja puntuación.
+    Ajusta la probabilidad conjunta de resultados 0-0, 1-0, 0-1 y 1-1
+    que el Poisson independiente subestima sistematicamente.
+    rho=-0.13 es el valor empirico tipico para futbol europeo.
+    """
+    try:
+        if k_home == 0 and k_away == 0:
+            return 1 - lam_h * lam_a * rho
+        elif k_home == 1 and k_away == 0:
+            return 1 + lam_a * rho
+        elif k_home == 0 and k_away == 1:
+            return 1 + lam_h * rho
+        elif k_home == 1 and k_away == 1:
+            return 1 - rho
+        return 1.0
+    except Exception:
+        return 1.0
+
+
+def _prob_poisson(k, lam):
+    """Probabilidad de Poisson P(X=k) con lambda=lam."""
+    try:
+        return (_math_poisson.exp(-lam) * lam**k) / _math_poisson.factorial(k)
+    except Exception:
+        return 0.0
+
+
 def _lam_partido(gf_home, gc_home, gf_away, gc_away, league=""):
-    """Calcula lambda total esperado del partido via Poisson."""
+    """Calcula lambdas home y away del partido via Poisson con ajuste de liga."""
     lam_h = max(0.3, (gf_home + gf_away) / 2 * 0.6 + (gc_home + gc_away) / 2 * 0.4)
     lam_a = max(0.2, (gf_away + gf_home) / 2 * 0.5 + (gc_away + gc_home) / 2 * 0.5)
     ajuste = _ajuste_liga_goles(league)
-    return (lam_h + lam_a) * (1 + ajuste)
+    lam_h = lam_h * (1 + ajuste)
+    lam_a = lam_a * (1 + ajuste)
+    return lam_h, lam_a
 
 
 def prob_under35_poisson(gf_home, gc_home, gf_away, gc_away, league=""):
-    """Prob de Under 3.5 goles usando distribucion de Poisson."""
+    """Prob de Under 3.5 goles usando Poisson con corrección Dixon-Coles."""
     try:
-        lam = _lam_partido(gf_home, gc_home, gf_away, gc_away, league)
-        prob = sum(
-            (lam**k * _math_poisson.exp(-lam)) / _math_poisson.factorial(k)
-            for k in range(4)
-        )
+        lam_h, lam_a = _lam_partido(gf_home, gc_home, gf_away, gc_away, league)
+        prob = 0.0
+        for gh in range(7):
+            for ga in range(7):
+                if gh + ga > 3:
+                    continue
+                p_h = _prob_poisson(gh, lam_h)
+                p_a = _prob_poisson(ga, lam_a)
+                tau = _correccion_dixon_coles(gh, ga, lam_h, lam_a)
+                prob += p_h * p_a * tau
         return round(min(95.0, max(40.0, prob * 100)), 1)
     except Exception:
         return None
 
 
 def prob_over15_poisson(gf_home, gc_home, gf_away, gc_away, league=""):
-    """Prob de Over 1.5 goles usando distribucion de Poisson."""
+    """Prob de Over 1.5 goles usando Poisson con corrección Dixon-Coles."""
     try:
-        lam = _lam_partido(gf_home, gc_home, gf_away, gc_away, league)
-        prob = 1 - _math_poisson.exp(-lam) - lam * _math_poisson.exp(-lam)
+        lam_h, lam_a = _lam_partido(gf_home, gc_home, gf_away, gc_away, league)
+        # prob under 1.5 = P(0-0) + P(1-0) + P(0-1)
+        prob_under = 0.0
+        for gh in range(3):
+            for ga in range(3):
+                if gh + ga > 1:
+                    continue
+                p_h = _prob_poisson(gh, lam_h)
+                p_a = _prob_poisson(ga, lam_a)
+                tau = _correccion_dixon_coles(gh, ga, lam_h, lam_a)
+                prob_under += p_h * p_a * tau
+        prob = 1 - prob_under
         return round(min(95.0, max(40.0, prob * 100)), 1)
     except Exception:
         return None
 
 
 def prob_under25_poisson(gf_home, gc_home, gf_away, gc_away, league=""):
-    """Prob de Under 2.5 goles usando distribucion de Poisson."""
+    """Prob de Under 2.5 goles usando Poisson con corrección Dixon-Coles."""
     try:
-        lam = _lam_partido(gf_home, gc_home, gf_away, gc_away, league)
-        prob = sum(
-            (lam**k * _math_poisson.exp(-lam)) / _math_poisson.factorial(k)
-            for k in range(3)
-        )
+        lam_h, lam_a = _lam_partido(gf_home, gc_home, gf_away, gc_away, league)
+        prob = 0.0
+        for gh in range(5):
+            for ga in range(5):
+                if gh + ga > 2:
+                    continue
+                p_h = _prob_poisson(gh, lam_h)
+                p_a = _prob_poisson(ga, lam_a)
+                tau = _correccion_dixon_coles(gh, ga, lam_h, lam_a)
+                prob += p_h * p_a * tau
         return round(min(92.0, max(35.0, prob * 100)), 1)
     except Exception:
         return None
@@ -1036,6 +1138,53 @@ def obtener_recomendaciones(home_general, away_general, home_home, away_away):
 
     recomendaciones.sort(key=lambda x: (x["score"], x["prob"]), reverse=True)
     return recomendaciones
+
+
+def _prob_empate_desde_cuotas(cuotas_1x2):
+    """
+    V14.3: Calcula la probabilidad implícita de empate desde las cuotas 1X2
+    de Pinnacle, quitando el margen (vig) para obtener la prob real.
+    Retorna float entre 0 y 1, o None si no hay datos.
+    Usado para filtrar picks de DC cuando la prob de empate es baja.
+    """
+    try:
+        if not cuotas_1x2 or "Draw" not in cuotas_1x2:
+            return None
+        # Quitar margen: suma de probs implícitas > 1
+        p_home = 1 / cuotas_1x2["Home"] if "Home" in cuotas_1x2 else 0
+        p_draw = 1 / cuotas_1x2["Draw"]
+        p_away = 1 / cuotas_1x2["Away"] if "Away" in cuotas_1x2 else 0
+        total = p_home + p_draw + p_away
+        if total <= 0:
+            return None
+        # Prob de empate sin margen
+        return round(p_draw / total, 3)
+    except Exception:
+        return None
+
+
+def calcular_stake_kelly(prob_decimal, cuota, bank, fraccion=0.25):
+    """
+    V14.3: Calcula el stake óptimo usando Kelly fraccionado (25% por defecto).
+    Kelly = (prob * cuota - 1) / (cuota - 1)
+    Si Kelly es negativo, el pick no tiene value → stake = 0.
+    Retorna el stake recomendado en soles y el Kelly% como referencia.
+    fraccion=0.25 es conservador — reduce volatilidad y riesgo de ruina.
+    """
+    try:
+        prob = float(prob_decimal)
+        cuota = float(cuota)
+        bank = float(bank)
+        if cuota <= 1.0 or prob <= 0 or prob >= 1:
+            return 0, 0
+        kelly_pct = (prob * cuota - 1) / (cuota - 1)
+        if kelly_pct <= 0:
+            return 0, round(kelly_pct * 100, 1)
+        kelly_fraccionado = kelly_pct * fraccion
+        stake = round(bank * kelly_fraccionado, 2)
+        return max(0, stake), round(kelly_pct * 100, 1)
+    except Exception:
+        return 0, 0
 
 
 def guardar_snapshot_odds(fixture_id, jugada, cuota):
@@ -1976,6 +2125,65 @@ def preparar_analisis(fixture_id, incluir_odds=False, incluir_contexto=False):
     except Exception as e:
         print(f"WARN xG predictions: {e}")
 
+    # ── MOTIVACIÓN DINÁMICA V14.3 ──────────────────────────────────────
+    # Ajusta el score según la situación real de los equipos en la tabla.
+    # Equipos con alta motivación (descenso, título) juegan con más intensidad.
+    # Equipos sin nada que ganar (mid-table asegurado) juegan con menos urgencia.
+    try:
+        standings_data = api_get(
+            f"/standings?league={fixture['league']['id']}&season={fixture['league']['season']}",
+            use_cache=True, ttl=7200
+        )
+        if standings_data:
+            # Construir mapa posición por team_id
+            pos_map = {}
+            total_equipos = 0
+            for grupo in standings_data:
+                for liga_std in grupo.get("league", {}).get("standings", []):
+                    total_equipos = max(total_equipos, len(liga_std))
+                    for entry in liga_std:
+                        tid = entry.get("team", {}).get("id")
+                        pos = entry.get("rank", 99)
+                        if tid:
+                            pos_map[tid] = pos
+
+            if total_equipos > 0 and pos_map:
+                def _motivacion(team_id, pos, total):
+                    """
+                    Retorna ajuste de score por motivación:
+                    +0.5 lucha título (top 2) o zona descenso (últimos 3)
+                    +0.3 lucha clasificación europea (top 6) o playoff descenso
+                    -0.3 mid-table sin objetivos (posición central asegurada)
+                    """
+                    if total < 6:
+                        return 0.0  # Torneo corto, no aplica
+                    pct = pos / total
+                    if pos <= 2:
+                        return 0.5   # Lucha por el título
+                    elif pos <= 6:
+                        return 0.3   # Lucha por Europa
+                    elif pct >= 0.85:
+                        return 0.5   # Zona de descenso (últimos 15%)
+                    elif pct >= 0.75:
+                        return 0.3   # Playoff descenso
+                    elif 0.35 <= pct <= 0.65:
+                        return -0.3  # Mid-table sin objetivos
+                    return 0.0
+
+                mot_home = _motivacion(home_id, pos_map.get(home_id, 99), total_equipos)
+                mot_away = _motivacion(away_id, pos_map.get(away_id, 99), total_equipos)
+                ajuste_mot = round((mot_home + mot_away) / 2, 1)
+
+                if ajuste_mot != 0:
+                    for r in recomendaciones:
+                        r["score"] = round(clamp(r["score"] + ajuste_mot, 0, 10), 1)
+                        if ajuste_mot > 0:
+                            r["motivo"] = r.get("motivo", "") + f" Motivación alta (+{ajuste_mot})."
+                        else:
+                            r["motivo"] = r.get("motivo", "") + f" Motivación baja ({ajuste_mot})."
+    except Exception as e:
+        print(f"WARN motivacion dinamica: {e}")
+
     # Filtro de cuota minima: descarta picks que no pueden ser rentables.
     recomendaciones = [
         r for r in recomendaciones if cuota_pick_suficiente(r)
@@ -2857,6 +3065,17 @@ def _formatear_pick_mensaje(o, idx=None, mostrar_id=True):
     ]
     if edge_line:
         lineas.append(edge_line)
+    # V14.3: Stake Kelly fraccionado como referencia
+    if cuota_mostrar and cuota_mostrar > 1.0 and prob > 0:
+        try:
+            from datetime import date as _kd
+            bank_data = leer_json(BANK_ACUMULADO_FILE)
+            bank_kelly = bank_data[-1].get("bank", BANK_INICIAL) if bank_data else BANK_INICIAL
+            stake_k, kelly_pct = calcular_stake_kelly(prob / 100, cuota_mostrar, bank_kelly)
+            if kelly_pct > 0:
+                lineas.append(f"📊 Kelly ref: S/{stake_k:.1f} ({kelly_pct:.1f}% Kelly → 25% fracc.)")
+        except Exception:
+            pass
     if mostrar_id and fixture_id:
         lineas.append(f"\U0001f4cc ID: {fixture_id}")
 
@@ -7233,24 +7452,31 @@ def calcular_handicap_recomendado_club(home_general, away_general,
     # Decidir linea y equipo
     if diferencia >= 1.5:
         equipo, linea = "home", -0.75
-        prob_est = 55.0
+        prob_est = 58.0   # V14.3: subido de 55% — -0.75 requiere dominio claro
     elif diferencia >= 0.8:
         equipo, linea = "home", -0.5
         prob_est = 62.0
-    elif diferencia >= 0.3:
+    elif diferencia >= 0.5:
         equipo, linea = "home", -0.25
-        prob_est = 68.0
+        prob_est = 68.0   # V14.3: umbral subido de 0.3 a 0.5 — evitar ruido estadístico
     elif diferencia <= -1.5:
         equipo, linea = "away", -0.75
-        prob_est = 55.0
+        prob_est = 58.0
     elif diferencia <= -0.8:
         equipo, linea = "away", -0.5
         prob_est = 62.0
-    elif diferencia <= -0.3:
+    elif diferencia <= -0.5:
         equipo, linea = "away", -0.25
         prob_est = 68.0
     else:
         return None  # partido muy parejo, no recomendar
+
+    # V14.3: Filtro de forma reciente — no recomendar handicap si el equipo
+    # favorito lleva 3+ partidos sin ganar (forma negativa reciente)
+    base_fav = base_home if equipo == "home" else base_away
+    forma_reciente = (base_fav or {}).get("forma", "")[:3]  # últimos 3 partidos
+    if forma_reciente and forma_reciente.count("L") >= 2:
+        return None  # Mal momento — forma reciente descarta el pick
 
     # Buscar cuota real de Pinnacle — Opcion B: solo con cuota real
     cuota, book = _extraer_cuota_handicap_pinnacle(odds, equipo, linea)
@@ -7278,7 +7504,7 @@ def calcular_handicap_recomendado_seleccion(home, away, odds):
 
     if diff_ranking >= 30:
         equipo, linea = "home", -0.75
-        prob_est = 52.0
+        prob_est = 58.0   # V14.3: subido de 52% — -0.75 selecciones requiere diferencia clara
     elif diff_ranking >= 15:
         equipo, linea = "home", -0.5
         prob_est = 60.0
@@ -7287,7 +7513,7 @@ def calcular_handicap_recomendado_seleccion(home, away, odds):
         prob_est = 66.0
     elif diff_ranking <= -30:
         equipo, linea = "away", -0.75
-        prob_est = 52.0
+        prob_est = 58.0
     elif diff_ranking <= -15:
         equipo, linea = "away", -0.5
         prob_est = 60.0
@@ -7898,6 +8124,14 @@ def generar_mini_tickets_dia():
             fuerza_a = gf_a - gc_h
             diff = fuerza_h - fuerza_a
 
+            # V14.3: Filtro de probabilidad de empate.
+            # Si la prob de empate desde Pinnacle es baja (<18%), 1X/X2
+            # tiene poco valor porque la cobertura del empate no suma.
+            odds_dc_check = api_get(f"/odds?fixture={fixture_id}", use_cache=True, ttl=600)
+            cuotas_1x2_dc = _extraer_cuotas_1x2_pinnacle(odds_dc_check) if odds_dc_check else {}
+            prob_empate_real = _prob_empate_desde_cuotas(cuotas_1x2_dc)
+            dc_tiene_valor = (prob_empate_real is None or prob_empate_real >= 0.18)
+
             # Local favorito -> 1X, Visitante favorito -> X2
             if diff >= 0.3:
                 jugada_dc = "1X"
@@ -7908,7 +8142,7 @@ def generar_mini_tickets_dia():
             else:
                 jugada_dc = None
 
-            if jugada_dc:
+            if jugada_dc and dc_tiene_valor:
                 cuota_dc, _ = buscar_mejor_cuota(fixture_id, jugada_dc)
                 if cuota_dc and MINI_TICKET_CUOTA_MIN <= cuota_dc <= MINI_TICKET_CUOTA_MAX:
                     clave_dc = (fixture_id, jugada_dc)
@@ -8175,17 +8409,14 @@ def _actualizar_resultado_combinada():
     if cambios:
         guardar_json_lista(PICKS_FILE, picks_todos)
 
-    # Indice por (fixture_id + jugada) y por (partido + jugada)
-    # IMPORTANTE: la clave incluye la jugada para evitar que picks distintos
-    # del mismo partido (ej: Under 3.5 y Over 1.5) se confundan entre si.
-    idx_picks_fid_jug = {}   # "fixture_id|jugada" -> pick
-    idx_picks_pj = {}        # "partido|jugada" -> pick
+    # Indice por fixture_id y por partido+jugada
+    idx_picks_fid = {}
+    idx_picks_pj = {}  # partido+jugada -> pick
     for p in picks_todos:
         fid = str(p.get("fixture_id",""))
-        jug = p.get("jugada","")
         if fid:
-            idx_picks_fid_jug[f"{fid}|{jug}"] = p
-        clave_pj = f"{p.get('partido','')}|{jug}"
+            idx_picks_fid[fid] = p
+        clave_pj = f"{p.get('partido','')}|{p.get('jugada','')}"
         idx_picks_pj[clave_pj] = p
 
     for c in combinadas:
@@ -8199,11 +8430,10 @@ def _actualizar_resultado_combinada():
             fid = str(pick_c.get("fixture_id", ""))
             jugada_comb = pick_c.get("jugada", "")
             partido_nombre = pick_c.get("partido", "")
-            clave_fid_jug = f"{fid}|{jugada_comb}"
             clave_pj = f"{partido_nombre}|{jugada_comb}"
 
-            # Buscar en picks_guardados.json por fixture_id+jugada (exacto) o partido+jugada
-            p_actual = idx_picks_fid_jug.get(clave_fid_jug) or idx_picks_pj.get(clave_pj)
+            # Buscar en picks_guardados.json
+            p_actual = idx_picks_fid.get(fid) or idx_picks_pj.get(clave_pj)
 
             if p_actual:
                 estado_p = p_actual.get("estado", "pendiente").lower()
@@ -8225,22 +8455,12 @@ def _actualizar_resultado_combinada():
                                 ga = fx[0]["goals"]["away"] or 0
                                 total = gh + ga
 
-                                # Evaluar jugada — usar float para evitar errores de redondeo
-                                import re as _re_comb
-                                def _linea_comb(txt):
-                                    m = _re_comb.search(r"(\d+\.?\d*)", txt)
-                                    return float(m.group(1)) if m else None
-
+                                # Evaluar jugada
                                 acierto = None
-                                jugada_comb_l = jugada_comb.lower()
-                                if "under" in jugada_comb_l and "gol" in jugada_comb_l:
-                                    linea_c = _linea_comb(jugada_comb)
-                                    acierto = total < linea_c if linea_c is not None else None
-                                elif "over" in jugada_comb_l and "gol" in jugada_comb_l:
-                                    linea_c = _linea_comb(jugada_comb)
-                                    acierto = total > linea_c if linea_c is not None else None
-                                elif "ambos marcan" in jugada_comb_l or "btts" in jugada_comb_l:
-                                    acierto = gh > 0 and ga > 0
+                                if "Under 3.5" in jugada_comb: acierto = total <= 3
+                                elif "Over 2.5" in jugada_comb: acierto = total >= 3
+                                elif "Over 1.5" in jugada_comb: acierto = total >= 2
+                                elif "Ambos marcan" in jugada_comb: acierto = gh>0 and ga>0
                                 elif "Corners Over" in jugada_comb:
                                     stats = api_get(f"/fixtures/statistics?fixture={fid}", use_cache=False)
                                     if stats:
@@ -8267,8 +8487,8 @@ def _actualizar_resultado_combinada():
                                         linea = float(''.join(c2 for c2 in jugada_comb.split("Over")[-1] if c2.isdigit() or c2=="."))
                                         acierto = tt > linea
                                         pick_c["resultado_real"] = f"{tt} tarjetas"
-                                elif "1x" in jugada_comb_l: acierto = gh >= ga
-                                elif "x2" in jugada_comb_l: acierto = ga >= gh
+                                elif "1X" in jugada_comb: acierto = gh >= ga
+                                elif "X2" in jugada_comb: acierto = ga >= gh
                                 elif "sin tarjeta roja" in jugada_comb.lower():
                                     stats_sr = api_get(f"/fixtures/statistics?fixture={fid}", use_cache=False)
                                     rojas_totales = 0
@@ -13584,25 +13804,51 @@ def analizar_seleccion(fixture_id, home, away, league, country, hora, round_name
     # TARJETAS ELIMINADO tambien para selecciones: dependen del arbitro y
     # del animo de los jugadores, factores que el modelo no mide.
 
-    # Corners (equipos ofensivos generan mas corners)
+    # Corners (V14.3: usar promedio real de corners por partido via analizar_estilo_corners)
+    # Solo recomendar si la suma de corners promedio home+away supera la línea en ≥1.5
+    # No recomendar en amistosos ni ligas sudamericanas (promedio corners bajo)
     if any("Corner" in m for m in mercados_pref):
-        corner_jugada = next((m for m in mercados_pref if "Corner" in m), "Corners Over 9.5")
-        prob_corner = 60
-        if estilo_home == "ofensivo" or estilo_away == "ofensivo":
-            prob_corner += 8
-        if diff_ranking >= 15:
-            prob_corner += 5  # equipo dominante genera mas corners
-        sugerencias.append({
-            "mercado": "Corners",
-            "jugada": corner_jugada,
-            "prob": prob_corner,
-            "score": round(score_final - 0.3, 1),
-            "riesgo": 2.0,
-            "cuota_minima": cuota_minima(prob_corner/100, 2.0),
-            "cuota": cuota_minima(prob_corner/100, 2.0),
-            "confianza": etiqueta_confianza(score_final - 0.3),
-            "motivo": f"Estilo: {estilo_home} vs {estilo_away}",
-        })
+        ligas_sin_corners = ["friendly", "amistoso", "sudamericana", "libertadores",
+                             "primera division", "liga colombiana", "liga mx",
+                             "serie a brasil", "urugua", "argentin", "chile",
+                             "u19", "u20", "u21", "u-19", "u-20", "u-21"]
+        liga_baja_corners = any(k in (league or "").lower() for k in ligas_sin_corners)
+
+        if not liga_baja_corners:
+            corner_jugada = next((m for m in mercados_pref if "Corner" in m), "Corners Over 9.5")
+            # Extraer línea de la jugada (ej: "Corners Over 9.5" → 9.5)
+            import re as _re_corn
+            m_linea = _re_corn.search(r"(\d+\.?\d*)", corner_jugada)
+            linea_corner = float(m_linea.group(1)) if m_linea else 9.5
+
+            # Obtener promedio real de corners de cada equipo
+            try:
+                estilo_h = analizar_estilo_corners(home_id, last=8) if home_id else None
+                estilo_a = analizar_estilo_corners(away_id, last=8) if away_id else None
+                corners_h = estilo_h.get("corners_prom", 0) if estilo_h else 0
+                corners_a = estilo_a.get("corners_prom", 0) if estilo_a else 0
+                corners_esperados = corners_h + corners_a
+            except Exception:
+                corners_esperados = 0
+
+            # Solo recomendar si corners esperados superan la línea en ≥1.5
+            if corners_esperados >= (linea_corner + 1.5):
+                prob_corner = min(78, 55 + (corners_esperados - linea_corner) * 8)
+                if estilo_h and estilo_h.get("estilo") == "costados":
+                    prob_corner = min(80, prob_corner + 5)
+                if estilo_a and estilo_a.get("estilo") == "costados":
+                    prob_corner = min(80, prob_corner + 5)
+                sugerencias.append({
+                    "mercado": "Corners",
+                    "jugada": corner_jugada,
+                    "prob": round(prob_corner, 1),
+                    "score": round(score_final - 0.2, 1),
+                    "riesgo": 1.8,
+                    "cuota_minima": cuota_minima(prob_corner/100, 1.8),
+                    "cuota": cuota_minima(prob_corner/100, 1.8),
+                    "confianza": etiqueta_confianza(score_final - 0.2),
+                    "motivo": f"Corners esperados: {corners_esperados:.1f} (línea {linea_corner}) | {estilo_h.get('estilo','?') if estilo_h else '?'} vs {estilo_a.get('estilo','?') if estilo_a else '?'}",
+                })
 
     # Amistosos: Over 2.5 (menos presion = mas goles)
     if fase == "friendly":
