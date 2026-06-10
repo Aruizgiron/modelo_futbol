@@ -9,6 +9,7 @@ from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, 
 from reportlab.lib.styles import getSampleStyleSheet
 import requests
 import os
+from typing import Optional, List, Dict, Tuple, Any
 import json
 import time
 import asyncio
@@ -142,6 +143,39 @@ EFICIENCIA_LIGA = {
     "FIFA World Cup":          "media",
     "World Cup":               "media",
 }
+
+
+def _escape_md(texto: str) -> str:
+    """Escapa caracteres especiales de Markdown v1 para evitar BadRequest de Telegram."""
+    if not texto:
+        return ""
+    # Caracteres que rompen Markdown v1 en Telegram si no se escapan
+    for ch in ['_', '*', '[', ']', '(', ')', '~', '`', '>', '#', '+',
+               '-', '=', '|', '{', '}', '.', '!']:
+        texto = texto.replace(ch, '\\' + ch)
+    return texto
+
+def _safe_send_md(texto: str) -> str:
+    """Limpia texto para envío seguro en Telegram Markdown.
+    Corrige marcadores de formato impares que causan BadRequest.
+    """
+    if not texto:
+        return ""
+    lineas = texto.split("\n")
+    lineas_limpias = []
+    for linea in lineas:
+        # Si hay número impar de * o _ en la línea, eliminarlos todos
+        # para evitar que Telegram falle el parse
+        if linea.count("*") % 2 != 0:
+            linea = linea.replace("*", "")
+        if linea.count("_") % 2 != 0:
+            linea = linea.replace("_", "")
+        # Eliminar backticks sueltos
+        if linea.count("`") % 2 != 0:
+            linea = linea.replace("`", "'")
+        lineas_limpias.append(linea)
+    return "\n".join(lineas_limpias)
+
 
 def get_umbral_confluencia(liga: str) -> int:
     """
@@ -1160,7 +1194,8 @@ def analizar_movimiento_cuota(
 # SECCIÓN 20F — V17: TODAS LAS VARIABLES INVESTIGADAS O/U 2.5
 # ═════════════════════════════════════════════════════════════════════════════
 
-import math as _math_v17
+# _math_v17 alias para Poisson
+_math_v17 = __import__("math")
 
 def calcular_gap_rating(shots_on_target: float, corners: float, partidos: int = 1) -> float:
     """GAP Rating (Wheatcroft 2020) — 0.8% ROI en 68,672 apuestas 12 años."""
@@ -1560,7 +1595,7 @@ def actualizar_historial_arbitro(arbitro: str, yellow_home: int, yellow_away: in
         d["yellows_away"] += yellow_away
         if liga and liga not in d["ligas"]:
             d["ligas"].append(liga)
-        guardar_json(REFEREE_FILE, datos)
+        guardar_json_lista(REFEREE_FILE, datos)
     except Exception as e:
         print(f"WARN arbitro historial: {e}")
 
@@ -3345,7 +3380,7 @@ ALERTAS_SUBS_FILE = _tmp_path("alertas_suscriptores.json")
 CHAT_IDS_ALARMAS_FILE = _tmp_path("chat_ids_alarmas.json")
 
 CACHE = {}
-CACHE_TTL = 300
+CACHE_TTL = 600   # 10 min — reducir peticiones al API (plan free tiene límite)
 CACHE_MAX_SIZE = 500   # maximo de entradas; purga las mas viejas al superarlo
 ALERTED_LIVE = set()
 
@@ -3604,20 +3639,50 @@ def cuota_pick_suficiente(rec):
     return cuota >= CUOTA_MINIMA_PICK
 
 
+# Control de peticiones API - Plan Ultra: 75,000/día, sin límite de rpm declarado
+# pero la API bloquea ráfagas. Usamos semáforo para limitar concurrencia.
+_API_SEMAPHORE = None  # Se inicializa como asyncio.Semaphore en el loop
+_API_MAX_CONCURRENT = 5   # Máximo 5 peticiones simultáneas
+_API_DELAY_ENTRE_LOTES = 0.5  # segundos entre lotes de peticiones
+
 def api_get(endpoint, use_cache=True, ttl=CACHE_TTL):
+    global _API_REQUEST_COUNT, _API_LAST_RESET
     now = time.time()
 
+    # Servir desde caché si está disponible y válido
     if use_cache and endpoint in CACHE:
         saved_time, saved_data = CACHE[endpoint]
         if now - saved_time < ttl:
             return saved_data
 
+    # Rate limiting: respetar límite del plan
+    elapsed = now - _API_LAST_RESET
+    if elapsed >= 60:
+        _API_REQUEST_COUNT = 0
+        _API_LAST_RESET = time.time()
+    if _API_REQUEST_COUNT >= _API_LIMIT_POR_MINUTO:
+        espera = 60 - elapsed + 1
+        print(f"[RATE LIMIT] Límite alcanzado — esperando {espera:.0f}s")
+        time.sleep(max(1, espera))
+        _API_REQUEST_COUNT = 0
+        _API_LAST_RESET = time.time()
+
     try:
         r = requests.get(
             f"{BASE_URL}{endpoint}",
             headers=HEADERS,
-            timeout=12
+            timeout=15
         )
+        _API_REQUEST_COUNT += 1
+
+        # Manejar 429 con backoff exponencial
+        if r.status_code == 429:
+            retry_after = int(r.headers.get("Retry-After", _API_429_BACKOFF))
+            print(f"[429 TOO MANY REQUESTS] Esperando {retry_after}s — {endpoint}")
+            time.sleep(retry_after)
+            # Reintentar una vez
+            r = requests.get(f"{BASE_URL}{endpoint}", headers=HEADERS, timeout=15)
+            _API_REQUEST_COUNT += 1
 
         if r.status_code != 200:
             print(f"ERROR API {r.status_code}: {endpoint}")
@@ -3626,24 +3691,30 @@ def api_get(endpoint, use_cache=True, ttl=CACHE_TTL):
         data = r.json().get("response", [])
 
         if use_cache:
-            # Purgar entradas viejas si el cache supera el limite
             if len(CACHE) >= CACHE_MAX_SIZE:
                 now2 = time.time()
                 viejos = [k for k, (t, _) in CACHE.items() if now2 - t > CACHE_TTL]
                 for k in viejos:
                     CACHE.pop(k, None)
-                # Si sigue lleno, eliminar la mitad mas antigua
                 if len(CACHE) >= CACHE_MAX_SIZE:
                     ordenados = sorted(CACHE.items(), key=lambda x: x[1][0])
                     for k, _ in ordenados[:CACHE_MAX_SIZE // 2]:
                         CACHE.pop(k, None)
-            CACHE[endpoint] = (now, data)
+            CACHE[endpoint] = (time.time(), data)
 
         return data
 
     except Exception as e:
         print("ERROR REQUEST:", e)
         return []
+
+
+async def _get_api_semaphore():
+    """Obtiene o crea el semáforo global para limitar concurrencia de API."""
+    global _API_SEMAPHORE
+    if _API_SEMAPHORE is None:
+        _API_SEMAPHORE = asyncio.Semaphore(_API_MAX_CONCURRENT)
+    return _API_SEMAPHORE
 
 
 async def api_get_async(session, endpoint, use_cache=True, ttl=CACHE_TTL):
@@ -3656,18 +3727,36 @@ async def api_get_async(session, endpoint, use_cache=True, ttl=CACHE_TTL):
         if now - saved_time < ttl:
             return saved_data
 
+    sem = await _get_api_semaphore()
     try:
-        async with session.get(
-            f"{BASE_URL}{endpoint}",
-            headers=HEADERS,
-            timeout=_aiohttp.ClientTimeout(total=12)
-        ) as r:
-            if r.status != 200:
-                return []
-            data = (await r.json()).get("response", [])
-            if use_cache:
-                CACHE[endpoint] = (now, data)
-            return data
+        async with sem:
+            async with session.get(
+                f"{BASE_URL}{endpoint}",
+                headers=HEADERS,
+                timeout=_aiohttp.ClientTimeout(total=15)
+            ) as r:
+                if r.status == 429:
+                    retry_after = int(r.headers.get("Retry-After", 30))
+                    print(f"[429 ASYNC] Rate limit — esperando {retry_after}s — {endpoint}")
+                    await asyncio.sleep(retry_after)
+                    # Reintentar una vez
+                    async with session.get(
+                        f"{BASE_URL}{endpoint}",
+                        headers=HEADERS,
+                        timeout=_aiohttp.ClientTimeout(total=15)
+                    ) as r2:
+                        if r2.status != 200:
+                            return []
+                        data = (await r2.json()).get("response", [])
+                        if use_cache:
+                            CACHE[endpoint] = (time.time(), data)
+                        return data
+                if r.status != 200:
+                    return []
+                data = (await r.json()).get("response", [])
+                if use_cache:
+                    CACHE[endpoint] = (time.time(), data)
+                return data
     except Exception:
         return []
 
@@ -6462,8 +6551,21 @@ def actualizar_resultados_automaticos():
 
 async def _enviar_mensaje_paginado(update, texto, parse_mode="Markdown", chunk=3900):
     """Divide mensajes largos en partes para no superar el limite de Telegram."""
+    texto = (texto or "").strip()
+    if not texto:
+        return
+    # Limpiar Markdown mal formado antes de enviar
+    if parse_mode == "Markdown":
+        texto = _safe_send_md(texto)
     if len(texto) <= chunk:
-        await update.message.reply_text(texto, parse_mode=parse_mode)
+        try:
+            await update.message.reply_text(texto, parse_mode=parse_mode)
+        except Exception:
+            # Fallback sin formato si hay error de parse entities
+            await update.message.reply_text(
+                texto.replace("*","").replace("_","").replace("`",""),
+                parse_mode=None
+            )
         return
     partes = []
     while texto:
@@ -6474,7 +6576,12 @@ async def _enviar_mensaje_paginado(update, texto, parse_mode="Markdown", chunk=3
         try:
             await update.message.reply_text(parte + sufijo, parse_mode=parse_mode)
         except Exception:
-            await update.message.reply_text(parte + sufijo)
+            # Fallback sin formato
+            texto_limpio = (parte + sufijo).replace("*","").replace("_","").replace("`","")
+            try:
+                await update.message.reply_text(texto_limpio, parse_mode=None)
+            except Exception:
+                pass
 
 
 def resumen_historial():
@@ -14807,7 +14914,7 @@ async def live_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 for fid, stats in zip(lote, res_l):
                     if not isinstance(stats, Exception) and stats:
                         CACHE[f"/fixtures/statistics?fixture={fid}"] = (time.time(), stats)
-                await asyncio.sleep(0.3)
+                await asyncio.sleep(1.0)  # 1s entre lotes para evitar ráfagas
     except Exception:
         pass
 
