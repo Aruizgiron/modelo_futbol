@@ -3642,9 +3642,12 @@ def cuota_pick_suficiente(rec):
 # Control de peticiones API - Plan Ultra: 75,000/día
 # La API bloquea ráfagas de muchas peticiones simultáneas aunque tengas cuota.
 # Usamos semáforo asyncio + delay en loops síncronos para evitar 429.
-_API_SEMAPHORE = None  # Se inicializa como asyncio.Semaphore cuando se necesite
-_API_MAX_CONCURRENT = 3   # Max 3 peticiones async simultáneas (conservador)
-_API_DELAY_ENTRE_LOTES = 0.5  # segundos entre lotes async
+_API_SEMAPHORE = None       # Se inicializa como asyncio.Semaphore cuando se necesite
+_API_MAX_CONCURRENT = 3     # Max 3 peticiones async simultáneas
+_API_DELAY_ENTRE_LOTES = 0.5
+_API_REQUEST_COUNT = 0      # Contador de peticiones síncronas
+_API_LAST_RESET = 0.0       # Timestamp del último reset del contador
+_API_LIMIT_POR_MINUTO = 100 # Plan Ultra: sin límite declarado, usar 100 como tope de ráfaga
 
 def api_get(endpoint, use_cache=True, ttl=CACHE_TTL):
     global _API_REQUEST_COUNT, _API_LAST_RESET
