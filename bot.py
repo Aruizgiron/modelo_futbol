@@ -3639,11 +3639,12 @@ def cuota_pick_suficiente(rec):
     return cuota >= CUOTA_MINIMA_PICK
 
 
-# Control de peticiones API - Plan Ultra: 75,000/día, sin límite de rpm declarado
-# pero la API bloquea ráfagas. Usamos semáforo para limitar concurrencia.
-_API_SEMAPHORE = None  # Se inicializa como asyncio.Semaphore en el loop
-_API_MAX_CONCURRENT = 5   # Máximo 5 peticiones simultáneas
-_API_DELAY_ENTRE_LOTES = 0.5  # segundos entre lotes de peticiones
+# Control de peticiones API - Plan Ultra: 75,000/día
+# La API bloquea ráfagas de muchas peticiones simultáneas aunque tengas cuota.
+# Usamos semáforo asyncio + delay en loops síncronos para evitar 429.
+_API_SEMAPHORE = None  # Se inicializa como asyncio.Semaphore cuando se necesite
+_API_MAX_CONCURRENT = 3   # Max 3 peticiones async simultáneas (conservador)
+_API_DELAY_ENTRE_LOTES = 0.5  # segundos entre lotes async
 
 def api_get(endpoint, use_cache=True, ttl=CACHE_TTL):
     global _API_REQUEST_COUNT, _API_LAST_RESET
@@ -6756,6 +6757,7 @@ def get_fixtures_by_leagues(leagues, title):
             use_cache=True,
             ttl=600
         )
+        time.sleep(0.25)  # Anti-ráfaga 429
 
         if fixtures:
             texto += f"\n🏆 {league_name}\n"
@@ -6790,6 +6792,7 @@ def obtener_partidos_configurados():
             use_cache=True,
             ttl=600
         )
+        time.sleep(0.25)  # Anti-ráfaga: pausa entre peticiones de ligas
 
         for m in fixtures:
             status = m["fixture"]["status"]["short"]
@@ -6834,6 +6837,7 @@ def generar_top(score_minimo=7.5):
             use_cache=True,
             ttl=600
         )
+        time.sleep(0.25)  # Anti-ráfaga
 
         for m in fixtures:
 
@@ -9049,6 +9053,7 @@ def obtener_fixtures_por_fecha(ligas, fecha):
             use_cache=True,
             ttl=600
         )
+        time.sleep(0.25)  # Anti-ráfaga 429
 
         for m in fixtures:
             status = m["fixture"]["status"]["short"]
@@ -9585,6 +9590,7 @@ async def fixtures_ligas(update: Update, context: ContextTypes.DEFAULT_TYPE, lea
     total = 0
 
     for league_name, data_liga in leagues.items():
+        time.sleep(0.25)  # Anti-ráfaga
         fixtures = api_get(
             f"/fixtures?league={data_liga['id']}&season={data_liga['season']}&date={today}&timezone=America/Lima",
             use_cache=True,
@@ -9643,6 +9649,7 @@ async def scanear_ligas(update: Update, context: ContextTypes.DEFAULT_TYPE, leag
             use_cache=True,
             ttl=600
         )
+        time.sleep(0.25)  # Anti-ráfaga 429
 
         for m in fixtures:
             status = m["fixture"]["status"]["short"]
