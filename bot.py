@@ -6301,24 +6301,41 @@ def guardar_pick_live_automatico(fixture_id, home, away, country, league, hora, 
 
 
 def evaluar_resultado_jugada(jugada, gh, ga):
+    """
+    V17 FIX: Evaluación robusta de resultado por jugada.
+    Usa comparación de texto flexible para cubrir variantes de nombre.
+    """
+    import re as _re_ev
     total = gh + ga
+    j = jugada.lower().strip()
 
-    if jugada == "Under 3.5 goles":
-        return total <= 3
+    # Extraer número de línea
+    def _get_linea(txt):
+        m = _re_ev.search(r"(\d+\.?\d*)", txt)
+        return float(m.group(1)) if m else None
 
-    if jugada == "Over 1.5 goles":
-        return total >= 2
+    # Over/Under goles
+    if "over" in j and ("gol" in j or _re_ev.search(r"\d+\.\d", j)):
+        linea = _get_linea(j)
+        if linea is not None:
+            return total > linea
+    if "under" in j and ("gol" in j or _re_ev.search(r"\d+\.\d", j)):
+        linea = _get_linea(j)
+        if linea is not None:
+            return total < linea
 
-    if jugada == "Over 2.5 goles":
-        return total >= 3
-
-    if jugada == "Ambos marcan - Sí":
+    if "ambos marcan" in j:
+        if "no" in j or "btts-no" in j:
+            return not (gh > 0 and ga > 0)
         return gh > 0 and ga > 0
 
-    if jugada in ["Over 0.5 gol live", "Over 0.5 gol restante"]:
+    if "over 0.5" in j or "over0.5" in j:
+        return total >= 1
+
+    if "corner" in j:
         return None
 
-    if "Corners" in jugada:
+    if "tarjeta" in j or "card" in j:
         return None
 
     return None
@@ -12715,9 +12732,16 @@ def _actualizar_resultado_combinada():
     idx_picks_pj = {}  # partido+jugada -> pick
     for p in picks_todos:
         fid = str(p.get("fixture_id",""))
+        jugada_p = p.get("jugada","")
         if fid:
-            idx_picks_fid[fid] = p
-        clave_pj = f"{p.get('partido','')}|{p.get('jugada','')}"
+            # V17 FIX: guardar por fixture_id+jugada para evitar colisiones
+            # cuando hay múltiples picks del mismo partido (Over 1.5 y Over 2.5)
+            clave_fid_jug = f"{fid}|{jugada_p}"
+            idx_picks_fid[clave_fid_jug] = p
+            # También guardar por fid solo como fallback
+            if fid not in idx_picks_fid:
+                idx_picks_fid[fid] = p
+        clave_pj = f"{p.get('partido','')}|{jugada_p}"
         idx_picks_pj[clave_pj] = p
 
     for c in combinadas:
@@ -12733,8 +12757,12 @@ def _actualizar_resultado_combinada():
             partido_nombre = pick_c.get("partido", "")
             clave_pj = f"{partido_nombre}|{jugada_comb}"
 
-            # Buscar en picks_guardados.json
-            p_actual = idx_picks_fid.get(fid) or idx_picks_pj.get(clave_pj)
+            # V17 FIX: Buscar primero por fixture_id+jugada (más preciso)
+            # Evita confundir Over 1.5 con Over 2.5 del mismo partido
+            clave_fid_jug = f"{fid}|{jugada_comb}"
+            p_actual = (idx_picks_fid.get(clave_fid_jug)
+                        or idx_picks_pj.get(clave_pj)
+                        or idx_picks_fid.get(fid))
 
             if p_actual:
                 estado_p = p_actual.get("estado", "pendiente").lower()
