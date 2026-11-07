@@ -67,22 +67,31 @@ CACHE = {}
 CACHE_TTL = 300
 ALERTED_LIVE = set()
 
+# ═════════════════════════════════════════════════════════════════
+#  CONFIGURACION DE LIGAS
+#  - Todo se valida por league_id (entero) que viene DENTRO de cada fixture.
+#  - El nombre y el pais que se muestran salen del propio fixture, nunca de
+#    la clave del diccionario: un partido ya no puede quedar con la etiqueta
+#    de otra liga.
+#  - Las claves deben ser UNICAS entre todos los diccionarios (se mezclan
+#    con dict.update y una clave repetida pisa a la otra).
+#  - Temporadas: en noviembre 2026 Europa juega la 2026-27 (season=2026).
+#    La busqueda diaria ya no depende de "season"; solo se usa para tablas.
+# ═════════════════════════════════════════════════════════════════
 EUROPA_LEAGUES = {
-    "Premier League": {"id": 39, "season": 2025, "country": "England"},
-    "Bundesliga": {"id": 78, "season": 2025, "country": "Germany"},
-    "Bundesliga 2": {"id": 79, "season": 2025, "country": "Germany"},
-    "Serie A Italia": {"id": 135, "season": 2025, "country": "Italy"},
-    "Serie B Italia": {"id": 136, "season": 2025, "country": "Italy"},
-    "LaLiga": {"id": 140, "season": 2025, "country": "Spain"},
-    "Segunda España": {"id": 141, "season": 2025, "country": "Spain"},
-    "Ligue 1": {"id": 61, "season": 2025, "country": "France"},
-    "Ligue 2": {"id": 62, "season": 2025, "country": "France"},
-    "Eredivisie": {"id": 88, "season": 2025, "country": "Netherlands"},
+    "Premier League": {"id": 39, "season": 2026, "country": "England"},
+    "Bundesliga": {"id": 78, "season": 2026, "country": "Germany"},
+    "Serie A Italia": {"id": 135, "season": 2026, "country": "Italy"},
+    "LaLiga": {"id": 140, "season": 2026, "country": "Spain"},
+    "Ligue 1": {"id": 61, "season": 2026, "country": "France"},
+    "Eredivisie": {"id": 88, "season": 2026, "country": "Netherlands"},
     "Eliteserien": {"id": 103, "season": 2026, "country": "Norway"},
-    "Bélgica Pro League": {"id": 144, "season": 2025, "country": "Belgium"},
-    "Super Lig": {"id": 203, "season": 2025, "country": "Turkey"},
-    "Primeira Liga": {"id": 94, "season": 2025, "country": "Portugal"},
+    "Bélgica Pro League": {"id": 144, "season": 2026, "country": "Belgium"},
+    "Super Lig": {"id": 203, "season": 2026, "country": "Turkey"},
+    "Primeira Liga": {"id": 94, "season": 2026, "country": "Portugal"},
     "Allsvenskan": {"id": 113, "season": 2026, "country": "Sweden"},
+    # Bundesliga 2, Serie B, Segunda España, Ligue 2 y Championship se
+    # quitaron de aqui: estan en LIGAS_EXCLUIDAS y no se analizan.
 }
 
 SUDAMERICA_LEAGUES = {
@@ -93,7 +102,8 @@ SUDAMERICA_LEAGUES = {
     "Chile Primera División": {"id": 265, "season": 2026, "country": "Chile"},
     "Colombia Primera A": {"id": 239, "season": 2026, "country": "Colombia"},
     "Uruguay Primera División": {"id": 268, "season": 2026, "country": "Uruguay"},
-    "Paraguay Primera División": {"id": 250, "season": 2026, "country": "Paraguay"},
+    "Paraguay Apertura": {"id": 250, "season": 2026, "country": "Paraguay"},
+    "Paraguay Clausura": {"id": 252, "season": 2026, "country": "Paraguay"},
     "Ecuador Liga Pro": {"id": 242, "season": 2026, "country": "Ecuador"},
     "Bolivia División Profesional": {"id": 344, "season": 2026, "country": "Bolivia"},
     "Venezuela Primera División": {"id": 299, "season": 2026, "country": "Venezuela"},
@@ -107,14 +117,37 @@ LIGAS_NOCTURNAS = {
     "J-League": {"id": 98, "season": 2026, "country": "Japan"},
 }
 
-# Ligas excluidas de combinadas por alta variabilidad
-LIGAS_EXCLUIDAS_COMBINADAS = {
-    "Championship",           # Alta variabilidad — datos confirman multiples fallos
-    "Serie B Italia",         # Segunda division — menos predecible
-    "Ligue 2",                # Segunda division
-    "Segunda España",         # Segunda division
-    "Bundesliga 2",           # Segunda division
+# Primeras divisiones sudamericanas que cambian de ID entre Apertura,
+# Clausura o fases finales. Si la API trae un partido de estos paises cuya
+# liga empieza con alguno de estos nombres, se acepta aunque su ID no este
+# arriba. La etiqueta sale del propio fixture, asi que no hay riesgo de mezcla.
+SUDAMERICA_AUTODETECTAR = {
+    "Argentina": ["liga profesional", "copa de la liga"],
+    "Brazil": ["serie a"],
+    "Peru": ["primera division", "liga 1"],
+    "Chile": ["primera division"],
+    "Colombia": ["primera a"],
+    "Uruguay": ["primera division"],
+    "Paraguay": ["division profesional", "primera division"],
+    "Ecuador": ["liga pro"],
+    "Bolivia": ["primera division", "division profesional"],
+    "Venezuela": ["primera division", "liga futve"],
 }
+# Palabras que descartan una liga autodetectada (femenino, reservas, juveniles)
+_PALABRAS_NO_PRIMERA = ("women", "femen", "reserve", "reserva", "u17", "u19",
+                        "u20", "u21", "u23", "youth", "juvenil", "sub-")
+
+# Ligas excluidas de TODO el analisis (prematch, live, combinadas,
+# minitickets). Se valida por ID y, de respaldo, por (pais, nombre).
+LIGAS_EXCLUIDAS = {
+    40:  ("England", "Championship"),   # Alta variabilidad — multiples fallos
+    136: ("Italy", "Serie B"),          # Segunda division
+    62:  ("France", "Ligue 2"),         # Segunda division
+    141: ("Spain", "Segunda División"), # Segunda division
+    79:  ("Germany", "2. Bundesliga"),  # Segunda division
+}
+# Compatibilidad con codigo anterior (nombres)
+LIGAS_EXCLUIDAS_COMBINADAS = {nombre for _, nombre in LIGAS_EXCLUIDAS.values()}
 
 # Ligas africanas — excluidas de combinadas por baja cobertura Pinnacle
 PAISES_EXCLUIDOS_COMBINADAS = {
@@ -154,7 +187,13 @@ def api_get(endpoint, use_cache=True, ttl=CACHE_TTL):
             print(f"ERROR API {r.status_code}: {endpoint}")
             return []
 
-        data = r.json().get("response", [])
+        payload = r.json()
+        errores_api = payload.get("errors")
+        if errores_api:
+            # API-Football responde 200 aunque haya error (plan, limite, season...)
+            print(f"ERROR API-FOOTBALL {endpoint}: {errores_api}")
+            return []
+        data = payload.get("response", []) or []
 
         if use_cache:
             CACHE[endpoint] = (now, data)
@@ -184,7 +223,11 @@ async def api_get_async(session, endpoint, use_cache=True, ttl=CACHE_TTL):
         ) as r:
             if r.status != 200:
                 return []
-            data = (await r.json()).get("response", [])
+            payload = await r.json()
+            if payload.get("errors"):
+                print(f"ERROR API-FOOTBALL {endpoint}: {payload.get('errors')}")
+                return []
+            data = payload.get("response", []) or []
             if use_cache:
                 CACHE[endpoint] = (now, data)
             return data
@@ -336,6 +379,238 @@ def hora_peru(fecha_api):
             return f"{h:02d}:{m:02d}"
         except Exception:
             return fecha_api[11:16]
+
+
+
+# ═════════════════════════════════════════════════════════════════
+#  OBTENCION CENTRALIZADA DE PARTIDOS
+#  Una sola funcion trae los partidos del dia para TODOS los comandos.
+#  Antes habia 7 copias distintas (unas con timezone, otras sin, unas
+#  filtraban por ID, otras no). Eso causaba:
+#    - ligas mezcladas (la etiqueta salia de la clave del diccionario),
+#    - Sudamerica ausente (sin timezone, la API usa la fecha UTC y los
+#      partidos de 19:00 en adelante hora Peru caen al "dia siguiente"),
+#    - Europa con season=2025 cuando ya se juega la 2026-27.
+# ═════════════════════════════════════════════════════════════════
+import unicodedata as _ud
+
+
+def _norm(txt):
+    """minusculas y sin tildes, para comparar nombres de ligas/paises."""
+    txt = str(txt or "")
+    txt = _ud.normalize("NFKD", txt)
+    txt = "".join(c for c in txt if not _ud.combining(c))
+    return txt.lower().strip()
+
+
+def format_league_name(country, league_name):
+    """'Paraguay' + 'Division Profesional - Clausura' -> sin duplicar el pais."""
+    country = (country or "").strip()
+    league_name = (league_name or "").strip()
+    if not country or country == "World" or _norm(league_name).startswith(_norm(country)):
+        return league_name
+    return f"{country} {league_name}"
+
+
+def _todas_las_ligas_config():
+    """Devuelve {league_id: {nombre, grupo, cfg}} con todas las ligas configuradas."""
+    registro = {}
+    for grupo, dic in (("EUROPA", EUROPA_LEAGUES),
+                       ("SUDAMERICA", SUDAMERICA_LEAGUES),
+                       ("NOCTURNAS", LIGAS_NOCTURNAS)):
+        for nombre, cfg in dic.items():
+            registro[int(cfg["id"])] = {"nombre": nombre, "grupo": grupo, "cfg": cfg}
+    return registro
+
+
+def liga_excluida(league_id=None, league_name="", country=""):
+    """True si la liga esta en LIGAS_EXCLUIDAS (por ID o por pais+nombre)."""
+    try:
+        if league_id is not None and int(league_id) in LIGAS_EXCLUIDAS:
+            return True
+    except (ValueError, TypeError):
+        pass
+    n_liga = _norm(league_name)
+    n_pais = _norm(country)
+    for pais_exc, nombre_exc in LIGAS_EXCLUIDAS.values():
+        n_exc = _norm(nombre_exc)
+        if not n_exc:
+            continue
+        # "Championship" o "England Championship" (como se guardaba antes)
+        if n_liga == n_exc or n_liga == f"{_norm(pais_exc)} {n_exc}":
+            if not n_pais or n_pais == _norm(pais_exc) or n_liga.startswith(_norm(pais_exc)):
+                return True
+    return False
+
+
+def pick_excluido(pick):
+    """Aplica liga_excluida a un pick guardado (con o sin league_id)."""
+    if not pick:
+        return False
+    return liga_excluida(
+        pick.get("league_id"),
+        pick.get("league", pick.get("liga", "")) or "",
+        pick.get("country", "") or "",
+    )
+
+
+def filtrar_fixtures_excluidos(fixtures):
+    """Quita de una respuesta cruda de la API (ej. /fixtures?live=all) las ligas excluidas."""
+    out = []
+    for m in fixtures or []:
+        lg = m.get("league", {}) or {}
+        if liga_excluida(lg.get("id"), lg.get("name", ""), lg.get("country", "")):
+            continue
+        out.append(m)
+    return out
+
+
+def _clasificar_liga_fixture(lg, registro):
+    """
+    Decide a que grupo pertenece la liga de un fixture.
+    Devuelve el grupo ("EUROPA", "SUDAMERICA", "NOCTURNAS") o None si no se usa.
+    """
+    try:
+        lid = int(lg.get("id"))
+    except (ValueError, TypeError):
+        return None
+    nombre = lg.get("name", "")
+    pais = lg.get("country", "")
+
+    if liga_excluida(lid, nombre, pais):
+        return None
+    if lid in registro:
+        return registro[lid]["grupo"]
+
+    # Autodeteccion de primeras divisiones sudamericanas (Apertura/Clausura)
+    patrones = SUDAMERICA_AUTODETECTAR.get(pais)
+    if patrones:
+        n = _norm(nombre)
+        if any(p in n for p in _PALABRAS_NO_PRIMERA):
+            return None
+        if any(n.startswith(p) for p in patrones):
+            return "SUDAMERICA"
+    return None
+
+
+def _season_actual_liga(league_id):
+    """Temporada vigente segun la API (para el respaldo por liga)."""
+    data = api_get(f"/leagues?id={league_id}&current=true", use_cache=True, ttl=86400)
+    try:
+        for s in data[0].get("seasons", []):
+            if s.get("current"):
+                return int(s["year"])
+    except Exception:
+        pass
+    return None
+
+
+ESTADOS_DESCARTADOS = {"CANC", "PST", "ABD", "AWD", "WO"}
+ESTADOS_TERMINADOS = {"FT", "AET", "PEN"}
+
+
+def obtener_partidos_dia(fecha, grupos=None, ids_permitidos=None,
+                         incluir_terminados=True, use_cache=True):
+    """
+    Trae TODOS los partidos de una fecha (hora Peru) con UNA llamada:
+        /fixtures?date=YYYY-MM-DD&timezone=America/Lima
+    y los filtra por league_id.
+
+    grupos:          {"EUROPA","SUDAMERICA","NOCTURNAS"} o None (todos)
+    ids_permitidos:  set de IDs concretos (opcional)
+    Devuelve lista de dicts ordenada por hora.
+    """
+    registro = _todas_las_ligas_config()
+    grupos = set(grupos) if grupos else {"EUROPA", "SUDAMERICA", "NOCTURNAS"}
+
+    fixtures = api_get(
+        f"/fixtures?date={fecha}&timezone=America/Lima",
+        use_cache=use_cache, ttl=600
+    )
+
+    # Respaldo: si la consulta por fecha falla, se consulta liga por liga
+    # validando que el fixture devuelto sea de la liga pedida.
+    if not fixtures:
+        fixtures = []
+        for lid, info in registro.items():
+            if info["grupo"] not in grupos:
+                continue
+            season = _season_actual_liga(lid) or info["cfg"].get("season")
+            fx = api_get(
+                f"/fixtures?league={lid}&season={season}&date={fecha}&timezone=America/Lima",
+                use_cache=use_cache, ttl=600
+            )
+            for m in fx or []:
+                try:
+                    if int(m["league"]["id"]) == lid:
+                        fixtures.append(m)
+                except Exception:
+                    continue
+
+    partidos = []
+    vistos = set()
+    for m in fixtures or []:
+        try:
+            lg = m["league"]
+            fid = m["fixture"]["id"]
+            if fid in vistos:
+                continue
+            grupo = _clasificar_liga_fixture(lg, registro)
+            if grupo is None or grupo not in grupos:
+                continue
+            lid = int(lg["id"])
+            if ids_permitidos and lid not in ids_permitidos:
+                continue
+            status = m["fixture"]["status"]["short"]
+            if status in ESTADOS_DESCARTADOS:
+                continue
+            if not incluir_terminados and status in ESTADOS_TERMINADOS:
+                continue
+            # La fecha devuelta debe ser la pedida (en hora Peru)
+            if str(m["fixture"].get("date", ""))[:10] not in ("", fecha):
+                continue
+
+            pais = lg.get("country", "") or ""
+            nombre_api = lg.get("name", "") or ""
+            vistos.add(fid)
+            partidos.append({
+                "id": fid,
+                "home": m["teams"]["home"]["name"],
+                "away": m["teams"]["away"]["name"],
+                "home_id": m["teams"]["home"]["id"],
+                "away_id": m["teams"]["away"]["id"],
+                "league": format_league_name(pais, nombre_api),
+                "league_name": nombre_api,
+                "league_id": lid,
+                "season": lg.get("season"),
+                "country": pais,
+                "round": lg.get("round", ""),
+                "grupo": grupo,
+                "status": status,
+                "hour": hora_peru(m["fixture"]["date"]),
+                "fecha": fecha,
+                "timestamp": m["fixture"]["timestamp"],
+            })
+        except Exception:
+            continue
+
+    partidos.sort(key=lambda x: (x.get("timestamp") or 9999999999))
+    return partidos
+
+
+def _grupos_de(ligas):
+    """Traduce un diccionario de ligas (EUROPA_LEAGUES, etc.) a sus grupos."""
+    if not ligas:
+        return None
+    grupos = set()
+    ids = {int(c["id"]) for c in ligas.values()}
+    if ids & {int(c["id"]) for c in EUROPA_LEAGUES.values()}:
+        grupos.add("EUROPA")
+    if ids & {int(c["id"]) for c in SUDAMERICA_LEAGUES.values()}:
+        grupos.add("SUDAMERICA")
+    if ids & {int(c["id"]) for c in LIGAS_NOCTURNAS.values()}:
+        grupos.add("NOCTURNAS")
+    return grupos or None
 
 
 def clamp(valor, minimo, maximo):
@@ -1299,8 +1574,10 @@ def preparar_analisis(fixture_id, incluir_odds=False, incluir_contexto=False):
 
     fixture = fixture[0]
 
-    league = fixture["league"]["name"]
-    country = fixture["league"]["country"]
+    league_id = fixture["league"].get("id")
+    season = fixture["league"].get("season")
+    country = fixture["league"].get("country", "")
+    league = format_league_name(country, fixture["league"]["name"])
 
     home = fixture["teams"]["home"]["name"]
     away = fixture["teams"]["away"]["name"]
@@ -1363,6 +1640,9 @@ def preparar_analisis(fixture_id, incluir_odds=False, incluir_contexto=False):
         "home": home,
         "away": away,
         "league": league,
+        "league_id": league_id,
+        "season": season,
+        "excluida": liga_excluida(league_id, fixture["league"]["name"], country),
         "country": country,
         "hora": hora_peru(fecha),
         "fecha": fecha_partido,
@@ -1374,8 +1654,11 @@ def preparar_analisis(fixture_id, incluir_odds=False, incluir_contexto=False):
     }
 
 
-def guardar_pick_automatico(data: dict):
+def guardar_pick_automatico(data: dict, tipo="prematch"):
     if not data:
+        return
+    # Ligas excluidas no se guardan (no deben entrar a combinadas ni reportes)
+    if data.get("excluida") or pick_excluido(data):
         return
 
     # Buscar recomendaciones con flexibilidad total
@@ -1423,14 +1706,18 @@ def guardar_pick_automatico(data: dict):
     categoria_edge, label_edge = clasificar_edge(edge_val)
     ve_val = valor_esperado(float(top.get("prob", 0) or 0), cuota_pinnacle) if cuota_pinnacle > 1.0 else None
 
+    _fecha = data.get("fecha") or data.get("fecha_partido") or fecha_hoy_peru()
+    _partido = data.get("partido") or f"{data.get('home','')} vs {data.get('away','')}"
     picks.append({
         "fixture_id": str(data["fixture_id"]),
-        "fecha": data["fecha"],
-        "hora": data["hora"],
-        "fecha_partido": data.get("fecha_partido", data["fecha"]),
-        "country": data["country"],
-        "league": data["league"],
-        "partido": f"{data['home']} vs {data['away']}",
+        "fecha": _fecha,
+        "hora": data.get("hora", ""),
+        "fecha_partido": data.get("fecha_partido", _fecha),
+        "country": data.get("country", ""),
+        "league": data.get("league", ""),
+        "league_id": data.get("league_id"),
+        "season": data.get("season"),
+        "partido": _partido,
         "mercado": top["mercado"],
         "jugada": top["jugada"],
         "probabilidad": top["prob"],
@@ -1445,7 +1732,7 @@ def guardar_pick_automatico(data: dict):
         "valor_esperado": ve_val,
         "estado": "pendiente",
         "resultado_real": None,
-        "tipo": "prematch",
+        "tipo": data.get("tipo", tipo),
         "timestamp": fecha_hora_peru()
     })
 
@@ -1453,6 +1740,8 @@ def guardar_pick_automatico(data: dict):
 
 
 def guardar_pick_live_automatico(fixture_id, home, away, country, league, hora, sugerencia, minuto=None):
+    if liga_excluida(None, league, country):
+        return
     picks = leer_json(PICKS_FILE)
 
     for p in picks:
@@ -1465,6 +1754,7 @@ def guardar_pick_live_automatico(fixture_id, home, away, country, league, hora, 
             p["probabilidad"] = sugerencia["prob"]
             p["score"] = sugerencia["score"]
             p["riesgo"] = sugerencia["riesgo"]
+            guardar_json_lista(PICKS_FILE, picks)
             return
 
     _cuota_live = sugerencia.get("cuota", 0) or sugerencia.get("cuota_minima", 0) or 0
@@ -1551,6 +1841,8 @@ def actualizar_resultados_automaticos():
         if status not in ["FT", "AET", "PEN"]:
             continue
 
+        gh = fixture["goals"]["home"]
+        ga = fixture["goals"]["away"]
         gh_ht = fixture.get("score", {}).get("halftime", {}).get("home")
         ga_ht = fixture.get("score", {}).get("halftime", {}).get("away")
 
@@ -1875,72 +2167,22 @@ def texto_detalle(data):
 
 def get_fixtures_by_leagues(leagues, title):
     today = fecha_hoy_peru()
-    texto = f"{title} ({today}) 🌐\n"
-    total = 0
-
-    for league_name, data in leagues.items():
-        fixtures = api_get(
-            f"/fixtures?league={data['id']}&season={data['season']}&date={today}",
-            use_cache=True,
-            ttl=600
-        )
-
-        if fixtures:
-            texto += f"\n🏆 {league_name}\n"
-
-        for m in fixtures:
-            texto += (
-                f"⚽ {hora_peru(m['fixture']['date'])} | "
-                f"{m['teams']['home']['name']} vs {m['teams']['away']['name']}\n"
-                f"ID: {m['fixture']['id']}\n"
-            )
-            total += 1
-
-    if total == 0:
+    partidos = obtener_partidos_dia(today, grupos=_grupos_de(leagues))
+    if not partidos:
         return "❌ No encontré partidos."
 
+    texto = f"{title} ({today}) 🌐\n"
+    liga_actual = None
+    for p in sorted(partidos, key=lambda x: (x["league"], x["timestamp"])):
+        if p["league"] != liga_actual:
+            liga_actual = p["league"]
+            texto += f"\n🏆 {liga_actual}\n"
+        texto += f"🌐 {p['hour']} | {p['home']} vs {p['away']}\nID: {p['id']}\n"
     return texto[:3900]
 
 
 def obtener_partidos_configurados():
-    today = fecha_hoy_peru()
-    ligas = {}
-    ligas.update(EUROPA_LEAGUES)
-    ligas.update(SUDAMERICA_LEAGUES)
-    ligas.update(LIGAS_NOCTURNAS)
-
-    partidos = []
-
-    for league_name, data in ligas.items():
-        fixtures = api_get(
-            f"/fixtures?league={data['id']}&season={data['season']}&date={today}",
-            use_cache=True,
-            ttl=600
-        )
-
-        for m in fixtures:
-            status = m["fixture"]["status"]["short"]
-
-            if status in ["CANC", "PST", "ABD"]:
-                continue
-
-            country = m["league"].get("country", "")
-            league_name = f"{country} {m['league']['name']}"
-
-            partidos.append({
-                "id": m["fixture"]["id"],
-                "home": m["teams"]["home"]["name"],
-                "away": m["teams"]["away"]["name"],
-                "league": league_name,
-                "hour": hora_peru(m["fixture"]["date"]),
-                "timestamp": m["fixture"]["timestamp"]
-            })
-
-            partidos.sort(
-                key=lambda x: x.get("timestamp", 9999999999)
-        )
-
-    return partidos
+    return obtener_partidos_dia(fecha_hoy_peru())
 
 
 def generar_top(score_minimo=7.5):
@@ -1953,22 +2195,11 @@ def generar_top(score_minimo=7.5):
 
     today = fecha_hoy_peru()
 
-    for _, data_liga in ligas.items():
-
-        fixtures = api_get(
-            f"/fixtures?league={data_liga['id']}&season={data_liga['season']}&date={today}",
-            use_cache=True,
-            ttl=600
-        )
-
-        for m in fixtures:
-
-            status = m["fixture"]["status"]["short"]
-
-            if status in ["FT", "AET", "PEN", "CANC", "ABD"]:
-                continue
-
-            fixture_id = str(m["fixture"]["id"])
+    for m in obtener_partidos_dia(today, incluir_terminados=False):
+        if m.get("status") not in ("NS", "TBD"):
+            continue
+        if True:
+            fixture_id = str(m["id"])
 
             try:
 
@@ -2001,6 +2232,7 @@ def generar_top(score_minimo=7.5):
 
     oportunidades.sort(
         key=lambda x: (x["score"], -x["riesgo"], x["prob"]),
+        reverse=True
     )
 
     return oportunidades[:10]
@@ -2854,7 +3086,7 @@ def analizar_live_fixture(fixture_id):
 
 
 def listar_live():
-    fixtures = api_get("/fixtures?live=all", use_cache=False)
+    fixtures = filtrar_fixtures_excluidos(api_get("/fixtures?live=all", use_cache=False))
 
     if not fixtures:
         return "❌ No hay partidos live."
@@ -3411,7 +3643,7 @@ def filtrar_picks_mes_actual():
 
 async def revisar_alertas_live(context: ContextTypes.DEFAULT_TYPE):
     chat_id = context.job.chat_id
-    fixtures = api_get("/fixtures?live=all", use_cache=False)
+    fixtures = filtrar_fixtures_excluidos(api_get("/fixtures?live=all", use_cache=False))
 
     for m in fixtures:
         fixture_id = str(m["fixture"]["id"])
@@ -3792,35 +4024,9 @@ def programar_reportes(context: ContextTypes.DEFAULT_TYPE, chat_id):
     )
 
 def obtener_fixtures_por_fecha(ligas, fecha):
-    partidos = []
+    """Partidos de 'fecha' de los grupos de ligas indicados (validado por ID)."""
+    return obtener_partidos_dia(fecha, grupos=_grupos_de(ligas))
 
-    for league_name, data_liga in ligas.items():
-        fixtures = api_get(
-            f"/fixtures?league={data_liga['id']}&season={data_liga['season']}&date={fecha}&timezone=America/Lima",
-            use_cache=True,
-            ttl=600
-        )
-
-        for m in fixtures:
-            status = m["fixture"]["status"]["short"]
-
-            if status in ["CANC", "PST", "ABD"]:
-                continue
-
-            country = data_liga.get("country", m["league"].get("country", ""))
-            titulo_liga = f"{country} {league_name}".strip()
-
-            partidos.append({
-                "id": m["fixture"]["id"],
-                "home": m["teams"]["home"]["name"],
-                "away": m["teams"]["away"]["name"],
-                "league": titulo_liga,
-                "hour": hora_peru(m["fixture"]["date"]),
-                "timestamp": m["fixture"]["timestamp"]
-            })
-
-    partidos.sort(key=lambda x: x.get("timestamp", 9999999999))
-    return partidos
 
 def texto_fixtures_fecha(titulo, ligas, fecha):
     partidos = obtener_fixtures_por_fecha(ligas, fecha)
@@ -3952,6 +4158,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "━━━━━━━━━━\n"
         "🔍 *ANALISIS*\n"
         "/analizar_all — Analiza TODAS las ligas automaticamente\n"
+        "/minitickets — Genera minitickets (hoy | nuevo | manana)\n"
+        "/ligas_hoy — Ligas que entran hoy (con su ID)\n"
+        "/reparar_ligas — Corrige ligas mal etiquetadas en picks\n"
         "/analizar ID — Analiza un partido especifico\n"
         "/detalle ID — Detalle completo de un partido\n"
         "/scanear — Escanea todas las ligas\n"
@@ -4155,46 +4364,22 @@ async def detalle(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def fixtures_ligas(update: Update, context: ContextTypes.DEFAULT_TYPE, leagues, titulo):
     await update.message.reply_text(f"📅 Buscando fixtures {titulo}...")
-
     today = fecha_hoy_peru()
-    texto = f"📅 FIXTURES {titulo.upper()} ({today})\n"
-    total = 0
-
-    for league_name, data_liga in leagues.items():
-        fixtures = api_get(
-            f"/fixtures?league={data_liga['id']}&season={data_liga['season']}&date={today}&timezone=America/Lima",
-            use_cache=True,
-            ttl=600
-        )
-
-        partidos_liga = []
-
-        for m in fixtures:
-            status = m["fixture"]["status"]["short"]
-
-            if status in ["CANC", "PST", "ABD"]:
-                continue
-
-            partidos_liga.append(
-                f"⚽ {hora_peru(m['fixture']['date'])} | "
-                f"{m['teams']['home']['name']} vs {m['teams']['away']['name']}\n"
-                f"📌 ID: {m['fixture']['id']}"
-            )
-            total += 1
-
-        if partidos_liga:
-            country = data_liga.get("country", "")
-            titulo_liga = f"{country} {league_name}".strip()
-            
-            texto += f"\n🏆 {data_liga.get('country', '')} {league_name}\n"
-            texto += "\n".join(partidos_liga)
-            texto += "\n"
-
-    if total == 0:
+    partidos = await asyncio.to_thread(obtener_partidos_dia, today, _grupos_de(leagues))
+    if not partidos:
         await update.message.reply_text(f"❌ No encontré fixtures en {titulo}.")
         return
 
-    await update.message.reply_text(texto[:3900])
+    texto = f"📅 FIXTURES {titulo.upper()} ({today})\n"
+    liga_actual = None
+    for p in sorted(partidos, key=lambda x: (x["grupo"], x["league"], x["timestamp"])):
+        if p["league"] != liga_actual:
+            liga_actual = p["league"]
+            texto += f"\n🏆 {liga_actual}\n"
+        texto += f"⚽ {p['hour']} | {p['home']} vs {p['away']}\n📌 ID: {p['id']}\n"
+
+    for i in range(0, len(texto), 3900):
+        await update.message.reply_text(texto[i:i + 3900])
 
 
 async def fixtures(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -4220,20 +4405,9 @@ async def scanear_ligas(update: Update, context: ContextTypes.DEFAULT_TYPE, leag
 
     today = fecha_hoy_peru()
 
-    for league_name, data_liga in leagues.items():
-        fixtures = api_get(
-            f"/fixtures?league={data_liga['id']}&season={data_liga['season']}&date={today}",
-            use_cache=True,
-            ttl=600
-        )
-
-        for m in fixtures:
-            status = m["fixture"]["status"]["short"]
-
-            if status in ["FT", "AET", "PEN", "CANC", "ABD"]:
-                continue
-
-            fixture_id = str(m["fixture"]["id"])
+    for m in obtener_partidos_dia(today, grupos=_grupos_de(leagues), incluir_terminados=False):
+        if True:
+            fixture_id = str(m["id"])
 
             try:
                 data = preparar_analisis(
@@ -4423,7 +4597,7 @@ async def live(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def elitelive(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("🏆 Buscando picks ÉLITE LIVE...")
 
-    fixtures = api_get("/fixtures?live=all", use_cache=False)
+    fixtures = filtrar_fixtures_excluidos(api_get("/fixtures?live=all", use_cache=False))
     oportunidades = []
 
     for m in fixtures:
@@ -4455,7 +4629,7 @@ async def elitelive(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def toplive(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    fixtures = api_get("/fixtures?live=all", use_cache=False)
+    fixtures = filtrar_fixtures_excluidos(api_get("/fixtures?live=all", use_cache=False))
     oportunidades = []
 
     for m in fixtures:
@@ -5423,8 +5597,8 @@ def _pick_valido_para_combinada(pick):
     partido = pick.get("partido", "") or ""
     liga_id = int(pick.get("league_id", 0) or 0)
 
-    # Excluir ligas con alta variabilidad
-    if any(exc.lower() in league.lower() for exc in LIGAS_EXCLUIDAS_COMBINADAS):
+    # Excluir ligas con alta variabilidad (por ID y por pais+nombre)
+    if pick_excluido(pick):
         return False
 
     # Excluir ligas africanas
@@ -7409,7 +7583,7 @@ async def live_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode="Markdown"
     )
 
-    fixtures = api_get("/fixtures?live=all", use_cache=False)
+    fixtures = filtrar_fixtures_excluidos(api_get("/fixtures?live=all", use_cache=False))
 
     if not fixtures:
         await update.message.reply_text(
@@ -7670,9 +7844,13 @@ async def analizar_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 pick_data = {
                     "fixture_id": fixture_id,
                     "partido": f"{home} vs {away}",
+                    "home": home,
+                    "away": away,
                     "league": league,
+                    "league_id": p.get("league_id"),
                     "country": country,
                     "hora": hora,
+                    "fecha": hoy,
                     "fecha_partido": hoy,
                     "tipo": "prematch",
                     "es_seleccion": True,
@@ -7716,14 +7894,12 @@ async def analizar_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             else:
                 # Analisis normal de clubes
-                data = preparar_analisis(
-                    fixture_id,
-                    incluir_odds=False,
-                    incluir_contexto=False
+                data = await asyncio.to_thread(
+                    preparar_analisis, fixture_id, False, False
                 )
                 analizados += 1
 
-                if not data or not data.get("recomendaciones"):
+                if not data or not data.get("recomendaciones") or data.get("excluida"):
                     continue
 
                 top = data["recomendaciones"][0]
@@ -7742,9 +7918,14 @@ async def analizar_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 pick_data = {
                     "fixture_id": fixture_id,
                     "partido": f"{home} vs {away}",
+                    "home": home,
+                    "away": away,
                     "league": league,
+                    "league_id": p.get("league_id"),
+                    "season": p.get("season"),
                     "country": country,
                     "hora": hora,
+                    "fecha": hoy,
                     "fecha_partido": hoy,
                     "tipo": "prematch",
                     "cuota": cuota_real_api if cuota_real_api > 1.0 else _cuota_segura(top),
@@ -7999,7 +8180,7 @@ def _obtener_picks_live_ahora(score_min=7.5, riesgo_max=2):
     picks que cumplan los criterios de calidad.
     Cada pick incluye el minuto actual del partido.
     """
-    fixtures = api_get("/fixtures?live=all", use_cache=False)
+    fixtures = filtrar_fixtures_excluidos(api_get("/fixtures?live=all", use_cache=False))
     if not fixtures:
         return []
 
@@ -9372,7 +9553,7 @@ def _armar_escalera():
     candidatos = []
 
     # ── Picks LIVE ───────────────────────────────────────────────────
-    fixtures_live = api_get("/fixtures?live=all", use_cache=False)
+    fixtures_live = filtrar_fixtures_excluidos(api_get("/fixtures?live=all", use_cache=False))
     for m in (fixtures_live or []):
         fixture_id = str(m["fixture"]["id"])
         home = m["teams"]["home"]["name"]
@@ -10846,55 +11027,6 @@ async def _alerta_edge_excelente_job(context):
 #  Picks diarios + Combinadas + Minitickets
 # ─────────────────────────────────────────────
 
-def _armar_minitickets(picks_hoy, hoy):
-    """
-    Arma minitickets: combinadas de 2-3 picks con score 9.5+,
-    riesgo 1, cuota individual 1.15-1.35.
-    Son muy seguros pero de cuota baja — al juntarlos sube la cuota.
-    """
-    from itertools import combinations as _comb_it
-    ya_usados = _fixture_ids_ya_usados(hoy)
-
-    candidatos = [
-        p for p in picks_hoy
-        if float(p.get("score", 0) or 0) >= 9.5
-        and float(p.get("riesgo", 10) or 10) <= 1.0
-        and not _es_btts(p)
-        and _pick_valido_para_combinada(p)
-        and str(p.get("fixture_id","")) not in ya_usados
-        and 1.10 <= float(_cuota_segura(p) or 0) <= 1.40
-    ]
-
-    if len(candidatos) < 2:
-        return []
-
-    minitickets = []
-    for n in [3, 2]:
-        if len(candidatos) < n:
-            continue
-        for grupo in _comb_it(candidatos, n):
-            grupo = list(grupo)
-            ids = [p.get("fixture_id","") for p in grupo]
-            if len(set(ids)) < len(ids):
-                continue
-            cuota_comb = 1.0
-            for p in grupo:
-                cuota_comb *= float(_cuota_segura(p) or 1.0)
-            cuota_comb = round(cuota_comb, 2)
-            if cuota_comb < 1.25:
-                continue
-            scores = [float(p.get("score",0) or 0) for p in grupo]
-            minitickets.append({
-                "picks": grupo,
-                "cuota": cuota_comb,
-                "score_prom": round(sum(scores)/len(scores), 2),
-                "n": n,
-            })
-
-    # Ordenar por score promedio descendente, tomar los 3 mejores
-    minitickets.sort(key=lambda x: (-x["score_prom"], -x["cuota"]))
-    return minitickets[:3]
-
 
 async def _job_automatico_medianoche(context):
     """
@@ -10913,26 +11045,9 @@ async def _job_automatico_medianoche(context):
     ligas_todas.update(SUDAMERICA_LEAGUES)
     ligas_todas.update(LIGAS_NOCTURNAS)
 
-    partidos_hoy = []
-    for nombre_liga, cfg in ligas_todas.items():
-        try:
-            fx = api_get(
-                f"/fixtures?league={cfg['id']}&season={cfg['season']}&date={hoy}",
-                use_cache=False
-            )
-            for m in (fx or []):
-                partidos_hoy.append({
-                    "id": m["fixture"]["id"],
-                    "home": m["teams"]["home"]["name"],
-                    "away": m["teams"]["away"]["name"],
-                    "league": nombre_liga,
-                    "league_id": cfg["id"],
-                    "country": cfg.get("country",""),
-                    "hour": hora_peru(m["fixture"]["date"]),
-                    "fecha": hoy,
-                })
-        except Exception:
-            continue
+    # A las 00:00 hora Peru el dia que empieza ES "hoy": se analizan sus partidos.
+    manana = hoy
+    partidos_manana = obtener_partidos_dia(hoy, incluir_terminados=False, use_cache=False)
 
     if not partidos_manana:
         for chat_id in _CHAT_IDS_ALARMAS:
@@ -11269,49 +11384,362 @@ async def comb5_manana(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"\u274c Error: {e}")
 
 
-async def minitickets(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# ─────────────────────────────────────────────
+#  MINITICKETS
+#  Combinadas cortas (2-3 picks) de alta confianza y cuota baja.
+#  /minitickets          -> hoy (muestra los guardados o los genera)
+#  /minitickets nuevo    -> vuelve a generar los de hoy
+#  /minitickets manana   -> genera los de manana
+# ─────────────────────────────────────────────
+
+# (score minimo, riesgo maximo, cuota min por pick, cuota max por pick, etiqueta)
+MINITICKET_NIVELES = [
+    (9.0, 2.0, 1.10, 1.45, "MUY ALTA"),
+    (8.5, 3.0, 1.10, 1.50, "ALTA"),
+    (8.0, 3.0, 1.15, 1.60, "MEDIA-ALTA"),
+]
+MINITICKET_CUOTA_MIN_TOTAL = 1.30
+MINITICKET_MAX = 3
+MINITICKET_STAKE = 0.02   # 2% del bank por miniticket
+
+
+def _cuota_real_pick(p):
+    """Cuota de mercado (API) si existe; None si solo hay cuota calculada."""
+    for campo in ("cuota_pinnacle", "cuota_api"):
+        try:
+            v = float(p.get(campo) or 0)
+            if v > 1.0:
+                return v
+        except (ValueError, TypeError):
+            continue
+    return None
+
+
+def _cuota_mini(p):
+    return _cuota_real_pick(p) or float(_cuota_segura(p) or 1.0)
+
+
+def _hora_ya_paso(p, fecha):
+    """True si el partido de hoy ya empezo (no sirve para un ticket nuevo)."""
+    if fecha != fecha_hoy_peru():
+        return False
+    hora = str(p.get("hora", "") or "")
+    if len(hora) < 5:
+        return False
+    return hora[:5] <= fecha_peru_obj().strftime("%H:%M")
+
+
+def _armar_minitickets(picks_hoy, hoy, max_tickets=MINITICKET_MAX):
     """
-    /minitickets — Muestra los minitickets del dia:
-    combinadas de 2-3 picks con score 9.5+, riesgo 1, cuota baja pero muy segura.
+    Arma minitickets a partir de picks guardados.
+    Usa niveles de exigencia: primero el mas estricto; si no alcanza para
+    un ticket, baja al siguiente. Un partido no se repite entre tickets.
     """
-    _registrar_chat_alarma(update.effective_chat.id)
-    hoy = fecha_hoy_peru()
-    picks_hoy = [
+    # Mejor pick por partido
+    mejores = {}
+    for p in picks_hoy:
+        if (p.get("tipo", "prematch") != "prematch"
+                or str(p.get("estado", "pendiente")).lower() not in ("pendiente", "pendiente_manual")
+                or _es_btts(p)
+                or not _pick_valido_para_combinada(p)
+                or _hora_ya_paso(p, hoy)):
+            continue
+        fid = str(p.get("fixture_id", ""))
+        if not fid:
+            continue
+        if fid not in mejores or float(p.get("score", 0) or 0) > float(mejores[fid].get("score", 0) or 0):
+            mejores[fid] = p
+    picks = list(mejores.values())
+
+    tickets = []
+    usados = set()
+    for score_min, riesgo_max, c_min, c_max, nivel in MINITICKET_NIVELES:
+        candidatos = [
+            p for p in picks
+            if str(p.get("fixture_id")) not in usados
+            and float(p.get("score", 0) or 0) >= score_min
+            and float(p.get("riesgo", 10) or 10) <= riesgo_max
+            and c_min <= _cuota_mini(p) <= c_max
+        ]
+        # Primero los que tienen cuota real, luego por score
+        candidatos.sort(key=lambda p: (_cuota_real_pick(p) is not None,
+                                       float(p.get("score", 0) or 0)), reverse=True)
+
+        while len(candidatos) >= 2 and len(tickets) < max_tickets:
+            n = 3 if len(candidatos) >= 3 else 2
+            grupo = candidatos[:n]
+            cuota = 1.0
+            for p in grupo:
+                cuota *= _cuota_mini(p)
+            # Si con 2 no llega a la cuota minima y hay un tercero, se agrega
+            if cuota < MINITICKET_CUOTA_MIN_TOTAL and n == 2 and len(candidatos) >= 3:
+                grupo = candidatos[:3]
+                cuota *= _cuota_mini(candidatos[2])
+            if cuota < MINITICKET_CUOTA_MIN_TOTAL:
+                break
+            scores = [float(p.get("score", 0) or 0) for p in grupo]
+            tickets.append({
+                "picks": grupo,
+                "cuota": round(cuota, 2),
+                "score_prom": round(sum(scores) / len(scores), 2),
+                "n": len(grupo),
+                "nivel": nivel,
+                "cuotas_reales": all(_cuota_real_pick(p) for p in grupo),
+            })
+            ids = {str(p.get("fixture_id")) for p in grupo}
+            usados |= ids
+            candidatos = [p for p in candidatos if str(p.get("fixture_id")) not in ids]
+        if len(tickets) >= max_tickets:
+            break
+
+    return tickets
+
+
+def _picks_guardados_fecha(fecha):
+    return [
         p for p in leer_json(PICKS_FILE)
-        if (p.get("fecha_partido") or p.get("fecha",""))[:10] == hoy
-        and p.get("estado","pendiente").lower() in ("pendiente","pendiente_manual")
+        if (p.get("fecha_partido") or p.get("fecha", ""))[:10] == fecha
+        and not pick_excluido(p)
     ]
 
-    mts = _armar_minitickets(picks_hoy, hoy)
+
+def _generar_picks_para_minitickets(fecha, max_partidos=60):
+    """
+    Analiza los partidos de 'fecha' que aun no tienen pick guardado y guarda,
+    por partido, la mejor recomendacion apta para miniticket.
+    Funcion sincrona: llamarla con asyncio.to_thread.
+    """
+    ya = {str(p.get("fixture_id")) for p in _picks_guardados_fecha(fecha)}
+    partidos = [
+        p for p in obtener_partidos_dia(fecha, incluir_terminados=False)
+        if p.get("status") in ("NS", "TBD") and str(p["id"]) not in ya
+        and not _hora_ya_paso({"hora": p["hour"]}, fecha)
+    ][:max_partidos]
+
+    score_min = min(n[0] for n in MINITICKET_NIVELES)
+    nuevos = 0
+    for p in partidos:
+        try:
+            data = preparar_analisis(str(p["id"]), incluir_odds=True)
+            if not data or data.get("excluida") or not data.get("recomendaciones"):
+                continue
+            aptas = [
+                r for r in data["recomendaciones"]
+                if float(r.get("score", 0) or 0) >= score_min
+                and not _es_btts(r)
+            ]
+            if not aptas:
+                continue
+            aptas.sort(key=lambda r: (float(r.get("score", 0) or 0),
+                                      -float(r.get("riesgo", 10) or 10)), reverse=True)
+            data["recomendaciones"] = [aptas[0]]
+            data["fecha_partido"] = fecha
+            data["league_id"] = p.get("league_id")
+            guardar_pick_automatico(data)
+            nuevos += 1
+        except Exception as e:
+            print("ERROR MINITICKET ANALISIS:", e)
+    return len(partidos), nuevos
+
+
+def _formato_miniticket(mt, idx, fecha):
+    lineas = [
+        f"🎟️ *MINITICKET {idx} — {mt['n']} picks* ({fecha})",
+        f"Confianza: *{mt.get('nivel','')}* | Score prom: {mt['score_prom']}",
+        "━━━━━━━━━━",
+    ]
+    for j, p in enumerate(mt["picks"], 1):
+        real = _cuota_real_pick(p)
+        cuota_txt = f"{real:.2f}" if real else f"{_cuota_mini(p):.2f} (calc)"
+        lineas.append(
+            f"{j}. *{p.get('partido','')}*\n"
+            f"   🏆 {p.get('league','')} | ⏰ {p.get('hora','')}\n"
+            f"   🎯 {p.get('jugada','')} | Score {p.get('score','')} | Riesgo {p.get('riesgo','')}\n"
+            f"   💰 Cuota {cuota_txt}"
+        )
+    stake = round(BANK_INICIAL * MINITICKET_STAKE, 2)
+    ganancia = round(stake * (mt["cuota"] - 1), 2)
+    lineas += [
+        "━━━━━━━━━━",
+        f"📈 Cuota total: *{mt['cuota']}x*",
+        f"💰 Stake sugerido: S/{stake:.2f} (2% bank) | Ganancia pot.: S/{ganancia:.2f}",
+    ]
+    if not mt.get("cuotas_reales"):
+        lineas.append("⚠️ Alguna cuota es calculada: verifica la cuota real en tu casa antes de apostar.")
+    if mt.get("ticket_id"):
+        lineas.append(f"🆔 {mt['ticket_id']}")
+    return "\n".join(lineas)
+
+
+async def _responder_md(update, texto):
+    """Envia con Markdown; si un nombre rompe el formato, reenvia en texto plano."""
+    try:
+        await update.message.reply_text(texto, parse_mode="Markdown")
+    except Exception:
+        await update.message.reply_text(texto.replace("*", ""))
+
+
+async def minitickets(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/minitickets [nuevo|manana] — genera y guarda minitickets del dia."""
+    _registrar_chat_alarma(update.effective_chat.id)
+    args = [a.lower() for a in (context.args or [])]
+    es_manana = any(a in ("manana", "mañana") for a in args)
+    forzar = "nuevo" in args or es_manana
+    fecha = fecha_manana_peru() if es_manana else fecha_hoy_peru()
+
+    # 1) Si ya hay minitickets guardados para la fecha, mostrarlos
+    if not forzar:
+        guardados = [
+            c for c in leer_json(COMBINADAS_FILE)
+            if c.get("subtipo") == "miniticket" and (c.get("fecha", "") or "")[:10] == fecha
+        ]
+        if guardados:
+            await update.message.reply_text(
+                f"🎟️ Minitickets ya generados para {fecha} ({len(guardados)}). "
+                f"Usa /minitickets nuevo para regenerarlos."
+            )
+            for i, c in enumerate(guardados, 1):
+                mt = {
+                    "picks": c.get("picks", []), "cuota": c.get("cuota_combinada", 0),
+                    "score_prom": c.get("score_promedio", 0), "n": c.get("n_picks", 0),
+                    "nivel": c.get("nivel", ""), "cuotas_reales": c.get("cuotas_reales", False),
+                    "ticket_id": c.get("ticket_id", ""),
+                }
+                estado = c.get("estado", "pendiente")
+                await _responder_md(update, _formato_miniticket(mt, i, fecha) + f"\n📌 Estado: {estado}")
+            return
+
+    # 2) Intentar con los picks guardados
+    picks = _picks_guardados_fecha(fecha)
+    mts = _armar_minitickets(picks, fecha)
+
+    # 3) Si no alcanza, analizar los partidos de la fecha
+    if len(mts) < MINITICKET_MAX:
+        await update.message.reply_text(
+            f"🔍 Analizando partidos de {fecha} para armar minitickets...\n"
+            f"Puede tardar unos minutos."
+        )
+        try:
+            total, nuevos = await asyncio.to_thread(_generar_picks_para_minitickets, fecha)
+        except Exception as e:
+            total, nuevos = 0, 0
+            print("ERROR MINITICKETS:", e)
+        picks = _picks_guardados_fecha(fecha)
+        mts = _armar_minitickets(picks, fecha)
 
     if not mts:
         await update.message.reply_text(
-            "\u274c No hay minitickets disponibles hoy.\n"
-            "Se necesitan al menos 2 picks con score 9.5+, riesgo 1 y cuota 1.10-1.40."
+            f"❌ No hay picks suficientes para un miniticket en {fecha}.\n"
+            f"Se necesitan al menos 2 partidos con score 8.0+, riesgo bajo y "
+            f"cuota por pick entre 1.10 y 1.60. Mejor no forzar un ticket."
         )
         return
 
+    # Al regenerar, quitar los minitickets pendientes anteriores de esa fecha
+    if forzar:
+        combs = leer_json(COMBINADAS_FILE)
+        combs = [
+            c for c in combs
+            if not (c.get("subtipo") == "miniticket"
+                    and (c.get("fecha", "") or "")[:10] == fecha
+                    and c.get("estado", "pendiente") == "pendiente")
+        ]
+        guardar_json_lista(COMBINADAS_FILE, combs)
+
     for i, mt in enumerate(mts, 1):
-        lineas = [
-            f"\U0001f4b0 *MINITICKET {i} — {mt['n']} picks*",
-            f"Score prom: {mt['score_prom']} | Cuota combinada: *{mt['cuota']}x*",
-            f"\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501",
-        ]
-        for j, p in enumerate(mt["picks"], 1):
-            cuota_p = _cuota_segura(p)
-            lineas.append(
-                f"{j}. *{p.get('partido','')}*\n"
-                f"   {p.get('league','')} | \u23f0 {p.get('hora','')}\n"
-                f"   {p.get('jugada','')} | Score:{p.get('score','')} | Cuota:{cuota_p}"
-            )
-        stake = round(BANK_INICIAL * STAKE_COMBINADA, 2)
-        ganancia = round(stake * (mt["cuota"] - 1), 2)
-        lineas += [
-            f"\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501",
-            f"\U0001f4b0 Stake: S/{stake:.2f} | Ganancia pot: *S/{ganancia:.2f}*",
-            f"\U0001f9e0 Alta confianza — todos score 9.5+ riesgo 1",
-        ]
-        await update.message.reply_text("\n".join(lineas), parse_mode="Markdown")
+        mt_comb = {
+            "fecha": fecha,
+            "subtipo": "miniticket",
+            "tipo": "prematch",
+            "picks": mt["picks"],
+            "cuota_combinada": mt["cuota"],
+            "n_picks": mt["n"],
+            "score_promedio": mt["score_prom"],
+            "nivel": mt["nivel"],
+            "cuotas_reales": mt["cuotas_reales"],
+            "stake": round(BANK_INICIAL * MINITICKET_STAKE, 2),
+            "estado": "pendiente",
+            "timestamp": fecha_hora_peru(),
+        }
+        _guardar_combinada(mt_comb)
+        mt["ticket_id"] = mt_comb.get("ticket_id", "")
+        await _responder_md(update, _formato_miniticket(mt, i, fecha))
+
+    await update.message.reply_text("✅ Minitickets guardados. Se evalúan solos con el seguimiento de combinadas.")
+
+
+# ─────────────────────────────────────────────
+#  /reparar_ligas — corrige picks guardados con liga mal etiquetada
+# ─────────────────────────────────────────────
+def _reparar_ligas_picks():
+    picks = leer_json(PICKS_FILE)
+    corregidos, eliminados = 0, 0
+    nuevos = []
+    for p in picks:
+        if str(p.get("estado", "pendiente")).lower() not in ("pendiente", "pendiente_manual"):
+            nuevos.append(p)
+            continue
+        fid = p.get("fixture_id")
+        fx = api_get(f"/fixtures?id={fid}", use_cache=True, ttl=3600) if fid else []
+        if fx:
+            lg = fx[0].get("league", {}) or {}
+            if liga_excluida(lg.get("id"), lg.get("name", ""), lg.get("country", "")):
+                eliminados += 1
+                continue
+            etiqueta = format_league_name(lg.get("country", ""), lg.get("name", ""))
+            if (p.get("league") != etiqueta or p.get("league_id") != lg.get("id")
+                    or p.get("country") != lg.get("country")):
+                p["league"] = etiqueta
+                p["league_id"] = lg.get("id")
+                p["season"] = lg.get("season")
+                p["country"] = lg.get("country", "")
+                corregidos += 1
+        elif pick_excluido(p):
+            eliminados += 1
+            continue
+        nuevos.append(p)
+    guardar_json_lista(PICKS_FILE, nuevos)
+    CACHE.clear()
+    return corregidos, eliminados
+
+
+async def reparar_ligas(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("🛠️ Revisando la liga real de cada pick pendiente...")
+    try:
+        corregidos, eliminados = await asyncio.to_thread(_reparar_ligas_picks)
+    except Exception as e:
+        await update.message.reply_text(f"❌ Error: {e}")
+        return
+    await update.message.reply_text(
+        f"✅ Listo.\nPicks con liga corregida: {corregidos}\n"
+        f"Picks de ligas excluidas eliminados: {eliminados}\nCaché limpiada."
+    )
+
+
+# ─────────────────────────────────────────────
+#  /ligas_hoy — muestra que ligas entran hoy y cuantos partidos tiene cada una
+# ─────────────────────────────────────────────
+async def ligas_hoy(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    fecha = fecha_hoy_peru()
+    partidos = await asyncio.to_thread(obtener_partidos_dia, fecha)
+    if not partidos:
+        await update.message.reply_text(f"❌ La API no devolvió partidos de tus ligas para {fecha}.")
+        return
+    conteo = {}
+    for p in partidos:
+        clave = (p["grupo"], p["league"], p["league_id"])
+        conteo[clave] = conteo.get(clave, 0) + 1
+    lineas = [f"🗂️ Ligas con partidos hoy ({fecha}) — {len(partidos)} partidos"]
+    grupo_actual = None
+    for (grupo, liga, lid), n in sorted(conteo.items()):
+        if grupo != grupo_actual:
+            grupo_actual = grupo
+            lineas.append(f"\n{grupo}")
+        lineas.append(f"  • {liga} (ID {lid}): {n}")
+    excl = ", ".join(f"{n} ({pais})" for pais, n in LIGAS_EXCLUIDAS.values())
+    lineas.append(f"\n🚫 Excluidas: {excl}")
+    await update.message.reply_text("\n".join(lineas)[:3900])
+
 
 # ─────────────────────────────────────────────
 #  VALIDACION DE LIGAS CONTRA LA API
@@ -11360,7 +11788,8 @@ def _validar_ligas_config():
                 pass
 
             if estado == "ERROR":
-                dic_activo.pop(nombre, None)       # desactivar liga con ID equivocado
+                # dic_activo.pop(nombre, None)  # <-- COMENTA O ELIMINA ESTA LÍNEA para evitar que borre la liga
+                pass
             elif nombre not in dic_activo:
                 dic_activo[nombre] = cfg           # re-activar si ahora es valida
 
@@ -11489,6 +11918,8 @@ app.add_handler(CommandHandler("resumen_combinadas", resumen_combinadas))
 app.add_handler(CommandHandler("estado", estado))
 app.add_handler(CommandHandler("validar_ligas", validar_ligas))
 app.add_handler(CommandHandler("minitickets", minitickets))
+app.add_handler(CommandHandler("reparar_ligas", reparar_ligas))
+app.add_handler(CommandHandler("ligas_hoy", ligas_hoy))
 app.add_handler(CommandHandler("combinada_manana", combinada_manana))
 app.add_handler(CommandHandler("comb3_manana", comb3_manana))
 app.add_handler(CommandHandler("comb4_manana", comb4_manana))
@@ -11540,67 +11971,6 @@ async def _set_commands(app_instance):
     ]
     await app_instance.bot.set_my_commands(comandos)
 
-async def cmd_miniticket(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg = await update.message.reply_text("🎟️ *Buscando las mejores oportunidades para tu MiniTicket...*", parse_mode="Markdown")
-
-    # Lee los picks directamente desde tu archivo real PICKS_FILE
-    picks_hoy = leer_json(PICKS_FILE) 
-    if not picks_hoy:
-        picks_hoy = await ejecutar_escaneo_top_dia()
-
-    candidatos = [
-        p for p in picks_hoy 
-        if p.get("score", 0) >= 70 and p.get("prob", 0) >= 60 and p.get("cuota", 1.0) >= 1.30
-    ]
-    candidatos.sort(key=lambda x: (x["score"], x["prob"]), reverse=True)
-
-    if len(candidatos) < 2:
-        await msg.edit_text("⚠️ No hay suficientes partidos con alto valor hoy para estructurar un MiniTicket.")
-        return
-
-    ticket_picks = []
-    partidos_usados = set()
-    for item in candidatos:
-        partido_id = item.get("fixture_id") or item.get("partido")
-        if partido_id not in partidos_usados:
-            ticket_picks.append(item)
-            partidos_usados.add(partido_id)
-        if len(ticket_picks) == 3:  
-            break
-
-    cuota_total = 1.0
-    for p in ticket_picks:
-        cuota_total *= p.get("cuota", 1.0)
-    cuota_total = round(cuota_total, 2)
-    stake_sugerido = "2% del Bank (Stake Conservador)"
-
-    # --- GUARDADO AUTOMÁTICO EN EL HISTORIAL DE COMBINADAS ---
-    nuevo_miniticket = {
-        "fecha": fecha_hoy_peru(),
-        "cuota_total": cuota_total,
-        "picks": ticket_picks,
-        "estado": "pendiente"
-    }
-    lista_combinadas = leer_json(COMBINADAS_FILE) or []
-    lista_combinadas.append(nuevo_miniticket)
-    guardar_json_lista(COMBINADAS_FILE, lista_combinadas)
-
-    texto = "🔥 *HARRYNINE V14 - MINITICKET DEL DÍA* 🔥\n"
-    texto += "-----------------------------------------\n"
-    for idx, p in enumerate(ticket_picks, 1):
-        texto += f"📌 *Selección {idx}:* {p.get('partido', 'Partido')}\n"
-        texto += f"🎯 *Pick:* `{p.get('pick', 'N/A')}`\n"
-        texto += f"📊 *Probabilidad:* {p.get('prob', 0)}% | *Score:* {p.get('score', 0)}/100\n"
-        texto += f"💡 *Cuota estimada:* `{p.get('cuota', 1.0):.2f}`\n\n"
-
-    texto += "-----------------------------------------\n"
-    texto += f"📈 *CUOTA TOTAL COMBINADA:* `{cuota_total:.2f}`\n"
-    texto += f"💰 *Gestión de Riesgo:* {stake_sugerido}\n"
-    texto += "-----------------------------------------\n"
-    texto += "_✅ MiniTicket guardado automáticamente en el historial._"
-
-    await msg.edit_text(texto, parse_mode="Markdown")    
-
 # Registrar comandos via post_init usando el job_queue al arrancar
 async def _registrar_comandos_bot(context):
     from telegram import BotCommand
@@ -11646,7 +12016,9 @@ async def _registrar_comandos_bot(context):
         BotCommand("resumen_combinadas",         "Resumen diario de combinadas"),
         BotCommand("estado",                     "Dashboard rapido del dia"),
         BotCommand("validar_ligas",              "Verifica que los IDs de ligas sean correctos"),
-        BotCommand("minitickets",                "Minitickets del dia — picks 9.5+ riesgo 1"),
+        BotCommand("minitickets",                "Genera minitickets (hoy | nuevo | manana)"),
+        BotCommand("ligas_hoy",                  "Ligas que entran hoy y sus IDs"),
+        BotCommand("reparar_ligas",              "Corrige ligas mal etiquetadas en picks"),
         BotCommand("combinada_manana",           "Combinada 2.5x+ de manana"),
         BotCommand("comb3_manana",               "Combinada 3x+ de manana"),
         BotCommand("comb4_manana",               "Combinada 4x+ de manana"),
