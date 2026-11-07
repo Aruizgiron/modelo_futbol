@@ -254,9 +254,15 @@ def agregar_json(path, item):
 
 
 def fecha_peru_obj():
-    from datetime import timezone, timedelta as _td
-    return datetime.now(timezone.utc).replace(tzinfo=None) - _td(hours=5)
-
+    from datetime import datetime
+    try:
+        from zoneinfo import ZoneInfo
+        # Zona horaria exacta para Perú de forma automática
+        return datetime.now(ZoneInfo("America/Lima")).replace(tzinfo=None)
+    except Exception:
+        # Fallback de respaldo por seguridad
+        from datetime import timezone, timedelta as _td
+        return datetime.now(timezone.utc).replace(tzinfo=None) - _td(hours=5)
 
 def fecha_hoy_peru():
     return fecha_peru_obj().strftime("%Y-%m-%d")
@@ -443,7 +449,7 @@ def mercado_categoria(jugada):
         return "Goles totales"
     if "Ambos marcan" in jugada:
         return "Ambos marcan"
-    if "1X" in jugada or "X2" in jugada:
+    if any(x in jugada.lower () for x in ["1x", "x2", "12", "doble oportunidad"]):
         return "Doble oportunidad"
     return "Otro"
 
@@ -594,7 +600,7 @@ def obtener_recomendaciones(home_general, away_general, home_home, away_away):
         score_under += 2
 
     if score_under >= 7:
-        prob = min(91, 66 + score_under * 2)
+        prob = min(91, 66 + score_under * 1.5)
         add_pick(
             "Under 3.5 goles",
             prob,
@@ -620,7 +626,7 @@ def obtener_recomendaciones(home_general, away_general, home_home, away_away):
         score_over15 += 2
 
     if score_over15 >= 7:
-        prob = min(90, 65 + score_over15 * 2)
+        prob = min(90, 65 + score_over15 * 1.5)
         add_pick(
             "Over 1.5 goles",
             prob,
@@ -644,7 +650,7 @@ def obtener_recomendaciones(home_general, away_general, home_home, away_away):
         score_over25 += 2
 
     if score_over25 >= 7:
-        prob = min(83, 56 + score_over25 * 2)
+        prob = min(83, 56 + score_over25 * 1.5)
         add_pick(
             "Over 2.5 goles",
             prob,
@@ -666,7 +672,7 @@ def obtener_recomendaciones(home_general, away_general, home_home, away_away):
         score_btts += 2
 
     if score_btts >= 7:
-        prob = min(81, 56 + score_btts * 2)
+        prob = min(81, 56 + score_btts * 1.5)
         add_pick(
             "Ambos marcan - Sí",
             prob,
@@ -1368,16 +1374,29 @@ def preparar_analisis(fixture_id, incluir_odds=False, incluir_contexto=False):
     }
 
 
-def guardar_pick_automatico(data):
-    if not data or not data.get("recomendaciones"):
+def guardar_pick_automatico(data: dict):
+    if not data:
         return
 
-    top = data["recomendaciones"][0]
+    # Buscar recomendaciones con flexibilidad total
+    rec = data.get("recomendaciones") or data.get("recomendacion") or data.get("picks")
+    
+    if not rec:
+        # Si no viene en lista, intentamos armarlo con los datos directos del diccionario
+        if data.get("jugada") and data.get("prob"):
+            top = data
+        else:
+            return
+    else:
+        top = rec[0] if isinstance(rec, list) and len(rec) > 0 else rec
+        if not top:
+            return
+
     picks = leer_json(PICKS_FILE)
 
     for p in picks:
         if (
-            str(p.get("fixture_id")) == str(data["fixture_id"])
+            str(p.get("fixture_id")) == str(data.get("fixture_id"))
             and p.get("jugada") == top["jugada"]
         ):
             p["fecha_consulta"] = fecha_hora_peru()
@@ -1532,8 +1551,8 @@ def actualizar_resultados_automaticos():
         if status not in ["FT", "AET", "PEN"]:
             continue
 
-        gh = fixture["goals"]["home"]
-        ga = fixture["goals"]["away"]
+        gh_ht = fixture.get("score", {}).get("halftime", {}).get("home")
+        ga_ht = fixture.get("score", {}).get("halftime", {}).get("away")
 
         if gh is None or ga is None:
             continue
@@ -1589,14 +1608,24 @@ def actualizar_resultados_automaticos():
 
         jugada_lower = jugada.lower()
 
+        # --- Selección inteligente de goles (HT vs FT) para evitar el Bug 6 ---
+        if "ht" in jugada_lower or "primer tiempo" in jugada_lower:
+            g_local = gh_ht if gh_ht is not None else gh
+            g_visita = ga_ht if ga_ht is not None else ga
+        else:
+            g_local = gh
+            g_visita = ga
+
+        total_eval = (g_local + g_visita) if (g_local is not None and g_visita is not None) else total
+
         # ── Goles ────────────────────────────────────────────────────────
         if "under" in jugada_lower and "gol" in jugada_lower:
             linea = _linea(jugada)
-            acierto = total < linea if linea is not None else None
+            acierto = total_eval < linea if linea is not None else None
 
         elif "over" in jugada_lower and "gol" in jugada_lower:
             linea = _linea(jugada)
-            acierto = total > linea if linea is not None else None
+            acierto = total_eval > linea if linea is not None else None
 
         elif "ambos marcan" in jugada_lower or "btts" in jugada_lower:
             if "no" in jugada_lower:
@@ -1606,21 +1635,37 @@ def actualizar_resultados_automaticos():
 
         # ── Corners ──────────────────────────────────────────────────────
         elif "corner" in jugada_lower and "over" in jugada_lower:
+            if corners_total is None:
+                p["estado"] = "pendiente_manual"
+                cambios += 1
+                continue
             linea = _linea(jugada.split("Over")[-1])
-            acierto = corners_total is not None and corners_total > linea if linea is not None else None
+            acierto = corners_total > linea if linea is not None else None
 
         elif "corner" in jugada_lower and "under" in jugada_lower:
+            if corners_total is None:
+                p["estado"] = "pendiente_manual"
+                cambios += 1
+                continue
             linea = _linea(jugada.split("Under")[-1])
-            acierto = corners_total is not None and corners_total < linea if linea is not None else None
+            acierto = corners_total < linea if linea is not None else None
 
         # ── Tarjetas ─────────────────────────────────────────────────────
         elif "tarjeta" in jugada_lower and "over" in jugada_lower:
+            if tarjetas_total is None:
+                p["estado"] = "pendiente_manual"
+                cambios += 1
+                continue
             linea = _linea(jugada.split("Over")[-1])
-            acierto = tarjetas_total is not None and tarjetas_total > linea if linea is not None else None
+            acierto = tarjetas_total > linea if linea is not None else None
 
         elif "tarjeta" in jugada_lower and "under" in jugada_lower:
+            if tarjetas_total is None:
+                p["estado"] = "pendiente_manual"
+                cambios += 1
+                continue
             linea = _linea(jugada.split("Under")[-1])
-            acierto = tarjetas_total is not None and tarjetas_total < linea if linea is not None else None
+            acierto = tarjetas_total < linea if linea is not None else None
 
         # ── Resultado ────────────────────────────────────────────────────
         elif "1x" in jugada_lower:
@@ -5212,6 +5257,8 @@ def _guardar_snapshot_aprendizaje():
 
 def _cuota_segura(pick):
     """Extrae la cuota de un pick de forma segura, tolerando None, 0 y strings."""
+    if not pick:
+        return 1.0
     for campo in ("cuota", "cuota_minima"):
         val = pick.get(campo)
         if val is None:
@@ -5222,7 +5269,7 @@ def _cuota_segura(pick):
                 return f
         except (ValueError, TypeError):
             continue
-    return 0.0
+    return 1.0
 
 
 def _leer_bank_acumulado():
@@ -5377,7 +5424,7 @@ def _pick_valido_para_combinada(pick):
     liga_id = int(pick.get("league_id", 0) or 0)
 
     # Excluir ligas con alta variabilidad
-    if league in LIGAS_EXCLUIDAS_COMBINADAS:
+    if any(exc.lower() in league.lower() for exc in LIGAS_EXCLUIDAS_COMBINADAS):
         return False
 
     # Excluir ligas africanas
@@ -10866,15 +10913,15 @@ async def _job_automatico_medianoche(context):
     ligas_todas.update(SUDAMERICA_LEAGUES)
     ligas_todas.update(LIGAS_NOCTURNAS)
 
-    partidos_manana = []
+    partidos_hoy = []
     for nombre_liga, cfg in ligas_todas.items():
         try:
             fx = api_get(
-                f"/fixtures?league={cfg['id']}&season={cfg['season']}&date={manana}",
+                f"/fixtures?league={cfg['id']}&season={cfg['season']}&date={hoy}",
                 use_cache=False
             )
             for m in (fx or []):
-                partidos_manana.append({
+                partidos_hoy.append({
                     "id": m["fixture"]["id"],
                     "home": m["teams"]["home"]["name"],
                     "away": m["teams"]["away"]["name"],
@@ -10882,7 +10929,7 @@ async def _job_automatico_medianoche(context):
                     "league_id": cfg["id"],
                     "country": cfg.get("country",""),
                     "hour": hora_peru(m["fixture"]["date"]),
-                    "fecha": manana,
+                    "fecha": hoy,
                 })
         except Exception:
             continue
@@ -11493,6 +11540,67 @@ async def _set_commands(app_instance):
     ]
     await app_instance.bot.set_my_commands(comandos)
 
+async def cmd_miniticket(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = await update.message.reply_text("🎟️ *Buscando las mejores oportunidades para tu MiniTicket...*", parse_mode="Markdown")
+
+    # Lee los picks directamente desde tu archivo real PICKS_FILE
+    picks_hoy = leer_json(PICKS_FILE) 
+    if not picks_hoy:
+        picks_hoy = await ejecutar_escaneo_top_dia()
+
+    candidatos = [
+        p for p in picks_hoy 
+        if p.get("score", 0) >= 70 and p.get("prob", 0) >= 60 and p.get("cuota", 1.0) >= 1.30
+    ]
+    candidatos.sort(key=lambda x: (x["score"], x["prob"]), reverse=True)
+
+    if len(candidatos) < 2:
+        await msg.edit_text("⚠️ No hay suficientes partidos con alto valor hoy para estructurar un MiniTicket.")
+        return
+
+    ticket_picks = []
+    partidos_usados = set()
+    for item in candidatos:
+        partido_id = item.get("fixture_id") or item.get("partido")
+        if partido_id not in partidos_usados:
+            ticket_picks.append(item)
+            partidos_usados.add(partido_id)
+        if len(ticket_picks) == 3:  
+            break
+
+    cuota_total = 1.0
+    for p in ticket_picks:
+        cuota_total *= p.get("cuota", 1.0)
+    cuota_total = round(cuota_total, 2)
+    stake_sugerido = "2% del Bank (Stake Conservador)"
+
+    # --- GUARDADO AUTOMÁTICO EN EL HISTORIAL DE COMBINADAS ---
+    nuevo_miniticket = {
+        "fecha": fecha_hoy_peru(),
+        "cuota_total": cuota_total,
+        "picks": ticket_picks,
+        "estado": "pendiente"
+    }
+    lista_combinadas = leer_json(COMBINADAS_FILE) or []
+    lista_combinadas.append(nuevo_miniticket)
+    guardar_json_lista(COMBINADAS_FILE, lista_combinadas)
+
+    texto = "🔥 *HARRYNINE V14 - MINITICKET DEL DÍA* 🔥\n"
+    texto += "-----------------------------------------\n"
+    for idx, p in enumerate(ticket_picks, 1):
+        texto += f"📌 *Selección {idx}:* {p.get('partido', 'Partido')}\n"
+        texto += f"🎯 *Pick:* `{p.get('pick', 'N/A')}`\n"
+        texto += f"📊 *Probabilidad:* {p.get('prob', 0)}% | *Score:* {p.get('score', 0)}/100\n"
+        texto += f"💡 *Cuota estimada:* `{p.get('cuota', 1.0):.2f}`\n\n"
+
+    texto += "-----------------------------------------\n"
+    texto += f"📈 *CUOTA TOTAL COMBINADA:* `{cuota_total:.2f}`\n"
+    texto += f"💰 *Gestión de Riesgo:* {stake_sugerido}\n"
+    texto += "-----------------------------------------\n"
+    texto += "_✅ MiniTicket guardado automáticamente en el historial._"
+
+    await msg.edit_text(texto, parse_mode="Markdown")    
+
 # Registrar comandos via post_init usando el job_queue al arrancar
 async def _registrar_comandos_bot(context):
     from telegram import BotCommand
@@ -11561,3 +11669,4 @@ async def _registrar_comandos_bot(context):
 app.job_queue.run_once(_registrar_comandos_bot, when=3)
 app.job_queue.run_once(_job_validar_ligas_inicio, when=10)
 app.run_polling()
+
