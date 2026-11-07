@@ -11,6 +11,7 @@ import requests
 import os
 import json
 import time
+import asyncio
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -2535,7 +2536,7 @@ def analizar_live_fixture(fixture_id):
         }
 
     stats = extraer_stats_live(
-        api_get(f"/fixtures/statistics?fixture={fixture_id}", use_cache=False)
+        api_get(f"/fixtures/statistics?fixture={fixture_id}", use_cache=True, ttl=45)
     )
 
     hs = stats.get(home, {})
@@ -6757,7 +6758,7 @@ def generar_pdf_rendimiento(datos):
     # ── ANALISIS DE EDGE VS PINNACLE ─────────────────────────────────
     story.append(subtitulo("9. Analisis de Valor vs Pinnacle (Edge)"))
     try:
-        picks_con_edge = [p for p in picks_rend_all
+        picks_con_edge = [p for p in leer_json(PICKS_FILE)
                          if (p.get("fecha_partido") or p.get("fecha",""))[:7] == f"{anio}-{mes:02d}"
                          and p.get("edge") is not None
                          and p.get("estado","").lower() in ("acierto","fallo")]
@@ -7984,6 +7985,7 @@ def _obtener_picks_live_ahora(score_min=7.5, riesgo_max=2):
             # Verificar riesgo con excepcion para tarjetas
             if not _riesgo_ok(mejor, riesgo_max=riesgo_max):
                 continue
+            riesgo = float(mejor.get("riesgo", 10) or 10)
 
             cuota = _cuota_segura(mejor)
             if cuota < 1.20:
@@ -7999,7 +8001,7 @@ def _obtener_picks_live_ahora(score_min=7.5, riesgo_max=2):
             jugada_invalida = False
 
             # Obtener stats actuales del partido
-            stats_check = api_get(f"/fixtures/statistics?fixture={fixture_id}", use_cache=False)
+            stats_check = api_get(f"/fixtures/statistics?fixture={fixture_id}", use_cache=True, ttl=45)
             corners_actuales = 0
             tarjetas_actuales = 0
             if stats_check:
