@@ -11,7 +11,6 @@ import requests
 import os
 import json
 import time
-import asyncio
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -62,33 +61,26 @@ COMBINADAS_FILE = _tmp_path("combinadas.json")
 APRENDIZAJE_FILE = _tmp_path("aprendizaje.json")
 ESCALERA_FILE = _tmp_path("escalera.json")
 BANK_ACUMULADO_FILE = _tmp_path("bank_acumulado.json")
-# Suscriptores a alertas live. Un solo job global atiende a todos: asi el
-# consumo de API es constante con 1 o con 30 usuarios suscritos.
-ALERTAS_SUBS_FILE = _tmp_path("alertas_suscriptores.json")
-# Chat IDs que reciben alarmas de combinadas — persistidos para sobrevivir reinicios
-CHAT_IDS_ALARMAS_FILE = _tmp_path("chat_ids_alarmas.json")
 
 CACHE = {}
 CACHE_TTL = 300
-CACHE_MAX_SIZE = 500   # maximo de entradas; purga las mas viejas al superarlo
 ALERTED_LIVE = set()
 
 EUROPA_LEAGUES = {
-    "Premier League": {"id": 39, "season": 2026, "country": "England"},
-    "Championship": {"id": 40, "season": 2026, "country": "England"},
-    "Bundesliga": {"id": 78, "season": 2026, "country": "Germany"},
-    "Bundesliga 2": {"id": 79, "season": 2026, "country": "Germany"}, 
-    "Serie A Italia": {"id": 135, "season": 2026, "country": "Italy"},
-    "Serie B Italia": {"id": 136, "season": 2026, "country": "Italy"},
-    "LaLiga": {"id": 140, "season": 2026, "country": "Spain"},
-    "Segunda España": {"id": 141, "season": 2026, "country": "Spain"},
-    "Ligue 1": {"id": 61, "season": 2026, "country": "France"},
-    "Ligue 2": {"id": 62, "season": 2026, "country": "France"}, 
-    "Eredivisie": {"id": 88, "season": 2026, "country": "Netherlands"},
+    "Premier League": {"id": 39, "season": 2025, "country": "England"},
+    "Bundesliga": {"id": 78, "season": 2025, "country": "Germany"},
+    "Bundesliga 2": {"id": 79, "season": 2025, "country": "Germany"},
+    "Serie A Italia": {"id": 135, "season": 2025, "country": "Italy"},
+    "Serie B Italia": {"id": 136, "season": 2025, "country": "Italy"},
+    "LaLiga": {"id": 140, "season": 2025, "country": "Spain"},
+    "Segunda España": {"id": 141, "season": 2025, "country": "Spain"},
+    "Ligue 1": {"id": 61, "season": 2025, "country": "France"},
+    "Ligue 2": {"id": 62, "season": 2025, "country": "France"},
+    "Eredivisie": {"id": 88, "season": 2025, "country": "Netherlands"},
     "Eliteserien": {"id": 103, "season": 2026, "country": "Norway"},
-    "Bélgica Pro League": {"id": 144, "season": 2026, "country": "Belgium"},
-    "Süper Lig": {"id": 203, "season": 2026, "country": "Turkey"},
-    "Primeira Liga": {"id": 94, "season": 2026, "country": "Portugal"},
+    "Bélgica Pro League": {"id": 144, "season": 2025, "country": "Belgium"},
+    "Super Lig": {"id": 203, "season": 2025, "country": "Turkey"},
+    "Primeira Liga": {"id": 94, "season": 2025, "country": "Portugal"},
     "Allsvenskan": {"id": 113, "season": 2026, "country": "Sweden"},
 }
 
@@ -100,223 +92,46 @@ SUDAMERICA_LEAGUES = {
     "Chile Primera División": {"id": 265, "season": 2026, "country": "Chile"},
     "Colombia Primera A": {"id": 239, "season": 2026, "country": "Colombia"},
     "Uruguay Primera División": {"id": 268, "season": 2026, "country": "Uruguay"},
-    "Paraguay Primera División": {"id": 284, "season": 2026, "country": "Paraguay"},
+    "Paraguay Primera División": {"id": 250, "season": 2026, "country": "Paraguay"},
     "Ecuador Liga Pro": {"id": 242, "season": 2026, "country": "Ecuador"},
     "Bolivia División Profesional": {"id": 344, "season": 2026, "country": "Bolivia"},
-    "Venezuela Primera División": {"id": 288, "season": 2026, "country": "Venezuela"},
+    "Venezuela Primera División": {"id": 299, "season": 2026, "country": "Venezuela"},
     "Copa Libertadores": {"id": 13, "season": 2026, "country": "World"},
     "Copa Sudamericana": {"id": 11, "season": 2026, "country": "World"},
+    "MLS": {"id": 253, "season": 2026, "country": "USA"},
 }
 
-OTRAS_LEAGUES = {
-    "MLS": {"id": 253, "season": 2026, "country": "USA"},
+# Ligas nocturnas — para analizar la noche anterior con /combinada_manana
+LIGAS_NOCTURNAS = {
     "J-League": {"id": 98, "season": 2026, "country": "Japan"},
 }
 
-# ── SELECCIONES NACIONALES Y MUNDIAL ────────────────────────────────────
-# Incluidas en analizar_all y generar_top con motor analizar_seleccion.
-# El Mundial 2026 arranca el 11 de junio (league=1, season=2026).
-# ID=10: Friendlies internacionales de selecciones mayores (Portugal vs Chile, etc.)
-# ID=667: Friendlies de clubes (NO de selecciones — excluido)
-SELECCIONES_LEAGUES = {
-    "FIFA World Cup 2026":            {"id": 1,   "season": 2026, "country": "World"},
-    "Friendlies Internacionales":     {"id": 10,  "season": 2026, "country": "World"},
-    "Friendlies Women":               {"id": 666, "season": 2026, "country": "World"},
-    "WC Qualif. CONMEBOL":            {"id": 35,  "season": 2026, "country": "World"},
-    "WC Qualif. UEFA":                {"id": 32,  "season": 2026, "country": "World"},
-    "WC Qualif. CONCACAF":            {"id": 30,  "season": 2026, "country": "World"},
-    "WC Qualif. AFC":                 {"id": 36,  "season": 2026, "country": "World"},
-    "WC Qualif. CAF":                 {"id": 29,  "season": 2026, "country": "World"},
-    "UEFA U19 Championship Qual":     {"id": 893, "season": 2026, "country": "World"},
-    "Baltic Cup":                     {"id": 849, "season": 2026, "country": "World"},
+# Ligas excluidas de combinadas por alta variabilidad
+LIGAS_EXCLUIDAS_COMBINADAS = {
+    "Championship",           # Alta variabilidad — datos confirman multiples fallos
+    "Serie B Italia",         # Segunda division — menos predecible
+    "Ligue 2",                # Segunda division
+    "Segunda España",         # Segunda division
+    "Bundesliga 2",           # Segunda division
 }
 
-
-# ══════════════════════════════════════════════════════════════════════
-# RECALIBRACION V14 — capa de correccion basada en datos reales
-# (279-491 picks cerrados, periodo 16-23 mayo 2026).
-# El motor de scoring usa reglas fijas; estas funciones corrigen score y
-# probabilidad para que reflejen la efectividad REAL medida, no la teorica.
-# ══════════════════════════════════════════════════════════════════════
-
-# Cuota minima exigida a cualquier pick individual. Por debajo de esto el
-# pick no es rentable aunque acierte: 80% de acierto necesita >=1.25 solo
-# para break-even; 1.50 da colchon ante error de calibracion.
-CUOTA_MINIMA_PICK = 1.50
-
-# Cuota minima de cada eslabon dentro de una combinada (coherente con el
-# filtro de picks individuales).
-CUOTA_MINIMA_ESLABON = 1.50
-
-# Rango de cuota total aceptable para una combinada.
-CUOTA_COMBINADA_MIN = 2.50
-CUOTA_COMBINADA_MAX = 4.50
-
-# Umbrales minimos por eslabon de combinada (sobre valores recalibrados).
-COMB_PROB_MIN = 80.0
-COMB_SCORE_MIN = 7.5
-# Over 1.5 es el eslabon que mas rompe combinadas (0-0 / 1-0). Se le exige
-# un score recalibrado mas alto que al resto.
-COMB_SCORE_MIN_OVER15 = 8.0
-
-# ── MODO CONSERVADOR V14.2 ─────────────────────────────────────────────
-# Maximo de picks diarios (solo los mejores pasan).
-MAX_PICKS_DIA = 8
-# Mercados permitidos en modo conservador.
-MERCADOS_CONSERVADOR = {"Goles totales", "Doble oportunidad"}
-# Score minimo dinamico segun cuota: mas cuota exige mas conviccion.
-SCORE_MIN_POR_CUOTA = [
-    (1.50, 2.20, 7.5),   # cuota 1.50-2.20 -> score >= 7.5
-    (2.21, 3.00, 8.0),   # cuota 2.21-3.00 -> score >= 8.0
-    (3.01, 99.0, 8.5),   # cuota 3.01+     -> score >= 8.5
-]
-# Freno de bank: si el bank cae por debajo de este % del inicial, no se generan picks.
-BANK_FRENO_PCT = 0.35   # 35% -> S/175 sobre S/500 inicial
-# Racha de fallos consecutivos que dispara alerta.
-RACHA_FALLOS_ALERTA = 5
-
-# Multiplicador de score por liga. Medido sobre efectividad real por liga.
-# Ligas con muestra < 10 picks quedan neutras (1.00) por falta de datos.
-MULTIPLICADOR_LIGA = {
-    "Premier League": 1.05,   # 87.9% (n=33)
-    "La Liga": 0.70,          # 42.1% (n=19)
-    "LaLiga": 0.70,           # alias del mismo torneo
-    "Süper Lig": 0.80,        # 50.0% (n=12)
-    "Super Lig": 0.80,        # alias sin diacritico
-    "2. Bundesliga": 0.88,    # 63.2% (n=19)
-    "Bundesliga 2": 0.88,     # alias
-    "Ligue 1": 0.88,          # 63.2% (n=19)
-    "Serie A": 0.92,          # 67.7% (n=31)
-    "Serie A Italia": 0.92,   # alias
+# Ligas africanas — excluidas de combinadas por baja cobertura Pinnacle
+PAISES_EXCLUIDOS_COMBINADAS = {
+    "South Africa", "Nigeria", "Ghana", "Kenya", "Tanzania",
+    "Cameroon", "Ivory Coast", "Senegal", "Egypt", "Morocco",
+    "Tunisia", "Algeria", "Zimbabwe", "Zambia", "Uganda",
 }
 
-
-def recalibrar_probabilidad(prob):
-    """
-    Corrige la probabilidad declarada hacia la efectividad real medida.
-    Tabla corregida V14.2: monotonica (a mayor prob declarada -> mayor recalibrada).
-    Eliminada la anomalia 70-74% -> 88% que promovia picks debiles.
-    """
-    try:
-        prob = float(prob)
-    except (ValueError, TypeError):
-        return prob
-    if prob >= 90:
-        return 88.0
-    if prob >= 85:
-        return 84.0
-    if prob >= 80:
-        return 78.0
-    if prob >= 75:
-        return 72.0
-    if prob >= 70:
-        return 66.0
-    return prob
-
-
-def recalibrar_score(score):
-    """
-    Re-mapea el score a la efectividad real.
-    Tabla corregida V14.2: monotonica (a mayor score -> mayor recalibrado).
-    Eliminada la anomalia 7.0-7.4 -> 8.5 que promovia picks con score bajo.
-    """
-    try:
-        score = float(score)
-    except (ValueError, TypeError):
-        return score
-    if score >= 9.5:
-        return 9.5
-    if score >= 9.0:
-        return 8.5
-    if score >= 8.5:
-        return 8.0
-    if score >= 8.0:
-        return 7.5
-    if score >= 7.5:
-        return 7.0
-    if score >= 7.0:
-        return 6.5
-    return 5.0
-
-
-def multiplicador_liga(liga):
-    """Retorna el factor de ajuste de score para una liga dada."""
-    if not liga:
-        return 1.0
-    return MULTIPLICADOR_LIGA.get(liga, 1.0)
-
-
-def aplicar_recalibracion(rec, liga=None):
-    """
-    Aplica la recalibracion completa a una recomendacion (dict con claves
-    prob/score). Guarda los valores originales y deja los recalibrados como
-    los oficiales. Idempotente: si ya fue recalibrada, no la altera.
-    """
-    if not rec or rec.get("_recalibrado"):
-        return rec
-
-    prob_orig = rec.get("prob", rec.get("probabilidad"))
-    score_orig = rec.get("score")
-
-    if prob_orig is not None:
-        prob_nueva = recalibrar_probabilidad(prob_orig)
-        rec["prob_original"] = prob_orig
-        rec["prob"] = prob_nueva
-        if "probabilidad" in rec:
-            rec["probabilidad"] = prob_nueva
-
-    if score_orig is not None:
-        score_nuevo = recalibrar_score(score_orig)
-        score_nuevo = round(score_nuevo * multiplicador_liga(liga), 1)
-        score_nuevo = clamp(score_nuevo, 0, 10)
-        rec["score_original"] = score_orig
-        rec["score"] = score_nuevo
-        # La etiqueta de confianza debe reflejar el score recalibrado.
-        if "confianza" in rec:
-            rec["confianza"] = etiqueta_confianza(score_nuevo)
-
-    # La cuota minima teorica depende de la probabilidad: si la prob
-    # cambio al recalibrar, se recalcula para que sea coherente.
-    if rec.get("prob") is not None and rec.get("riesgo") is not None:
-        nueva_cm = cuota_minima(rec["prob"], rec["riesgo"])
-        if nueva_cm:
-            rec["cuota_minima"] = nueva_cm
-
-    rec["_recalibrado"] = True
-    return rec
-
-
-def umbral_prob_desde_score_legado(score_minimo):
-    """
-    Traduce umbrales de score a umbrales de probabilidad recalibrada.
-    V14.2: el score vuelve a ser el criterio principal. La prob es desempate.
-      score_minimo >= 9.0 -> elite  -> prob recalibrada >= 80%
-      score_minimo >= 7.5 -> normal -> prob recalibrada >= 66%
-    """
-    try:
-        s = float(score_minimo)
-        if s >= 9.0:
-            return 80.0
-        return 66.0
-    except (ValueError, TypeError):
-        return 66.0
-
-
-def cuota_pick_suficiente(rec):
-    """
-    True si el pick supera la cuota minima. Usa la mejor cuota disponible
-    (API/Pinnacle si existe, si no la cuota minima calculada).
-    Si no hay ninguna cuota, se rechaza por prudencia.
-    """
-    cuota = (rec.get("cuota_api")
-             or rec.get("cuota")
-             or rec.get("cuota_minima")
-             or 0)
-    try:
-        cuota = float(cuota)
-    except (ValueError, TypeError):
-        return False
-    return cuota >= CUOTA_MINIMA_PICK
+# Top 6 de cada liga principal — excluir enfrentamientos directos de combinadas
+TOP6_LIGAS = {
+    39: ["Manchester City", "Arsenal", "Liverpool", "Chelsea", "Manchester United", "Tottenham"],
+    78: ["Bayern Munich", "Borussia Dortmund", "RB Leipzig", "Bayer Leverkusen", "Eintracht Frankfurt", "Stuttgart"],
+    135: ["Inter", "Juventus", "AC Milan", "Napoli", "Lazio", "Roma", "Atalanta"],
+    140: ["Real Madrid", "Barcelona", "Atletico Madrid", "Sevilla", "Real Sociedad", "Athletic Club"],
+    61: ["Paris Saint Germain", "Marseille", "Monaco", "Lyon", "Lille", "Nice"],
+    128: ["River Plate", "Boca Juniors", "Racing Club", "Independiente", "San Lorenzo", "Huracan"],
+    71: ["Flamengo", "Palmeiras", "Atletico Mineiro", "Gremio", "Internacional", "Corinthians"],
+}
 
 
 def api_get(endpoint, use_cache=True, ttl=CACHE_TTL):
@@ -341,17 +156,6 @@ def api_get(endpoint, use_cache=True, ttl=CACHE_TTL):
         data = r.json().get("response", [])
 
         if use_cache:
-            # Purgar entradas viejas si el cache supera el limite
-            if len(CACHE) >= CACHE_MAX_SIZE:
-                now2 = time.time()
-                viejos = [k for k, (t, _) in CACHE.items() if now2 - t > CACHE_TTL]
-                for k in viejos:
-                    CACHE.pop(k, None)
-                # Si sigue lleno, eliminar la mitad mas antigua
-                if len(CACHE) >= CACHE_MAX_SIZE:
-                    ordenados = sorted(CACHE.items(), key=lambda x: x[1][0])
-                    for k, _ in ordenados[:CACHE_MAX_SIZE // 2]:
-                        CACHE.pop(k, None)
             CACHE[endpoint] = (now, data)
 
         return data
@@ -438,19 +242,8 @@ def leer_json(path):
 
 
 def guardar_json_lista(path, data):
-    """Escritura atomica: escribe a .tmp y luego renombra para evitar
-    corrupcion si el proceso se interrumpe a mitad de escritura."""
-    path_tmp = path + ".tmp"
-    try:
-        with open(path_tmp, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2, ensure_ascii=False)
-        os.replace(path_tmp, path)
-    except Exception as e:
-        print(f"ERROR guardar_json_lista({path}): {e}")
-        try:
-            os.remove(path_tmp)
-        except Exception:
-            pass
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2, ensure_ascii=False)
 
 
 def agregar_json(path, item):
@@ -469,9 +262,6 @@ def fecha_hoy_peru():
 
 def fecha_manana_peru():
     return (fecha_peru_obj() + timedelta(days=1)).strftime("%Y-%m-%d")
-
-def fecha_ayer_peru():
-    return (fecha_peru_obj() - timedelta(days=1)).strftime("%Y-%m-%d")
 
 def fecha_hora_peru():
     return fecha_peru_obj().strftime("%Y-%m-%d %H:%M:%S")
@@ -548,9 +338,6 @@ def clamp(valor, minimo, maximo):
 def cuota_justa(probabilidad):
     if probabilidad <= 0:
         return None
-    # Si la probabilidad viene como decimal (0-1), convertir a porcentaje
-    if probabilidad < 1:
-        probabilidad = probabilidad * 100
     return round(100 / probabilidad, 2)
 
 
@@ -649,18 +436,14 @@ def porcentaje(v):
 
 
 def mercado_categoria(jugada):
-    # El orden importa: "Tarjetas Over 3.5" contiene "Over", asi que
-    # Tarjetas y Corners deben evaluarse ANTES que Over/Under.
     if "Corners" in jugada:
         return "Corners"
-    if "Tarjeta" in jugada:
-        return "Tarjetas"
+    if "Over" in jugada or "Under" in jugada:
+        return "Goles totales"
     if "Ambos marcan" in jugada:
         return "Ambos marcan"
     if "1X" in jugada or "X2" in jugada:
         return "Doble oportunidad"
-    if "Over" in jugada or "Under" in jugada:
-        return "Goles totales"
     return "Otro"
 
 def calcular_forma(team_id, modo=None, last=10):
@@ -673,7 +456,6 @@ def calcular_forma(team_id, modo=None, last=10):
     over25 = 0
     under35 = 0
     btts = 0
-    rojas_total = 0
     forma = []
 
     for p in partidos:
@@ -704,27 +486,6 @@ def calcular_forma(team_id, modo=None, last=10):
         jugados += 1
         gf_total += gf
         gc_total += gc
-
-        # Tarjetas rojas del equipo en este partido
-        try:
-            fixture_id_p = p["fixture"]["id"]
-            stats = api_get(
-                f"/fixtures/statistics?fixture={fixture_id_p}",
-                use_cache=True, ttl=86400  # 24h cache para partidos pasados
-            )
-            if stats:
-                for team_data in stats:
-                    t_id = team_data.get("team", {}).get("id")
-                    if t_id != team_id:
-                        continue
-                    for item in team_data.get("statistics", []):
-                        if item.get("type") == "Red Cards":
-                            try:
-                                rojas_total += int(str(item.get("value") or 0))
-                            except Exception:
-                                pass
-        except Exception:
-            pass
 
         if gf > gc:
             forma.append("W")
@@ -757,147 +518,8 @@ def calcular_forma(team_id, modo=None, last=10):
         "over25": over25 / jugados,
         "under35": under35 / jugados,
         "btts": btts / jugados,
-        "forma": "".join(forma),
-        "rojas_prom": round(rojas_total / jugados, 2),
+        "forma": "".join(forma)
     }
-
-
-
-
-import math as _math_poisson
-
-# ── PERFIL DE GOLES POR LIGA ─────────────────────────────────────────────
-PERFIL_GOLES_LIGA = {
-    "Eredivisie": +0.08, "Jupiler Pro League": +0.07, "Belgian Pro League": +0.07,
-    "Austrian Bundesliga": +0.07, "Bundesliga": +0.05, "2. Bundesliga": +0.05,
-    "Bundesliga 2": +0.05, "Swedish Allsvenskan": +0.06, "Norwegian Eliteserien": +0.05,
-    "Premier League": +0.03, "Championship": +0.03,
-    "Ligue 1": -0.07, "La Liga": -0.05, "LaLiga": -0.05,
-    "Primeira Liga": -0.05, "Super Lig": -0.04, "Süper Lig": -0.04,
-    "Serie A": -0.03, "Friendlies": -0.05,
-    "Friendlies Internacionales": -0.05,
-    "World Friendlies Internacionales": -0.05,
-    "J-League": -0.02, "K League 1": -0.02,
-}
-
-
-def _ajuste_liga_goles(league):
-    """Retorna el ajuste de prob de goles para una liga dada."""
-    if not league:
-        return 0.0
-    for nombre, ajuste in PERFIL_GOLES_LIGA.items():
-        if nombre.lower() in league.lower():
-            return ajuste
-    return 0.0
-
-
-def _lam_partido(gf_home, gc_home, gf_away, gc_away, league=""):
-    """Calcula lambda total esperado del partido via Poisson."""
-    lam_h = max(0.3, (gf_home + gf_away) / 2 * 0.6 + (gc_home + gc_away) / 2 * 0.4)
-    lam_a = max(0.2, (gf_away + gf_home) / 2 * 0.5 + (gc_away + gc_home) / 2 * 0.5)
-    ajuste = _ajuste_liga_goles(league)
-    return (lam_h + lam_a) * (1 + ajuste)
-
-
-def prob_under35_poisson(gf_home, gc_home, gf_away, gc_away, league=""):
-    """Prob de Under 3.5 goles usando distribucion de Poisson."""
-    try:
-        lam = _lam_partido(gf_home, gc_home, gf_away, gc_away, league)
-        prob = sum(
-            (lam**k * _math_poisson.exp(-lam)) / _math_poisson.factorial(k)
-            for k in range(4)
-        )
-        return round(min(95.0, max(40.0, prob * 100)), 1)
-    except Exception:
-        return None
-
-
-def prob_over15_poisson(gf_home, gc_home, gf_away, gc_away, league=""):
-    """Prob de Over 1.5 goles usando distribucion de Poisson."""
-    try:
-        lam = _lam_partido(gf_home, gc_home, gf_away, gc_away, league)
-        prob = 1 - _math_poisson.exp(-lam) - lam * _math_poisson.exp(-lam)
-        return round(min(95.0, max(40.0, prob * 100)), 1)
-    except Exception:
-        return None
-
-
-def prob_under25_poisson(gf_home, gc_home, gf_away, gc_away, league=""):
-    """Prob de Under 2.5 goles usando distribucion de Poisson."""
-    try:
-        lam = _lam_partido(gf_home, gc_home, gf_away, gc_away, league)
-        prob = sum(
-            (lam**k * _math_poisson.exp(-lam)) / _math_poisson.factorial(k)
-            for k in range(3)
-        )
-        return round(min(92.0, max(35.0, prob * 100)), 1)
-    except Exception:
-        return None
-
-
-def _ajustar_prob_correlacion_mismo_partido(jugada1, jugada2, prob_conjunta_pct):
-    """
-    Ajusta la prob conjunta cuando dos mercados son del mismo partido.
-    La multiplicacion simple sobreestima porque los eventos no son independientes.
-    """
-    j1 = jugada1.lower()
-    j2 = jugada2.lower()
-    p = prob_conjunta_pct
-    if (("under 3.5" in j1 and "over 1.5" in j2) or
-            ("over 1.5" in j1 and "under 3.5" in j2)):
-        p = p * 0.92
-    elif (("under 3.5" in j1 and "over 2.5" in j2) or
-            ("over 2.5" in j1 and "under 3.5" in j2)):
-        p = p * 0.80
-    elif (("1x" in j1 or "x2" in j1) and "under" in j2):
-        p = p * 1.03
-    elif ("under" in j1 and ("1x" in j2 or "x2" in j2)):
-        p = p * 1.03
-    return round(min(95.0, p), 1)
-
-def calcular_prob_sin_roja(home_general, away_general, fase="group"):
-    """
-    Calcula la probabilidad de que el partido termine Sin Tarjeta Roja.
-    Usa el historial de rojas de ambos equipos (rojas_prom de calcular_forma).
-    Base estadistica: ~83% de partidos terminan sin roja en ligas normales.
-    Ajustes:
-      - Equipos con historial agresivo: baja prob
-      - Amistosos: sube prob (arbitros mas permisivos)
-      - Fases eliminatorias: baja prob (mas tension)
-    Devuelve probabilidad entre 60 y 95.
-    """
-    # Base estadistica general
-    prob_base = 83.0
-
-    # Ajuste por historial de rojas del local
-    rojas_home = float((home_general or {}).get("rojas_prom", 0.05) or 0.05)
-    rojas_away = float((away_general or {}).get("rojas_prom", 0.05) or 0.05)
-    rojas_prom = (rojas_home + rojas_away) / 2.0
-
-    # A mayor promedio de rojas, menor prob de partido limpio
-    # 0 rojas/partido → +5%, 0.2 rojas/partido → -10%, 0.5+ → -20%
-    if rojas_prom == 0:
-        ajuste_rojas = +5.0
-    elif rojas_prom <= 0.1:
-        ajuste_rojas = 0.0
-    elif rojas_prom <= 0.2:
-        ajuste_rojas = -8.0
-    elif rojas_prom <= 0.4:
-        ajuste_rojas = -15.0
-    else:
-        ajuste_rojas = -22.0
-
-    # Ajuste por fase del torneo
-    ajuste_fase = 0.0
-    if fase == "friendly":
-        ajuste_fase = +5.0   # arbitros mas permisivos en amistosos
-    elif fase in ("semi", "final"):
-        ajuste_fase = -8.0   # maxima tension
-    elif fase in ("quarter", "round_of_16"):
-        ajuste_fase = -5.0   # tension eliminatoria
-
-    prob_final = prob_base + ajuste_rojas + ajuste_fase
-    return round(max(60.0, min(95.0, prob_final)), 1)
 
 
 def bloque_stats(titulo, stats):
@@ -1029,10 +651,27 @@ def obtener_recomendaciones(home_general, away_general, home_home, away_away):
             score_over25
         )
 
-    # BTTS (Ambos marcan) ELIMINADO de la generacion: efectividad real
-    # 41.6% (101 picks). La variable `btts` se conserva mas arriba porque
-    # alimenta los scores de Under y Over 2.5; solo se elimina la emision
-    # del pick. BTTS tambien sigue excluido de combinadas y alertas.
+    score_btts = 0
+
+    if btts >= 0.70:
+        score_btts += 5
+    elif btts >= 0.60:
+        score_btts += 4
+
+    if base_home["gf_prom"] >= 1.0 and base_away["gf_prom"] >= 1.0:
+        score_btts += 3
+
+    if base_home["gc_prom"] >= 0.8 and base_away["gc_prom"] >= 0.8:
+        score_btts += 2
+
+    if score_btts >= 7:
+        prob = min(81, 56 + score_btts * 2)
+        add_pick(
+            "Ambos marcan - Sí",
+            prob,
+            "Ambos equipos tienen tendencia a marcar y también conceden ocasiones.",
+            score_btts
+        )
 
     recomendaciones.sort(key=lambda x: (x["score"], x["prob"]), reverse=True)
     return recomendaciones
@@ -1074,217 +713,8 @@ def guardar_snapshot_odds(fixture_id, jugada, cuota):
     return movimiento
 
 
-def _extraer_cuotas_1x2_pinnacle(odds):
-    """
-    Extrae las cuotas de Home, Draw, Away del mercado 1X2 de Pinnacle.
-    Devuelve dict {"Home": float, "Draw": float, "Away": float} o {} si no hay.
-    Usado para calcular Doble Oportunidad desde Pinnacle (que no tiene ese mercado).
-    """
-    PINNACLE_NAMES = {"Pinnacle", "Pinnacle Sports"}
-    WINNER_MARKETS = {"Match Winner", "1X2", "Match Result", "Full Time Result", "Home/Away"}
-    resultado = {}
-    for casa in odds:
-        for book in casa.get("bookmakers", []):
-            if book.get("name", "") not in PINNACLE_NAMES:
-                continue
-            for bet in book.get("bets", []):
-                if not any(m.lower() in bet.get("name", "").lower() for m in WINNER_MARKETS):
-                    continue
-                for value in bet.get("values", []):
-                    nombre = str(value.get("value", "")).strip()
-                    try:
-                        odd = float(value.get("odd"))
-                    except Exception:
-                        continue
-                    if nombre in ("Home", "1", "Home Team"):
-                        resultado["Home"] = odd
-                    elif nombre in ("Draw", "X", "Tie"):
-                        resultado["Draw"] = odd
-                    elif nombre in ("Away", "2", "Away Team"):
-                        resultado["Away"] = odd
-            if resultado:
-                return resultado
-    return resultado
-
-
-def _cuota_doble_oportunidad_pinnacle(odds, jugada):
-    """
-    Calcula la cuota equivalente de Doble Oportunidad desde el 1X2 de Pinnacle.
-    Pinnacle no ofrece mercado de Doble Oportunidad directamente.
-    Formula: cuota_DC = 1 / (1/cuota_A + 1/cuota_B)
-    Devuelve (cuota, "Pinnacle (calc DC)") o (None, None).
-    """
-    cuotas = _extraer_cuotas_1x2_pinnacle(odds)
-    if not cuotas:
-        return None, None
-    try:
-        if jugada == "1X":
-            if "Home" in cuotas and "Draw" in cuotas:
-                prob = (1 / cuotas["Home"]) + (1 / cuotas["Draw"])
-                return round(1 / prob, 3), "Pinnacle (DC calc)"
-        elif jugada == "X2":
-            if "Draw" in cuotas and "Away" in cuotas:
-                prob = (1 / cuotas["Draw"]) + (1 / cuotas["Away"])
-                return round(1 / prob, 3), "Pinnacle (DC calc)"
-        elif jugada == "12":
-            if "Home" in cuotas and "Away" in cuotas:
-                prob = (1 / cuotas["Home"]) + (1 / cuotas["Away"])
-                return round(1 / prob, 3), "Pinnacle (DC calc)"
-    except Exception:
-        pass
-    return None, None
-
-
-def _normalizar_jugada_para_matching(jugada):
-    """
-    Normaliza el texto de la jugada para el matching de cuotas.
-    Elimina sufijos de contexto que no forman parte del nombre del mercado:
-    ' live', ' restante', ' HT', ' HT Live', ' Live', etc.
-    Devuelve la jugada normalizada en lowercase para comparacion.
-    """
-    import re as _re_norm
-    jugada_norm = jugada.strip()
-    # Quitar sufijos contextuales (orden importa: mas especifico primero)
-    sufijos = [
-        r"\s+ht\s+live$", r"\s+ht$", r"\s+live$", r"\s+restante$",
-        r"\s+1t$", r"\s+2t$", r"\s+primer\s+tiempo$", r"\s+segundo\s+tiempo$",
-    ]
-    for suf in sufijos:
-        jugada_norm = _re_norm.sub(suf, "", jugada_norm, flags=_re_norm.IGNORECASE).strip()
-    return jugada_norm
-
-
-def buscar_cuota_live(fixture_id, jugada):
-    """
-    PUNTO 5: Busca la cuota REAL EN VIVO de una jugada usando el endpoint
-    /odds/live de api-sports. Las cuotas live cambian minuto a minuto, por
-    eso se usa un cache muy corto (45s) en lugar de los 600s del prematch.
-
-    A diferencia de buscar_mejor_cuota (que usa /odds = prematch y devuelve
-    cuotas estaticas de antes del partido), esta refleja el estado actual.
-
-    Devuelve (cuota, casa) o (None, None) si no hay cuota live disponible.
-    """
-    odds = api_get(f"/odds/live?fixture={fixture_id}", use_cache=True, ttl=45)
-    if not odds:
-        return None, None
-
-    PINNACLE_NAMES = {"Pinnacle", "Pinnacle Sports"}
-    CASA_PRIORIDAD = {
-        "Pinnacle": 1, "Pinnacle Sports": 1,
-        "Bet365": 2, "bet365": 2,
-        "William Hill": 3, "Betfair": 4,
-        "888Sport": 5, "Dafabet": 6,
-    }
-
-    jugada_norm = _normalizar_jugada_para_matching(jugada)
-    jugada_l = jugada_norm.lower()
-
-    mejor = None
-    mejor_book = None
-
-    for casa in odds:
-        # /odds/live tiene estructura: cada item con "odds" -> lista de mercados
-        bookmakers = casa.get("bookmakers", [])
-        if not bookmakers and casa.get("odds"):
-            # Estructura alternativa de /odds/live
-            bookmakers = [{"name": "Live", "bets": casa.get("odds", [])}]
-
-        for book in bookmakers:
-            book_name = book.get("name", "Live")
-            for bet in book.get("bets", book.get("odds", [])):
-                bet_name = bet.get("name", "") or bet.get("label", "")
-                for value in bet.get("values", bet.get("odds", [])):
-                    nombre = str(value.get("value", "") or value.get("name", ""))
-                    odd_raw = value.get("odd", value.get("value"))
-                    try:
-                        odd = float(odd_raw)
-                    except (ValueError, TypeError):
-                        continue
-
-                    match = False
-                    # Goles over/under
-                    if "over" in jugada_l and "gol" in jugada_l:
-                        try:
-                            linea = float(jugada_norm.split("Over")[-1].strip().split()[0])
-                        except Exception:
-                            linea = None
-                        if linea is not None and "over" in nombre.lower():
-                            import re as _re_l
-                            mnum = _re_l.search(r"(\d+\.?\d*)", nombre)
-                            if mnum and abs(float(mnum.group(1)) - linea) < 0.01:
-                                match = True
-                    elif "under" in jugada_l and "gol" in jugada_l:
-                        try:
-                            linea = float(jugada_norm.split("Under")[-1].strip().split()[0])
-                        except Exception:
-                            linea = None
-                        if linea is not None and "under" in nombre.lower():
-                            import re as _re_l2
-                            mnum2 = _re_l2.search(r"(\d+\.?\d*)", nombre)
-                            if mnum2 and abs(float(mnum2.group(1)) - linea) < 0.01:
-                                match = True
-                    # Corners / Tarjetas live
-                    elif ("corner" in jugada_l or "tarjeta" in jugada_l) and ("over" in jugada_l or "under" in jugada_l):
-                        tipo = "over" if "over" in jugada_l else "under"
-                        try:
-                            seg = jugada_norm.split("Over" if tipo == "over" else "Under")[-1]
-                            linea = float(seg.strip().split()[0].replace(",", "."))
-                        except Exception:
-                            linea = None
-                        # Ampliar matching: "Total Corners", "Corner Kicks", "Corners", etc.
-                        es_mkt_corner = (
-                            "corner" in jugada_l and (
-                                "corner" in bet_name.lower()
-                                or "corners" in bet_name.lower()
-                                or "corner kicks" in bet_name.lower()
-                                or "total corners" in bet_name.lower()
-                            )
-                        )
-                        es_mkt_tarjeta = (
-                            "tarjeta" in jugada_l and (
-                                "card" in bet_name.lower()
-                                or "booking" in bet_name.lower()
-                                or "yellow" in bet_name.lower()
-                            )
-                        )
-                        es_mkt = es_mkt_corner or es_mkt_tarjeta
-                        if linea is not None and es_mkt and tipo in nombre.lower():
-                            import re as _re_l3
-                            mnum3 = _re_l3.search(r"(\d+\.?\d*)", nombre)
-                            if mnum3 and abs(float(mnum3.group(1)) - linea) < 0.26:
-                                match = True
-                    # Resultado 1X2
-                    elif jugada_l.strip() in ("1", "2", "x"):
-                        mapa = {"1": ("home", "1"), "2": ("away", "2"), "x": ("draw", "x")}
-                        claves = mapa[jugada_l.strip()]
-                        if nombre.lower() in claves:
-                            match = True
-
-                    if match:
-                        prio = CASA_PRIORIDAD.get(book_name, 50)
-                        prio_mejor = CASA_PRIORIDAD.get(mejor_book, 99) if mejor_book else 99
-                        if mejor is None or prio < prio_mejor:
-                            mejor = odd
-                            mejor_book = book_name
-
-    if mejor:
-        book_label = mejor_book if mejor_book in PINNACLE_NAMES else f"{mejor_book} (live)"
-        return round(mejor, 3), book_label
-    return None, None
-
-
 def buscar_mejor_cuota(fixture_id, jugada):
     odds = api_get(f"/odds?fixture={fixture_id}", use_cache=True, ttl=600)
-
-    # --- FIX 1: Doble Oportunidad calculada desde 1X2 de Pinnacle ---
-    # Pinnacle no ofrece mercado DC directamente. Calculamos la cuota
-    # equivalente matematicamente desde sus cuotas 1X2 (mas precisas).
-    if jugada in ("1X", "X2", "12"):
-        cuota_dc, book_dc = _cuota_doble_oportunidad_pinnacle(odds, jugada)
-        if cuota_dc:
-            return cuota_dc, book_dc
-        # Si Pinnacle no tiene 1X2 tampoco, caer al fallback normal abajo
 
     mejor = None
     mejor_book = None
@@ -1298,11 +728,7 @@ def buscar_mejor_cuota(fixture_id, jugada):
         "Bwin": 7, "Unibet": 8,
     }
 
-    # --- FIX 2: Normalizar jugada antes del matching ---
-    # Quita sufijos como " live", " restante", " HT" para que el matcher
-    # encuentre la linea numerica correctamente en jugadas live.
-    jugada_norm = _normalizar_jugada_para_matching(jugada)
-    jugada_l = jugada_norm.lower()
+    mejor_por_casa = {}  # book_name -> (odd, match_found)
 
     for casa in odds:
         for book in casa.get("bookmakers", []):
@@ -1322,6 +748,8 @@ def buscar_mejor_cuota(fixture_id, jugada):
 
                     match = False
 
+                    jugada_l = jugada.lower()
+
                     # Goles Over/Under — verificar que el mercado sea de goles
                     GOALS_MARKETS = {"Goals Over/Under", "Total Goals", "Over/Under",
                                      "Goals", "Total", "Over Under"}
@@ -1330,11 +758,11 @@ def buscar_mejor_cuota(fixture_id, jugada):
 
                     if "over" in jugada_l and "gol" in jugada_l:
                         try:
-                            linea = float(jugada_norm.split("Over")[-1].strip().split()[0])
+                            linea = float(jugada.split("Over")[-1].strip().split()[0])
                         except Exception:
                             linea = None
                         if is_goals_market and linea is not None:
-                            # Match exacto
+                            # Match exacto primero
                             if nombre.strip() in (f"Over {linea}", f"Over{linea}",
                                                    f"Over {linea:.1f}", f"Over {int(linea)}"):
                                 match = True
@@ -1352,7 +780,7 @@ def buscar_mejor_cuota(fixture_id, jugada):
 
                     elif "under" in jugada_l and "gol" in jugada_l:
                         try:
-                            linea = float(jugada_norm.split("Under")[-1].strip().split()[0])
+                            linea = float(jugada.split("Under")[-1].strip().split()[0])
                         except Exception:
                             linea = None
                         if is_goals_market and linea is not None:
@@ -1369,13 +797,12 @@ def buscar_mejor_cuota(fixture_id, jugada):
                                     val2 = float(m_num2.group(1))
                                     if abs(val2 - linea) <= 0.5 and "under" in nombre.lower():
                                         match = True
-
                     # Ambos marcan
                     elif "ambos marcan" in jugada_l or "btts" in jugada_l:
                         if ("Both Teams" in bet_name or "BTTS" in bet_name) and nombre.lower() in ["yes","si","sí"]:
                             match = True
-
-                    # Doble oportunidad fallback (si Pinnacle no tenia 1X2)
+                    # Doble oportunidad
+                    # Pinnacle usa "Home/Draw", "Draw/Away", "Home/Away"
                     # Otras casas usan "1X", "X2", "12"
                     elif jugada == "1X":
                         if "Double Chance" in bet_name and (
@@ -1395,75 +822,31 @@ def buscar_mejor_cuota(fixture_id, jugada):
                             "Home Away" in nombre or "1 2" in nombre
                         ):
                             match = True
-
-                    # --- FIX 3: Corners — matching mas flexible ---
+                    # Corners Over/Under
                     elif "corner" in jugada_l and "over" in jugada_l:
-                        try:
-                            linea_c = float(jugada_norm.split("Over")[-1].strip().split()[0].replace(",", "."))
-                        except Exception:
-                            linea_c = None
-                        CORNER_MARKETS = {"Corner", "Corners", "Asian Corners", "Total Corners"}
-                        is_corner_market = any(cm.lower() in bet_name.lower() for cm in CORNER_MARKETS)
-                        if is_corner_market and linea_c is not None:
-                            import re as _re_c
-                            m_c = _re_c.search(r"(\d+\.?\d*)", nombre)
-                            if m_c and abs(float(m_c.group(1)) - linea_c) < 0.01 and "over" in nombre.lower():
-                                match = True
-                            elif nombre.strip() in (f"Over {linea_c}", f"Over{linea_c}",
-                                                     f"Over {linea_c:.1f}", f"Over {int(linea_c)}"):
-                                match = True
-
+                        linea_c = jugada.split("Over")[-1].strip().split()[0]
+                        if ("Corner" in bet_name or "Corners" in bet_name) and (
+                            nombre.strip() == f"Over {linea_c}" or
+                            nombre.strip() == f"Over{linea_c}"
+                        ):
+                            match = True
                     elif "corner" in jugada_l and "under" in jugada_l:
-                        try:
-                            linea_c = float(jugada_norm.split("Under")[-1].strip().split()[0].replace(",", "."))
-                        except Exception:
-                            linea_c = None
-                        CORNER_MARKETS = {"Corner", "Corners", "Asian Corners", "Total Corners"}
-                        is_corner_market = any(cm.lower() in bet_name.lower() for cm in CORNER_MARKETS)
-                        if is_corner_market and linea_c is not None:
-                            import re as _re_c2
-                            m_c2 = _re_c2.search(r"(\d+\.?\d*)", nombre)
-                            if m_c2 and abs(float(m_c2.group(1)) - linea_c) < 0.01 and "under" in nombre.lower():
-                                match = True
-                            elif nombre.strip() in (f"Under {linea_c}", f"Under{linea_c}",
-                                                     f"Under {linea_c:.1f}", f"Under {int(linea_c)}"):
-                                match = True
-
-                    # --- FIX 3: Tarjetas — ampliar nombres de mercado aceptados ---
+                        linea_c = jugada.split("Under")[-1].strip().split()[0]
+                        if ("Corner" in bet_name or "Corners" in bet_name) and (
+                            nombre.strip() == f"Under {linea_c}" or
+                            nombre.strip() == f"Under{linea_c}"
+                        ):
+                            match = True
+                    # Tarjetas - Pinnacle usa "Bookings" o "Cards"
                     elif "tarjeta" in jugada_l and "over" in jugada_l:
-                        try:
-                            linea_t = float(jugada_norm.split("Over")[-1].strip().split()[0].replace(",", "."))
-                        except Exception:
-                            linea_t = None
-                        CARD_MARKETS = {"Card", "Booking", "Yellow", "Total Cards",
-                                        "Bookings", "Cards", "Total Bookings"}
-                        is_card_market = any(cm.lower() in bet_name.lower() for cm in CARD_MARKETS)
-                        if is_card_market and linea_t is not None:
-                            import re as _re_t
-                            m_t = _re_t.search(r"(\d+\.?\d*)", nombre)
-                            if m_t and abs(float(m_t.group(1)) - linea_t) < 0.01 and "over" in nombre.lower():
-                                match = True
-                            elif nombre.strip() in (f"Over {linea_t}", f"Over{linea_t}",
-                                                     f"Over {linea_t:.1f}", f"Over {int(linea_t)}"):
-                                match = True
-
-                    elif "tarjeta" in jugada_l and "under" in jugada_l:
-                        try:
-                            linea_t = float(jugada_norm.split("Under")[-1].strip().split()[0].replace(",", "."))
-                        except Exception:
-                            linea_t = None
-                        CARD_MARKETS = {"Card", "Booking", "Yellow", "Total Cards",
-                                        "Bookings", "Cards", "Total Bookings"}
-                        is_card_market = any(cm.lower() in bet_name.lower() for cm in CARD_MARKETS)
-                        if is_card_market and linea_t is not None:
-                            import re as _re_t2
-                            m_t2 = _re_t2.search(r"(\d+\.?\d*)", nombre)
-                            if m_t2 and abs(float(m_t2.group(1)) - linea_t) < 0.01 and "under" in nombre.lower():
-                                match = True
-                            elif nombre.strip() in (f"Under {linea_t}", f"Under{linea_t}",
-                                                     f"Under {linea_t:.1f}", f"Under {int(linea_t)}"):
-                                match = True
-
+                        linea_t = jugada.split("Over")[-1].strip().split()[0]
+                        if ("Card" in bet_name or "Booking" in bet_name or
+                            "Yellow" in bet_name) and (
+                            nombre.strip() == f"Over {linea_t}" or
+                            nombre.strip() == f"Over{linea_t}" or
+                            f"Over {linea_t}" in nombre
+                        ):
+                            match = True
                     # 1X2 - Pinnacle usa "Home", "Draw", "Away" o "1", "X", "2"
                     elif jugada_l.strip() in ("1", "local gana", "victoria local"):
                         if ("Match Winner" in bet_name or "1X2" in bet_name or
@@ -1487,13 +870,18 @@ def buscar_mejor_cuota(fixture_id, jugada):
                     if match:
                         prioridad_actual = CASA_PRIORIDAD.get(book_name, 50)
                         prioridad_mejor = CASA_PRIORIDAD.get(mejor_book, 50) if mejor_book else 99
+                        # Preferir Pinnacle sobre cualquier otra casa
                         if mejor is None:
                             mejor = odd
                             mejor_book = book_name
                         elif prioridad_actual < prioridad_mejor:
+                            # Casa con mayor prioridad (Pinnacle sobre Bet365, etc.)
                             mejor = odd
                             mejor_book = book_name
 
+    # Si no encontro cuota de Pinnacle, registrar para diagnostico
+    if mejor is None:
+        pass  # No hay cuota Pinnacle disponible para esta jugada
     return mejor, mejor_book
 
 
@@ -1796,16 +1184,83 @@ def agregar_doble_oportunidad(recomendaciones, home, away, home_general, away_ge
 
 
 def agregar_mercados_extra_prematch(recomendaciones, home_id, away_id, home_general, away_general):
-    # MERCADOS EXTRA PREMATCH DESACTIVADOS.
-    # Esta funcion emitia corners, tarjetas y BTTS en prematch. Los tres
-    # mercados fueron eliminados de la generacion:
-    #   - BTTS: efectividad real 41.6%
-    #   - Corners prematch: 33-40% (vs 79.5% en corners live)
-    #   - Tarjetas: dependen del arbitro y del animo de los jugadores,
-    #     factores que el modelo no mide; efectividad inestable.
-    # La funcion se conserva (la llama preparar_analisis) pero ya no
-    # agrega nada. Los picks prematch provienen solo de
-    # obtener_recomendaciones (goles, doble oportunidad).
+    home_m = calcular_stats_mercados(home_id, last=5)
+    away_m = calcular_stats_mercados(away_id, last=5)
+
+    if not home_m or not away_m:
+        return recomendaciones
+
+    corners_total = home_m["corners_prom"] + away_m["corners_prom"]
+    cards_total = home_m["cards_prom"] + away_m["cards_prom"]
+    shots_total = home_m["shots_prom"] + away_m["shots_prom"]
+    sog_total = home_m["sog_prom"] + away_m["sog_prom"]
+
+    def add_extra(jugada, prob, score, riesgo, motivo):
+        recomendaciones.append({
+            "mercado": mercado_categoria(jugada),
+            "jugada": jugada,
+            "prob": prob,
+            "score": score,
+            "riesgo": riesgo,
+            "confianza": etiqueta_confianza(score),
+            "motivo": motivo,
+            "cuota_justa": cuota_justa(prob),
+            "cuota_minima": cuota_minima(prob, riesgo),
+        })
+
+    if corners_total >= 9:
+        add_extra(
+            "Corners Over 8.5",
+            77,
+            8.0,
+            3.0,
+            "Promedio combinado alto de corners y ritmo ofensivo favorable."
+        )
+    elif corners_total >= 8:
+        add_extra(
+            "Corners Over 7.5",
+            75,
+            7.4,
+            3.5,
+            "Tendencia aceptable de corners entre ambos equipos."
+        )
+
+    if cards_total >= 5:
+        add_extra(
+            "Tarjetas Over 4.5",
+            76,
+            7.8,
+            3.4,
+            "Promedio alto de tarjetas y posible partido friccionado."
+        )
+    elif cards_total >= 4:
+        add_extra(
+            "Tarjetas Over 3.5",
+            74,
+            7.2,
+            3.8,
+            "Tendencia moderada-alta de tarjetas."
+        )
+
+    if home_general and away_general:
+        btts_base = (home_general["btts"] + away_general["btts"]) / 2
+
+        if (
+            btts_base >= 0.60
+            and home_general["gf_prom"] >= 1
+            and away_general["gf_prom"] >= 1
+            and home_general["gc_prom"] >= 0.8
+            and away_general["gc_prom"] >= 0.8
+        ):
+            add_extra(
+                "Ambos marcan - Sí",
+                76,
+                7.8,
+                3.8,
+                "Ambos equipos tienen capacidad de marcar y también conceden goles."
+            )
+
+    recomendaciones.sort(key=lambda x: (x["score"], x["prob"]), reverse=True)
     return recomendaciones
 
 
@@ -1817,12 +1272,7 @@ def enriquecer_con_odds(fixture_id, recomendaciones):
         r["bookmaker"] = book
 
         if cuota:
-            # Edge se calcula con prob ORIGINAL (antes de recalibrar) para
-            # no introducir sesgos de la tabla de recalibracion en el filtro.
-            prob_para_edge = float(
-                r.get("prob_original", r.get("prob", 0)) or 0
-            )
-            r["edge"] = edge_estimado(prob_para_edge, cuota)
+            r["edge"] = edge_estimado(r["prob"], cuota)
             r["movimiento"] = guardar_snapshot_odds(
                 fixture_id,
                 r["jugada"],
@@ -1835,8 +1285,7 @@ def enriquecer_con_odds(fixture_id, recomendaciones):
     return recomendaciones
 
 def preparar_analisis(fixture_id, incluir_odds=False, incluir_contexto=False):
-    # Datos base del fixture: cacheados 1h (no cambian antes del partido)
-    fixture = api_get(f"/fixtures?id={fixture_id}", use_cache=True, ttl=3600)
+    fixture = api_get(f"/fixtures?id={fixture_id}", use_cache=False)
 
     if not fixture:
         return None
@@ -1902,128 +1351,6 @@ def preparar_analisis(fixture_id, incluir_odds=False, incluir_contexto=False):
             recomendaciones
         )
 
-    # ── RECALIBRACION V14.2 ───────────────────────────────────────────
-    # Se aplica DESPUES de enriquecer con odds para que el filtro de
-    # cuota use la cuota real de mercado cuando exista.
-    for r in recomendaciones:
-        aplicar_recalibracion(r, liga=league)
-
-    # ── BONUS H2H EN MERCADOS DE GOLES ────────────────────────────────
-    # Si en los ultimos 5 H2H el mercado elegido fue consistente, +0.5 score.
-    try:
-        home_id_ha = fixture["teams"]["home"]["id"]
-        away_id_ha = fixture["teams"]["away"]["id"]
-        h2h_bonus = api_get(
-            f"/fixtures/headtohead?h2h={home_id_ha}-{away_id_ha}&last=5",
-            use_cache=True, ttl=7200
-        )
-        if h2h_bonus and len(h2h_bonus) >= 3:
-            goles_h2h = [(m["goals"]["home"] or 0) + (m["goals"]["away"] or 0)
-                         for m in h2h_bonus
-                         if m["goals"]["home"] is not None]
-            if goles_h2h:
-                over15_h2h = sum(1 for g in goles_h2h if g >= 2) / len(goles_h2h)
-                under35_h2h = sum(1 for g in goles_h2h if g <= 3) / len(goles_h2h)
-                for r in recomendaciones:
-                    jugada_r = (r.get("jugada") or "").lower()
-                    if "over 1.5" in jugada_r and over15_h2h >= 0.7:
-                        r["score"] = round(min(10.0, r["score"] + 0.5), 1)
-                        r["motivo"] = r.get("motivo", "") + f" H2H refuerza Over1.5 ({int(over15_h2h*100)}%)."
-                    elif ("over 2.5" in jugada_r) and over15_h2h >= 0.8:
-                        r["score"] = round(min(10.0, r["score"] + 0.3), 1)
-                    elif "under 3.5" in jugada_r and under35_h2h >= 0.8:
-                        r["score"] = round(min(10.0, r["score"] + 0.5), 1)
-                        r["motivo"] = r.get("motivo", "") + f" H2H refuerza Under3.5 ({int(under35_h2h*100)}%)."
-    except Exception as e:
-        print(f"WARN H2H bonus: {e}")
-
-    # ── xG DE PREDICTIONS COMO SEÑAL PREMATCH ─────────────────────────
-    # /predictions devuelve goles esperados por equipo — usarlos para
-    # reforzar o penalizar mercados de goles.
-    try:
-        pred_data = api_get(
-            f"/predictions?fixture={fixture_id}",
-            use_cache=True, ttl=3600
-        )
-        if pred_data:
-            p0 = pred_data[0] if isinstance(pred_data, list) else pred_data
-            goals_pred = p0.get("predictions", {}).get("goals", {})
-            xg_home = float(goals_pred.get("home", 0) or 0)
-            xg_away = float(goals_pred.get("away", 0) or 0)
-            xg_total = round(xg_home + xg_away, 2)
-            if xg_total > 0:
-                for r in recomendaciones:
-                    jugada_r = (r.get("jugada") or "").lower()
-                    if "over 1.5" in jugada_r:
-                        if xg_total >= 2.5:
-                            r["score"] = round(min(10.0, r["score"] + 0.4), 1)
-                        elif xg_total < 1.2:
-                            r["score"] = round(max(0.0, r["score"] - 0.3), 1)
-                    elif "over 2.5" in jugada_r:
-                        if xg_total >= 3.0:
-                            r["score"] = round(min(10.0, r["score"] + 0.4), 1)
-                        elif xg_total < 1.8:
-                            r["score"] = round(max(0.0, r["score"] - 0.3), 1)
-                    elif "under 3.5" in jugada_r:
-                        if xg_total <= 2.0:
-                            r["score"] = round(min(10.0, r["score"] + 0.3), 1)
-                        elif xg_total > 3.0:
-                            r["score"] = round(max(0.0, r["score"] - 0.4), 1)
-                    # Guardar xG en el pick para aprendizaje ML
-                    r["xg_pred_home"] = xg_home
-                    r["xg_pred_away"] = xg_away
-                    r["xg_pred_total"] = xg_total
-    except Exception as e:
-        print(f"WARN xG predictions: {e}")
-
-    # Filtro de cuota minima: descarta picks que no pueden ser rentables.
-    recomendaciones = [
-        r for r in recomendaciones if cuota_pick_suficiente(r)
-    ]
-
-    # ── FILTRO DE EDGE POSITIVO OBLIGATORIO ───────────────────────────
-    # Solo pasan picks donde el mercado paga mas de lo que Pinnacle implica.
-    # Si no hay cuota de Pinnacle se permite (edge=None -> no penalizar).
-    recomendaciones = [
-        r for r in recomendaciones
-        if r.get("edge") is None or r.get("edge", 0) >= 0
-    ]
-
-    # ── FILTRO DE SCORE DINAMICO POR CUOTA ────────────────────────────
-    # Mas cuota = mas score exigido (el modelo debe estar mas convencido).
-    def _score_min_para_cuota(cuota):
-        for c_min, c_max, s_min in SCORE_MIN_POR_CUOTA:
-            if c_min <= cuota <= c_max:
-                return s_min
-        return 7.5
-
-    def _pasa_filtro_score_cuota(r):
-        cuota = _cuota_segura(r)
-        if cuota <= 0:
-            return True   # sin cuota real no penalizar
-        score = float(r.get("score", 0) or 0)
-        return score >= _score_min_para_cuota(cuota)
-
-    recomendaciones = [r for r in recomendaciones if _pasa_filtro_score_cuota(r)]
-
-    # ── FILTRO DE MERCADOS CONSERVADOR ────────────────────────────────
-    recomendaciones = [
-        r for r in recomendaciones
-        if r.get("mercado", "") in MERCADOS_CONSERVADOR
-    ]
-
-    # ── ORDENAR: score primario, VE como desempate ─────────────────────
-    # V14.2: score vuelve a ser el criterio principal.
-    # VE (prob * cuota) rompe empates entre picks con mismo score.
-    def _clave_orden(x):
-        score = float(x.get("score", 0) or 0)
-        prob = float(x.get("prob", 0) or 0) / 100.0
-        cuota = _cuota_segura(x)
-        ve = prob * cuota
-        return (score, ve)
-
-    recomendaciones.sort(key=_clave_orden, reverse=True)
-
     return {
         "fixture_id": str(fixture_id),
         "home": home,
@@ -2040,118 +1367,69 @@ def preparar_analisis(fixture_id, incluir_odds=False, incluir_contexto=False):
     }
 
 
-def guardar_pick_plano(pick):
-    """
-    Persiste un pick que ya viene en formato PLANO (claves jugada/score/etc
-    en la raiz), como los que generan /analizar_all y /live_all.
-    Centraliza la persistencia para que TODA jugada entre al mismo pipeline
-    de resumen, aprendizaje, metricas y simulacion de bank.
-    Evita duplicados por (fixture_id + jugada).
-    """
-    if not pick or not pick.get("fixture_id") or not pick.get("jugada"):
-        return False
+def guardar_pick_automatico(data):
+    if not data or not data.get("recomendaciones"):
+        return
 
+    top = data["recomendaciones"][0]
     picks = leer_json(PICKS_FILE)
 
-    # Evitar duplicado: mismo fixture + misma jugada
     for p in picks:
-        if (str(p.get("fixture_id")) == str(pick.get("fixture_id"))
-                and p.get("jugada") == pick.get("jugada")):
+        if (
+            str(p.get("fixture_id")) == str(data["fixture_id"])
+            and p.get("jugada") == top["jugada"]
+        ):
             p["fecha_consulta"] = fecha_hora_peru()
-            p["probabilidad"] = pick.get("prob", p.get("probabilidad"))
-            p["score"] = pick.get("score", p.get("score"))
-            p["riesgo"] = pick.get("riesgo", p.get("riesgo"))
-            if pick.get("minuto") is not None:
-                p["minuto_consulta"] = pick.get("minuto")
+            p["probabilidad"] = top["prob"]
+            p["score"] = top["score"]
+            p["riesgo"] = top["riesgo"]
             guardar_json_lista(PICKS_FILE, picks)
-            return True
+            return
 
-    # Normalizar cuota
-    _cuota = pick.get("cuota_api") or pick.get("cuota") or pick.get("cuota_minima") or 0
+    _cuota_val = top.get("cuota_minima", 0) or top.get("cuota", 0) or 0
     try:
-        _cuota = float(_cuota) if _cuota else 0.0
+        _cuota_val = float(_cuota_val)
     except (ValueError, TypeError):
-        _cuota = 0.0
+        _cuota_val = 0.0
 
-    cuota_pinnacle = pick.get("cuota_api") or _cuota
+    # Calcular edge vs Pinnacle si hay cuota real
+    cuota_pinnacle = top.get("cuota_api") or _cuota_val
     try:
         cuota_pinnacle = float(cuota_pinnacle) if cuota_pinnacle else 0
     except Exception:
         cuota_pinnacle = 0
 
-    prob_val = float(pick.get("prob", 0) or pick.get("probabilidad", 0) or 0)
-    edge_val = edge_estimado(prob_val, cuota_pinnacle) if cuota_pinnacle > 1.0 else None
-    categoria_edge, _label = clasificar_edge(edge_val)
-    ve_val = valor_esperado(prob_val, cuota_pinnacle) if cuota_pinnacle > 1.0 else None
+    edge_val = edge_estimado(float(top.get("prob", 0) or 0), cuota_pinnacle) if cuota_pinnacle > 1.0 else None
+    categoria_edge, label_edge = clasificar_edge(edge_val)
+    ve_val = valor_esperado(float(top.get("prob", 0) or 0), cuota_pinnacle) if cuota_pinnacle > 1.0 else None
 
-    registro = {
-        "fixture_id": str(pick.get("fixture_id")),
-        "fecha": pick.get("fecha", pick.get("fecha_partido", fecha_hoy_peru())),
-        "hora": pick.get("hora", ""),
-        "fecha_partido": pick.get("fecha_partido", fecha_hoy_peru()),
-        "country": pick.get("country", ""),
-        "league": pick.get("league", ""),
-        "partido": pick.get("partido", ""),
-        "mercado": pick.get("mercado", ""),
-        "jugada": pick.get("jugada", ""),
-        "probabilidad": prob_val,
-        "score": pick.get("score", 0),
-        "riesgo": pick.get("riesgo", 0),
-        "cuota_minima": _cuota,
-        "cuota": cuota_pinnacle if cuota_pinnacle > 1.0 else _cuota,
+    picks.append({
+        "fixture_id": str(data["fixture_id"]),
+        "fecha": data["fecha"],
+        "hora": data["hora"],
+        "fecha_partido": data.get("fecha_partido", data["fecha"]),
+        "country": data["country"],
+        "league": data["league"],
+        "partido": f"{data['home']} vs {data['away']}",
+        "mercado": top["mercado"],
+        "jugada": top["jugada"],
+        "probabilidad": top["prob"],
+        "score": top["score"],
+        "riesgo": top["riesgo"],
+        "cuota_minima": _cuota_val,
+        "cuota": cuota_pinnacle if cuota_pinnacle > 1.0 else _cuota_val,
         "cuota_pinnacle": cuota_pinnacle if cuota_pinnacle > 1.0 else None,
-        "bookmaker": pick.get("bookmaker", ""),
+        "bookmaker": top.get("bookmaker", ""),
         "edge": edge_val,
         "edge_categoria": categoria_edge,
         "valor_esperado": ve_val,
         "estado": "pendiente",
         "resultado_real": None,
-        "tipo": pick.get("tipo", "prematch"),
-        "minuto_consulta": pick.get("minuto"),
-        "es_seleccion": pick.get("es_seleccion", False),
-        "timestamp": fecha_hora_peru(),
-    }
-    picks.append(registro)
+        "tipo": "prematch",
+        "timestamp": fecha_hora_peru()
+    })
+
     guardar_json_lista(PICKS_FILE, picks)
-    return True
-
-
-def guardar_pick_automatico(data):
-    """
-    Guarda un pick prematch en picks_guardados.json.
-    Acepta dos formatos y los unifica:
-      A) Formato preparar_analisis: data tiene clave 'recomendaciones'.
-      B) Formato plano (analizar_all): jugada/score/etc en la raiz.
-    Delega la persistencia a guardar_pick_plano para que TODA jugada
-    entre al mismo pipeline (resumen, aprendizaje, metricas, bank).
-    """
-    if not data:
-        return False
-
-    if data.get("recomendaciones"):
-        top = data["recomendaciones"][0]
-        pick = {
-            "fixture_id": str(data.get("fixture_id", "")),
-            "fecha": data.get("fecha", fecha_hoy_peru()),
-            "hora": data.get("hora", ""),
-            "fecha_partido": data.get("fecha_partido", data.get("fecha", fecha_hoy_peru())),
-            "country": data.get("country", ""),
-            "league": data.get("league", ""),
-            "partido": f"{data.get('home','')} vs {data.get('away','')}",
-            "mercado": top.get("mercado", ""),
-            "jugada": top.get("jugada", ""),
-            "prob": top.get("prob", 0),
-            "score": top.get("score", 0),
-            "riesgo": top.get("riesgo", 0),
-            "cuota": top.get("cuota_minima", 0) or top.get("cuota", 0),
-            "cuota_api": top.get("cuota_api"),
-            "bookmaker": top.get("bookmaker", ""),
-            "tipo": data.get("tipo", "prematch"),
-        }
-        return guardar_pick_plano(pick)
-    elif data.get("jugada"):
-        return guardar_pick_plano(data)
-    return False
 
 
 def guardar_pick_live_automatico(fixture_id, home, away, country, league, hora, sugerencia, minuto=None):
@@ -2167,17 +1445,6 @@ def guardar_pick_live_automatico(fixture_id, home, away, country, league, hora, 
             p["probabilidad"] = sugerencia["prob"]
             p["score"] = sugerencia["score"]
             p["riesgo"] = sugerencia["riesgo"]
-            # PUNTO 5: refrescar la cuota live si llego una nueva
-            _nueva_cuota = sugerencia.get("cuota_api") or sugerencia.get("cuota", 0)
-            try:
-                _nueva_cuota = float(_nueva_cuota)
-            except (ValueError, TypeError):
-                _nueva_cuota = 0.0
-            if _nueva_cuota > 1.0:
-                p["cuota"] = _nueva_cuota
-                p["cuota_api"] = sugerencia.get("cuota_api")
-                p["bookmaker"] = sugerencia.get("bookmaker", p.get("bookmaker", ""))
-            guardar_json_lista(PICKS_FILE, picks)
             return
 
     _cuota_live = sugerencia.get("cuota", 0) or sugerencia.get("cuota_minima", 0) or 0
@@ -2188,8 +1455,8 @@ def guardar_pick_live_automatico(fixture_id, home, away, country, league, hora, 
 
     picks.append({
         "fixture_id": str(fixture_id),
-        "fecha": fecha_hoy_peru(),          # fecha Peru al momento de guardar
-        "fecha_partido": fecha_hoy_peru(),  # mismo — el partido es hoy (live)
+        "fecha": fecha_hoy_peru(),
+        "fecha_partido": fecha_hoy_peru(),
         "hora": hora,
         "country": country,
         "league": league,
@@ -2201,9 +1468,6 @@ def guardar_pick_live_automatico(fixture_id, home, away, country, league, hora, 
         "riesgo": sugerencia["riesgo"],
         "cuota_minima": _cuota_live,
         "cuota": _cuota_live,
-        "cuota_api": sugerencia.get("cuota_api"),
-        "cuota_pinnacle": sugerencia.get("cuota_api") if sugerencia.get("bookmaker", "").startswith("Pinnacle") else None,
-        "bookmaker": sugerencia.get("bookmaker", ""),
         "estado": "pendiente",
         "resultado_real": None,
         "tipo": "live",
@@ -2249,16 +1513,7 @@ def actualizar_resultados_automaticos():
             continue
 
         fixture_id = p.get("fixture_id")
-
-        # B: Saltar fixture_id sinteticos (REC-xxxx) generados por reconstruccion
-        if not fixture_id or str(fixture_id).startswith("REC-"):
-            continue
-
-        try:
-            fixture = api_get(f"/fixtures?id={fixture_id}", use_cache=False)
-        except Exception as e:
-            print(f"WARN actualizar fixture {fixture_id}: {e}")
-            continue
+        fixture = api_get(f"/fixtures?id={fixture_id}", use_cache=False)
 
         if not fixture:
             continue
@@ -2266,7 +1521,7 @@ def actualizar_resultados_automaticos():
         fixture = fixture[0]
         status = fixture["fixture"]["status"]["short"]
 
-        # Corregir hora del pick si esta mal (reconvertir de UTC a Peru)
+        # Corregir hora del pick si está mal (reconvertir de UTC a Peru)
         fecha_api = fixture["fixture"].get("date","")
         if fecha_api:
             hora_correcta = hora_peru(fecha_api)
@@ -2290,10 +1545,7 @@ def actualizar_resultados_automaticos():
         corners_total = None
         tarjetas_total = None
 
-        try:
-            stats = api_get(f"/fixtures/statistics?fixture={fixture_id}", use_cache=False)
-        except Exception:
-            stats = None
+        stats = api_get(f"/fixtures/statistics?fixture={fixture_id}", use_cache=False)
 
         if stats:
             total_corners = 0
@@ -2304,6 +1556,7 @@ def actualizar_resultados_automaticos():
                     tipo = item.get("type")
                     raw = item.get("value")
 
+                    # La API puede devolver valores como string ("8"), porcentaje ("45%") o None
                     try:
                         if raw is None:
                             valor = 0
@@ -2316,8 +1569,10 @@ def actualizar_resultados_automaticos():
 
                     if tipo == "Corner Kicks":
                         total_corners += valor
+
                     elif tipo == "Yellow Cards":
                         total_cards += valor
+
                     elif tipo == "Red Cards":
                         total_cards += (valor * 2)
 
@@ -2333,33 +1588,8 @@ def actualizar_resultados_automaticos():
 
         jugada_lower = jugada.lower()
 
-        # ── HT (primer tiempo) — usar marcador de halftime, NO el final ──
-        if "ht" in jugada_lower and ("over" in jugada_lower or "under" in jugada_lower):
-            linea = _linea(jugada)
-            # Intentar obtener marcador de primer tiempo desde la API
-            try:
-                score_ht = fixture.get("score", {}).get("halftime", {})
-                gh_ht = score_ht.get("home")
-                ga_ht = score_ht.get("away")
-                if gh_ht is not None and ga_ht is not None:
-                    total_ht = gh_ht + ga_ht
-                    if "over" in jugada_lower:
-                        acierto = total_ht > linea if linea is not None else None
-                    else:
-                        acierto = total_ht < linea if linea is not None else None
-                    p["resultado_real"] = f"HT {gh_ht}-{ga_ht}"
-                else:
-                    # Sin datos HT, dejar pendiente_manual
-                    p["estado"] = "pendiente_manual"
-                    p["resultado"] = "pendiente_manual"
-                    continue
-            except Exception:
-                p["estado"] = "pendiente_manual"
-                p["resultado"] = "pendiente_manual"
-                continue
-
         # ── Goles ────────────────────────────────────────────────────────
-        elif "under" in jugada_lower and "gol" in jugada_lower:
+        if "under" in jugada_lower and "gol" in jugada_lower:
             linea = _linea(jugada)
             acierto = total < linea if linea is not None else None
 
@@ -2410,35 +1640,18 @@ def actualizar_resultados_automaticos():
         elif "12" in jugada_lower:
             acierto = gh != ga
 
-        # ── Sin Tarjeta Roja ─────────────────────────────────────────────
-        elif "sin tarjeta roja" in jugada_lower:
-            rojas_pick = 0
-            stats_disponibles = False
-            if stats:
-                for td_sr in stats:
-                    stats_disponibles = True
-                    for item_sr in td_sr.get("statistics", []):
-                        if item_sr.get("type") == "Red Cards":
-                            val_sr = item_sr.get("value")
-                            if val_sr is not None:
-                                try:
-                                    rojas_pick += int(str(val_sr))
-                                except Exception:
-                                    pass
-            # Si no hay estadisticas disponibles (liga menor), dejar pendiente_manual
-            if not stats_disponibles:
-                p["estado"] = "pendiente_manual"
-                p["resultado"] = "pendiente_manual"
-                p["resultado_real"] = "Sin stats API — verificar manual"
-                continue
-            acierto = rojas_pick == 0
-            p["resultado_real"] = f"{rojas_pick} rojas"
+        # ── HT (primer tiempo) ───────────────────────────────────────────
+        elif "ht" in jugada_lower and "over" in jugada_lower:
+            linea = _linea(jugada)
+            acierto = total > linea if linea is not None else None
 
         if "Corners" in jugada:
             p["resultado_real"] = f"{corners_total} corners"
+
         elif "Tarjetas" in jugada:
             p["resultado_real"] = f"{tarjetas_total} tarjetas"
-        elif "resultado_real" not in p:
+
+        else:
             p["resultado_real"] = f"{gh}-{ga}"
 
         if acierto is True:
@@ -2461,27 +1674,10 @@ def actualizar_resultados_automaticos():
     if cambios > 0:
         try:
             _actualizar_resultado_combinada()
-        except Exception as e:
-            print(f"WARN _actualizar_resultado_combinada: {e}")
+        except Exception:
+            pass
 
     return picks, cambios
-
-
-async def _enviar_mensaje_paginado(update, texto, parse_mode="Markdown", chunk=3900):
-    """Divide mensajes largos en partes para no superar el limite de Telegram."""
-    if len(texto) <= chunk:
-        await update.message.reply_text(texto, parse_mode=parse_mode)
-        return
-    partes = []
-    while texto:
-        partes.append(texto[:chunk])
-        texto = texto[chunk:]
-    for i, parte in enumerate(partes):
-        sufijo = f"\n_(parte {i+1}/{len(partes)})_" if len(partes) > 1 else ""
-        try:
-            await update.message.reply_text(parte + sufijo, parse_mode=parse_mode)
-        except Exception:
-            await update.message.reply_text(parte + sufijo)
 
 
 def resumen_historial():
@@ -2563,7 +1759,7 @@ def resumen_historial():
     return texto[:3900]
 
 
-def texto_resumen(data, mini_tickets=None):
+def texto_resumen(data):
     recs = data["recomendaciones"]
 
     texto = (
@@ -2573,34 +1769,20 @@ def texto_resumen(data, mini_tickets=None):
     )
 
     if not recs:
-        texto += "⚠️ No hay jugada clara.\nRecomendación: NO apostar."
-    else:
-        top = recs[0]
-        texto += (
-            f"🎯 Mercado: {top['mercado']}\n"
-            f"✅ Jugada: {top['jugada']}\n\n"
-            f"⭐ Score: {top['score']}/10\n"
-            f"⚠️ Riesgo: {top['riesgo']}/10\n"
-            f"{top['confianza']}\n\n"
-            f"💰 Entrar solo si cuota ≥ {top['cuota_minima']}\n\n"
-            f"🧠 Resumen:\n{top['motivo']}\n\n"
-            f"💾 Guardado automáticamente para seguimiento."
-        )
+        return texto + "⚠️ No hay jugada clara.\nRecomendación: NO apostar."
 
-    # Sección mini-tickets del mismo partido
-    if mini_tickets:
-        texto += "\n\n━━━━━━━━━━\n💡 *Mini-tickets sugeridos para este partido:*\n"
-        for i, mt in enumerate(mini_tickets[:3], 1):
-            picks_txt = " + ".join(
-                f"{e['jugada']} ({e['cuota']}x)" for e in mt["picks"]
-            )
-            est_txt = " ⚠️est." if any(e.get("cuota_estimada") for e in mt["picks"]) else ""
-            texto += (
-                f"\n🎫 *Ticket {i}* — cuota {mt['cuota_combinada']}x{est_txt}\n"
-                f"   {picks_txt}\n"
-                f"   Prob conjunta: ~{mt['prob_conjunta']}%\n"
-            )
-        texto += "\n_(Cuotas marcadas con ⚠️est. son estimadas — verifica en tu casa de apuestas)_"
+    top = recs[0]
+
+    texto += (
+        f"🎯 Mercado: {top['mercado']}\n"
+        f"✅ Jugada: {top['jugada']}\n\n"
+        f"⭐ Score: {top['score']}/10\n"
+        f"⚠️ Riesgo: {top['riesgo']}/10\n"
+        f"{top['confianza']}\n\n"
+        f"💰 Entrar solo si cuota ≥ {top['cuota_minima']}\n\n"
+        f"🧠 Resumen:\n{top['motivo']}\n\n"
+        f"💾 Guardado automáticamente para seguimiento."
+    )
 
     return texto[:3900]
 
@@ -2679,8 +1861,7 @@ def obtener_partidos_configurados():
     ligas = {}
     ligas.update(EUROPA_LEAGUES)
     ligas.update(SUDAMERICA_LEAGUES)
-    ligas.update(OTRAS_LEAGUES)
-    ligas.update(SELECCIONES_LEAGUES)
+    ligas.update(LIGAS_NOCTURNAS)
 
     partidos = []
 
@@ -2722,8 +1903,7 @@ def generar_top(score_minimo=7.5):
     ligas = {}
     ligas.update(EUROPA_LEAGUES)
     ligas.update(SUDAMERICA_LEAGUES)
-    ligas.update(OTRAS_LEAGUES)
-    ligas.update(SELECCIONES_LEAGUES)
+    ligas.update(LIGAS_NOCTURNAS)
 
     today = fecha_hoy_peru()
 
@@ -2757,9 +1937,7 @@ def generar_top(score_minimo=7.5):
 
                 top = data["recomendaciones"][0]
 
-                # V14.2: filtrar por SCORE como criterio principal
-                score_top = float(top.get("score", 0) or 0)
-                if score_top < score_minimo:
+                if top["score"] < score_minimo:
                     continue
 
                 oportunidades.append({
@@ -2775,15 +1953,11 @@ def generar_top(score_minimo=7.5):
             except Exception as e:
                 print("ERROR TOP:", e)
 
-    # Ordenar: score descendente, riesgo ascendente como desempate
     oportunidades.sort(
-        key=lambda x: (float(x.get("score", 0) or 0),
-                       -int(x.get("riesgo", 9) or 9),
-                       float(x.get("prob", 0) or 0)),
-        reverse=True,
+        key=lambda x: (x["score"], -x["riesgo"], x["prob"]),
     )
 
-    return oportunidades[:MAX_PICKS_DIA]
+    return oportunidades[:10]
 
 def _formatear_pick_mensaje(o, idx=None, mostrar_id=True):
     """
@@ -2803,26 +1977,11 @@ def _formatear_pick_mensaje(o, idx=None, mostrar_id=True):
         cuota_calc = 0
 
     cuota_mostrar = cuota_pin if cuota_pin > 1.0 else cuota_calc
+    book_str = " (Pinnacle)" if cuota_pin > 1.0 else (" (calc)" if cuota_calc > 1.0 else "")
 
-    # --- FIX 4: Mostrar la casa real, no siempre "Pinnacle" ---
-    bookmaker = o.get("bookmaker", "")
-    PINNACLE_NAMES = {"Pinnacle", "Pinnacle Sports", "Pinnacle (DC calc)"}
-    if cuota_pin > 1.0:
-        if bookmaker in PINNACLE_NAMES or "Pinnacle" in str(bookmaker):
-            book_str = " (Pinnacle)"
-        elif bookmaker:
-            book_str = f" ({bookmaker})"
-        else:
-            book_str = " (casas)"
-    elif cuota_calc > 1.0:
-        book_str = " (calc)"
-    else:
-        book_str = ""
-
-    # Edge vs Pinnacle — solo calcular si la cuota es de Pinnacle
+    # Edge vs Pinnacle
     prob = float(o.get("prob", 0) or 0)
-    es_pinnacle = cuota_pin > 1.0 and (bookmaker in PINNACLE_NAMES or "Pinnacle" in str(bookmaker))
-    edge_val = edge_estimado(prob, cuota_pin) if es_pinnacle else None
+    edge_val = edge_estimado(prob, cuota_pin) if cuota_pin > 1.0 else None
     cat_edge, label_edge = clasificar_edge(edge_val)
 
     # Emoji de edge
@@ -2869,8 +2028,7 @@ def generar_top_fecha(fecha, score_minimo=7.5):
     ligas = {}
     ligas.update(EUROPA_LEAGUES)
     ligas.update(SUDAMERICA_LEAGUES)
-    ligas.update(OTRAS_LEAGUES)
-    ligas.update(SELECCIONES_LEAGUES)
+    ligas.update(LIGAS_NOCTURNAS)
 
     partidos = obtener_fixtures_por_fecha(ligas, fecha)
 
@@ -2887,9 +2045,7 @@ def generar_top_fecha(fecha, score_minimo=7.5):
 
             top = data["recomendaciones"][0]
 
-            # V14.2: score como criterio principal
-            score_top = float(top.get("score", 0) or 0)
-            if score_top < score_minimo:
+            if top["score"] < score_minimo:
                 continue
 
             oportunidades.append({
@@ -2906,11 +2062,11 @@ def generar_top_fecha(fecha, score_minimo=7.5):
             print("ERROR TOP FECHA:", e)
 
     oportunidades.sort(
-        key=lambda x: float(x.get("score", 0) or 0),
+        key=lambda x: x["score"],
         reverse=True
     )
 
-    return oportunidades[:MAX_PICKS_DIA]
+    return oportunidades
 
 def extraer_stats_live(stats_response):
     stats = {}
@@ -3226,23 +2382,23 @@ def sugerir_live_tarjetas(elapsed, total_yellow, total_red, marcador_apretado):
     if elapsed <= 35 and total_cards >= 2 and marcador_apretado:
         sugerencias.append({
             "mercado": "Tarjetas",
-            "jugada": "Tarjetas Over 3.5",
-            "prob": 78,
-            "score": 7.5,
-            "riesgo": 3.5,
-            "cuota": 1.55,
-            "motivo": "Partido friccionado temprano y marcador competitivo (linea conservadora 3.5)."
+            "jugada": "Tarjetas Over 4.5",
+            "prob": 74,
+            "score": 7.4,
+            "riesgo": 4.0,
+            "cuota": 1.70,
+            "motivo": "Partido friccionado temprano y marcador competitivo."
         })
 
     elif elapsed <= 60 and total_cards >= 3:
         sugerencias.append({
             "mercado": "Tarjetas",
-            "jugada": "Tarjetas Over 3.5",
-            "prob": 80,
-            "score": 7.7,
-            "riesgo": 3.3,
-            "cuota": 1.45,
-            "motivo": "Alta frecuencia de tarjetas antes del tramo final (linea conservadora 3.5)."
+            "jugada": "Tarjetas Over 4.5",
+            "prob": 76,
+            "score": 7.6,
+            "riesgo": 3.8,
+            "cuota": 1.65,
+            "motivo": "Alta frecuencia de tarjetas antes del tramo final."
         })
 
     return sugerencias
@@ -3349,17 +2505,8 @@ def sugerir_live_ht(
 
     return sugerencias
 
-def analizar_live_fixture(fixture_id, cache_ttl=0):
-    """
-    Analiza un partido en vivo.
-    cache_ttl: si es > 0, las llamadas a la API usan cache con ese TTL
-    (en segundos). El job de alertas lo usa para no repetir llamadas
-    identicas en cada ciclo; los comandos bajo demanda usan 0 (sin cache)
-    para tener siempre datos frescos.
-    """
-    _usar_cache = cache_ttl > 0
-    fixture = api_get(f"/fixtures?id={fixture_id}",
-                      use_cache=_usar_cache, ttl=cache_ttl or CACHE_TTL)
+def analizar_live_fixture(fixture_id):
+    fixture = api_get(f"/fixtures?id={fixture_id}", use_cache=False)
 
     if not fixture:
         return None
@@ -3388,8 +2535,7 @@ def analizar_live_fixture(fixture_id, cache_ttl=0):
         }
 
     stats = extraer_stats_live(
-        api_get(f"/fixtures/statistics?fixture={fixture_id}",
-                use_cache=_usar_cache, ttl=cache_ttl or CACHE_TTL)
+        api_get(f"/fixtures/statistics?fixture={fixture_id}", use_cache=False)
     )
 
     hs = stats.get(home, {})
@@ -3487,11 +2633,30 @@ def analizar_live_fixture(fixture_id, cache_ttl=0):
 
     sugerencias = []
 
-    # BTTS (Ambos marcan) ELIMINADO de live: efectividad real 38-41%.
-    # TARJETAS ELIMINADO de live: dependen del arbitro y del animo de los
-    # jugadores, factores que el modelo no mide.
-    # Las funciones sugerir_live_btts y sugerir_live_tarjetas se conservan
-    # definidas por compatibilidad, pero ya no se invocan.
+    sugerencias.extend(
+        sugerir_live_btts(
+            elapsed,
+            gh,
+            ga,
+            h_shots,
+            a_shots,
+            h_sog,
+            a_sog,
+            h_corners,
+            a_corners,
+            h_da,
+            a_da
+        )
+    )
+
+    sugerencias.extend(
+        sugerir_live_tarjetas(
+            elapsed,
+            total_yellow,
+            total_red,
+            abs(gh - ga) <= 1
+        )
+    )
 
     sugerencias.extend(
         sugerir_live_ht(
@@ -3542,21 +2707,6 @@ def analizar_live_fixture(fixture_id, cache_ttl=0):
     if sugerencias:
         sugerencias.sort(key=lambda x: (x["score"], x["prob"]), reverse=True)
         top_live = sugerencias[0]
-
-        # Refrescar la cuota con la cuota REAL EN VIVO antes de guardar.
-        # La cuota estimada del modelo (ej: cuota_corner de linea_corners_recomendada)
-        # es estatica y puede diferir mucho de la cuota live real del mercado.
-        try:
-            cuota_live_real, book_live_real = buscar_cuota_live(
-                fixture_id, top_live.get("jugada", "")
-            )
-            if cuota_live_real and cuota_live_real > 1.0:
-                top_live["cuota"] = cuota_live_real
-                top_live["cuota_api"] = cuota_live_real
-                top_live["bookmaker"] = book_live_real
-        except Exception as e:
-            print(f"WARN cuota live en analizar_live_fixture: {e}")
-
         guardar_pick_live_automatico(
             fixture_id,
             home,
@@ -3783,7 +2933,7 @@ def generar_pdf_resumen():
         except Exception:
             pass
 
-    # ── Seccion combinadas y mini-tickets del dia ────────────────────
+    # ── Seccion combinada del dia ────────────────────────────────────
     y -= 10
     c.setFont("Helvetica-Bold", 12)
     c.drawString(40, y, "COMBINADA DEL DIA")
@@ -3791,25 +2941,9 @@ def generar_pdf_resumen():
     c.setFont("Helvetica", 10)
 
     comb_hoy = None
-    mini_tickets_hoy = []
     try:
         combinadas = leer_json(COMBINADAS_FILE)
-        # Combinada principal (no MT)
-        comb_hoy = next(
-            (c2 for c2 in combinadas
-             if c2.get("fecha") == hoy
-             and c2.get("subtipo") not in ("MT",)
-             and not c2.get("sin_combinada")
-             and c2.get("picks")),
-            None
-        )
-        # Mini-tickets del dia
-        mini_tickets_hoy = [
-            c2 for c2 in combinadas
-            if c2.get("fecha") == hoy
-            and c2.get("subtipo") == "MT"
-            and c2.get("picks")
-        ]
+        comb_hoy = next((c2 for c2 in combinadas if c2.get("fecha") == hoy), None)
     except Exception:
         pass
 
@@ -3821,49 +2955,18 @@ def generar_pdf_resumen():
         y -= 14
         for i, pk in enumerate(comb_hoy.get("picks", []), 1):
             cuota_p = pk.get("cuota") or pk.get("cuota_minima") or "?"
-            estado_pk = pk.get("estado", "pendiente")
-            linea = f"  {i}. {pk.get('partido','')} — {pk.get('jugada','')} | Score: {pk.get('score','')} | Cuota: {cuota_p} | {estado_pk.upper()}"
+            linea = f"  {i}. {pk.get('partido','')} — {pk.get('jugada','')} | Score: {pk.get('score','')} | Cuota: {cuota_p}"
             c.drawString(40, y, linea[:110])
             y -= 14
-        # Solo mostrar "Fallo en" si el estado real es fallo
-        if comb_hoy.get("estado","").lower() == "fallo" and comb_hoy.get("fallo_en"):
+        if comb_hoy.get("fallo_en"):
             c.drawString(40, y, f"  Fallo en: {comb_hoy.get('fallo_en','')}")
             y -= 14
     elif comb_hoy and comb_hoy.get("sin_combinada"):
         c.drawString(40, y, f"Sin combinada rentable: {comb_hoy.get('motivo','')}")
         y -= 14
     else:
-        c.drawString(40, y, "No se genero combinada hoy (usa /combinada_dia para generarla)")
+        c.drawString(40, y, "No se genero combinada hoy (usa /combinada para generarla)")
         y -= 14
-
-    # Mini-tickets del dia
-    if mini_tickets_hoy:
-        y -= 10
-        c.setFont("Helvetica-Bold", 11)
-        c.drawString(40, y, f"MINI-TICKETS DEL DIA ({len(mini_tickets_hoy)} tickets)")
-        y -= 16
-        c.setFont("Helvetica", 9)
-        for mt in mini_tickets_hoy:
-            estado_mt = mt.get("estado", "pendiente").upper()
-            cuota_mt = mt.get("cuota_combinada", "?")
-            prob_mt = mt.get("prob_conjunta", "?")
-            ticket_id = mt.get("ticket_id", "")
-            c.drawString(40, y, f"Ticket: {ticket_id} | Cuota: {cuota_mt}x | Prob: {prob_mt}% | Estado: {estado_mt}")
-            y -= 12
-            for i, pk in enumerate(mt.get("picks", []), 1):
-                cuota_p = pk.get("cuota") or "?"
-                estado_pk = pk.get("estado", "pendiente")
-                linea = f"  {i}. {pk.get('partido','')} — {pk.get('jugada','')} | {cuota_p}x | {estado_pk.upper()}"
-                c.drawString(40, y, linea[:110])
-                y -= 11
-            y -= 5
-            if y < 80:
-                c.showPage()
-                y = 780
-                c.setFont("Helvetica", 9)
-
-    # ── Seccion handicap del dia ──────────────────────────────────────
-    y = _seccion_handicap_pdf(c, y, hoy)
 
     c.save()
 
@@ -4135,7 +3238,7 @@ def generar_pdf_reporte(picks, titulo, filename):
 
     data = [[
         "Fecha", "Hora", "Pais", "Liga", "Partido",
-        "Jugada", "Score", "Riesgo", "Resultado", "Estado"
+        "Jugada", "Score", "Riesgo", "Cuota", "Edge", "Estado"
     ]]
 
     ESTADO_COLORES = {
@@ -4148,6 +3251,9 @@ def generar_pdf_reporte(picks, titulo, filename):
         estado = p.get("estado", "pendiente").lower()
         fecha_raw = (p.get("fecha_partido") or p.get("fecha") or "")[:10]
         fecha_show = fecha_raw[5:] if len(fecha_raw) == 10 else fecha_raw
+        cuota_p = _cuota_segura(p) or ""
+        edge_p = p.get("edge", "")
+        edge_str = f"+{edge_p}%" if edge_p and float(str(edge_p) or 0) > 0 else (f"{edge_p}%" if edge_p else "N/D")
         data.append([
             fecha_show,
             p.get("hora", ""),
@@ -4157,12 +3263,13 @@ def generar_pdf_reporte(picks, titulo, filename):
             (p.get("jugada", ""))[:22],
             str(p.get("score", "")),
             str(p.get("riesgo", "")),
-            str(p.get("resultado_real", ""))[:12],
-            estado.upper()[:12],
+            str(cuota_p) if cuota_p else "N/D",
+            edge_str,
+            estado.upper()[:10],
         ])
         row_colors.append(ESTADO_COLORES.get(estado, colors.white))
 
-    col_w = [2*cm, 1.8*cm, 2.2*cm, 3.5*cm, 5.5*cm, 5*cm, 1.5*cm, 1.8*cm, 2.5*cm, 2.5*cm]
+    col_w = [1.8*cm, 1.5*cm, 2.0*cm, 3.0*cm, 5.0*cm, 4.5*cm, 1.3*cm, 1.3*cm, 1.5*cm, 1.5*cm, 2.0*cm]
     table = Table(data, repeatRows=1, colWidths=col_w)
 
     ts = [
@@ -4193,7 +3300,6 @@ def generar_pdf_reporte(picks, titulo, filename):
         fechas_ord = sorted([(p.get("fecha_partido") or p.get("fecha") or "")[:10] for p in picks_ord if (p.get("fecha_partido") or p.get("fecha"))])
         if fechas_ord:
             _seccion_combinadas_historico(elements, fechas_ord[0], fechas_ord[-1], styles)
-            _seccion_handicap_historico_pdf(elements, fechas_ord[0], fechas_ord[-1], styles)
 
     # Seccion prematch vs live
     elements.append(Spacer(1, 14))
@@ -4257,103 +3363,24 @@ def filtrar_picks_mes_actual():
 
     return filtrados
 
-# ══════════════════════════════════════════════════════════════════════
-# ALERTAS LIVE — sistema global de un solo job (ahorro de API)
-# Antes: 1 job por usuario, cada 90s, sin cache -> 3 usuarios = 3x consumo.
-# Ahora: 1 job global cada 150s, con cache; escanea UNA vez y notifica a
-# todos los suscriptores. El consumo de API ya no escala con los usuarios.
-# ══════════════════════════════════════════════════════════════════════
-
-# Intervalo del escaneo live global (segundos). 150s es suficiente para
-# alertas live y reduce el consumo frente a los 90s anteriores.
-ALERTAS_INTERVALO = 150
-# TTL de cache del escaneo live: algo menor que el intervalo para que
-# cada ciclo traiga datos frescos pero cualquier otra llamada a
-# /fixtures?live=all dentro de la ventana reuse el resultado.
-ALERTAS_CACHE_TTL = 120
-
-
-def cargar_suscriptores_alertas():
-    """Lista de chat_ids suscritos a alertas live (persistida en disco)."""
-    data = leer_json(ALERTAS_SUBS_FILE)
-    if isinstance(data, list):
-        return [c for c in data if c is not None]
-    return []
-
-
-def guardar_suscriptores_alertas(subs):
-    """Persiste la lista de suscriptores (sin duplicados)."""
-    unicos = sorted({c for c in subs if c is not None}, key=str)
-    guardar_json_lista(ALERTAS_SUBS_FILE, unicos)
-    return unicos
-
-
-def suscribir_alerta(chat_id):
-    """Anade un chat a la lista de alertas. True si quedo suscrito."""
-    subs = cargar_suscriptores_alertas()
-    if chat_id not in subs:
-        subs.append(chat_id)
-        guardar_suscriptores_alertas(subs)
-    return True
-
-
-def desuscribir_alerta(chat_id):
-    """Quita un chat de la lista de alertas. True si estaba y se quito."""
-    subs = cargar_suscriptores_alertas()
-    if chat_id in subs:
-        subs = [c for c in subs if c != chat_id]
-        guardar_suscriptores_alertas(subs)
-        return True
-    return False
-
-
 async def revisar_alertas_live(context: ContextTypes.DEFAULT_TYPE):
-    """
-    Job GLOBAL de alertas live. Escanea los partidos en vivo UNA sola vez
-    y envia las alertas a todos los suscriptores. El escaneo usa cache, de
-    modo que el consumo de API es el mismo con 1 o con N usuarios.
-    """
-    subs = cargar_suscriptores_alertas()
-    if not subs:
-        return  # nadie suscrito: no se gasta ni una llamada extra
+    chat_id = context.job.chat_id
+    fixtures = api_get("/fixtures?live=all", use_cache=False)
 
-    # Escaneo unico con cache (mejora de consumo de API).
-    fixtures = api_get("/fixtures?live=all",
-                        use_cache=True, ttl=ALERTAS_CACHE_TTL)
-    if not fixtures:
-        return
-
-    # Detectar las alertas una sola vez (no por usuario).
-    nuevas = []
     for m in fixtures:
         fixture_id = str(m["fixture"]["id"])
+
         if fixture_id in ALERTED_LIVE:
             continue
-        analisis = analizar_live_fixture(fixture_id,
-                                         cache_ttl=ALERTAS_CACHE_TTL)
-        if analisis and analisis.get("alerta"):
+
+        analisis = analizar_live_fixture(fixture_id)
+
+        if analisis and analisis["alerta"]:
             ALERTED_LIVE.add(fixture_id)
-            nuevas.append(analisis["texto"])
-
-    if not nuevas:
-        return
-
-    # Difundir a todos los suscriptores. Si un envio falla (chat borrado,
-    # bot bloqueado), se quita ese suscriptor para no reintentar siempre.
-    caidos = []
-    for chat_id in subs:
-        for texto in nuevas:
-            try:
-                await context.bot.send_message(
-                    chat_id=chat_id,
-                    text=f"🚨 ALERTA AUTOMÁTICA LIVE\n\n{texto}"
-                )
-            except Exception:
-                caidos.append(chat_id)
-                break
-    if caidos:
-        restantes = [c for c in subs if c not in caidos]
-        guardar_suscriptores_alertas(restantes)
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=f"🚨 ALERTA AUTOMÁTICA LIVE\n\n{analisis['texto']}"
+            )
 
 
 async def enviar_reporte_semanal(context: ContextTypes.DEFAULT_TYPE):
@@ -4587,11 +3614,7 @@ async def _check_combinadas_job(context: ContextTypes.DEFAULT_TYPE):
     Si alguna combinada se cierra, notifica al chat.
     """
     try:
-        # Siempre actualizar picks individuales (no solo cuando hay combinadas)
-        actualizar_resultados_automaticos()
-        _actualizar_resultado_combinada()
-
-        # Verificar cuales combinadas cambiaron
+        # Verificar estado antes de actualizar
         combinadas_antes = leer_json(COMBINADAS_FILE)
         pendientes_antes = {
             c.get("ticket_id",""): c.get("estado","pendiente")
@@ -4600,133 +3623,14 @@ async def _check_combinadas_job(context: ContextTypes.DEFAULT_TYPE):
             and not c.get("sin_combinada")
         }
 
-        combinadas_despues = leer_json(COMBINADAS_FILE)
-        chat_id = context.job.chat_id
+        if not pendientes_antes:
+            return  # No hay pendientes, no hacer nada
 
-        for c in combinadas_despues:
-            ticket = c.get("ticket_id","")
-            if ticket not in pendientes_antes:
-                continue
-            nuevo_estado = c.get("estado","pendiente")
-            if nuevo_estado == pendientes_antes[ticket]:
-                continue
-            if nuevo_estado.lower() == "acierto":
-                emoji = "✅"
-                cuota = c.get("cuota_combinada", "?")
-                picks_txt = " + ".join(
-                    p.get("jugada","?") for p in c.get("picks",[])
-                )
-                await context.bot.send_message(
-                    chat_id=chat_id,
-                    text=(
-                        f"{emoji} *COMBINADA CERRADA — ACIERTO*\n"
-                        f"Ticket: {ticket}\n"
-                        f"Cuota: {cuota}x\n"
-                        f"Picks: {picks_txt}"
-                    ),
-                    parse_mode="Markdown"
-                )
-            elif nuevo_estado.lower() == "fallo":
-                await context.bot.send_message(
-                    chat_id=chat_id,
-                    text=f"❌ *Combinada {ticket} — fallo*",
-                    parse_mode="Markdown"
-                )
-    except Exception as e:
-        print(f"ERROR _check_combinadas_job: {e}")
-
-
-async def _job_actualizar_estados(context: ContextTypes.DEFAULT_TYPE):
-    """
-    Job global cada 20 minutos: actualiza estados de picks y combinadas
-    pendientes automaticamente, independientemente de si hay alertas activas.
-    Tambien detecta rachas de fallos y freno de bank.
-    """
-    try:
-        picks, cambios = actualizar_resultados_automaticos()
-        if cambios > 0:
-            print(f"[auto-update] {cambios} picks actualizados")
-
-        # Cerrar handicaps pendientes
-        try:
-            cambios_ha = cerrar_handicaps_pendientes()
-            if cambios_ha > 0:
-                print(f"[handicap] {cambios_ha} picks cerrados automaticamente")
-        except Exception as e:
-            print(f"WARN cerrar_handicaps: {e}")
-
-        # V: Alerta de racha de fallos consecutivos
-        picks_cerrados_recientes = [
-            p for p in picks
-            if p.get("estado", "").lower() in ("acierto", "fallo")
-        ]
-        picks_cerrados_recientes.sort(
-            key=lambda p: p.get("timestamp", ""), reverse=True
-        )
-        ultimos = picks_cerrados_recientes[:RACHA_FALLOS_ALERTA]
-        if (len(ultimos) == RACHA_FALLOS_ALERTA
-                and all(p.get("estado") == "fallo" for p in ultimos)):
-            chats = _cargar_chat_ids_alarmas()
-            for cid in chats:
-                try:
-                    await context.bot.send_message(
-                        chat_id=cid,
-                        text=(
-                            f"⚠️ *ALERTA: {RACHA_FALLOS_ALERTA} fallos consecutivos*\n"
-                            f"El sistema detectó una racha negativa. "
-                            f"Considera revisar los criterios antes de continuar."
-                        ),
-                        parse_mode="Markdown"
-                    )
-                except Exception:
-                    pass
-
-        # U: Freno de bank
-        try:
-            bank_data = _leer_bank_acumulado()
-            if bank_data:
-                bank_actual = bank_data[-1].get("bank", BANK_INICIAL)
-                freno = BANK_INICIAL * BANK_FRENO_PCT
-                if bank_actual <= freno:
-                    chats = _cargar_chat_ids_alarmas()
-                    for cid in chats:
-                        try:
-                            await context.bot.send_message(
-                                chat_id=cid,
-                                text=(
-                                    f"🛑 *FRENO DE BANK ACTIVADO*\n"
-                                    f"Bank actual: S/ {bank_actual:.2f} "
-                                    f"(límite: S/ {freno:.2f})\n"
-                                    f"No se generarán nuevos picks hasta revisión manual."
-                                ),
-                                parse_mode="Markdown"
-                            )
-                        except Exception:
-                            pass
-        except Exception as e:
-            print(f"WARN freno bank: {e}")
-
-    except Exception as e:
-        print(f"ERROR _job_actualizar_estados: {e}")
-    """
-    Job periodico cada 15 minutos.
-    Actualiza resultados de picks y combinadas pendientes automaticamente.
-    Si alguna combinada se cierra, notifica al chat.
-    """
-    try:
-        # Siempre actualizar picks individuales (no solo cuando hay combinadas)
+        # Actualizar picks y combinadas
         actualizar_resultados_automaticos()
         _actualizar_resultado_combinada()
 
-        # Verificar cuales combinadas cambiaron
-        combinadas_antes = leer_json(COMBINADAS_FILE)
-        pendientes_antes = {
-            c.get("ticket_id",""): c.get("estado","pendiente")
-            for c in combinadas_antes
-            if c.get("estado","pendiente") == "pendiente"
-            and not c.get("sin_combinada")
-        }
-
+        # Verificar cuales cambiaron
         combinadas_despues = leer_json(COMBINADAS_FILE)
         chat_id = context.job.chat_id
 
@@ -4781,18 +3685,6 @@ def programar_reportes(context: ContextTypes.DEFAULT_TYPE, chat_id):
     for job in context.job_queue.get_jobs_by_name(f"rendimiento_nocturno_{chat_id}"):
         job.schedule_removal()
 
-    # Job combinada garantizada diaria — 7:30 AM hora Peru (12:30 UTC)
-    for job in context.job_queue.get_jobs_by_name(f"combinada_dia_{chat_id}"):
-        job.schedule_removal()
-
-    context.job_queue.run_daily(
-        enviar_combinada_dia,
-        time=dtime(hour=12, minute=30),  # 12:30 UTC = 7:30 AM Peru
-        days=tuple(range(7)),
-        chat_id=chat_id,
-        name=f"combinada_dia_{chat_id}"
-    )
-
     context.job_queue.run_daily(
         enviar_reporte_semanal,
         time=dtime(hour=21, minute=0),
@@ -4816,6 +3708,17 @@ def programar_reportes(context: ContextTypes.DEFAULT_TYPE, chat_id):
         days=tuple(range(7)),
         chat_id=chat_id,
         name=f"rendimiento_nocturno_{chat_id}"
+    )
+
+    # Job automatico 00:00 hora Peru (= 05:00 UTC) — picks + combinadas + minitickets
+    for job in context.job_queue.get_jobs_by_name(f"medianoche_{chat_id}"):
+        job.schedule_removal()
+    context.job_queue.run_daily(
+        _job_automatico_medianoche,
+        time=dtime(hour=5, minute=0),
+        days=tuple(range(7)),
+        chat_id=chat_id,
+        name=f"medianoche_{chat_id}"
     )
 
     # Job cada 15 minutos para actualizar combinadas pendientes
@@ -4866,8 +3769,6 @@ def obtener_fixtures_por_fecha(ligas, fecha):
                 "home": m["teams"]["home"]["name"],
                 "away": m["teams"]["away"]["name"],
                 "league": titulo_liga,
-                "country": country,
-                "round": m["league"].get("round", ""),
                 "hour": hora_peru(m["fixture"]["date"]),
                 "timestamp": m["fixture"]["timestamp"]
             })
@@ -4898,24 +3799,50 @@ def texto_fixtures_fecha(titulo, ligas, fecha):
     return texto[:3900]
 
 async def fixtures_manana(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("📅 Buscando fixtures de mañana (todas las ligas + selecciones)...")
+    await update.message.reply_text("📅 Buscando fixtures Europa + Sudamérica de mañana...")
 
     ligas = {}
     ligas.update(EUROPA_LEAGUES)
     ligas.update(SUDAMERICA_LEAGUES)
-    ligas.update(OTRAS_LEAGUES)
-    ligas.update(SELECCIONES_LEAGUES)
+    ligas.update(LIGAS_NOCTURNAS)
 
     fecha = fecha_manana_peru()
 
     texto = texto_fixtures_fecha(
-        "FIXTURES MAÑANA — TODAS LAS LIGAS + SELECCIONES",
+        "FIXTURES EUROPA + SUDAMÉRICA MAÑANA",
         ligas,
         fecha
     )
 
-    await _enviar_mensaje_paginado(update, texto, parse_mode=None)
+    await update.message.reply_text(texto[:3900])
 
+
+async def fixtures_europa_manana(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("📅 Buscando fixtures Europa de mañana...")
+
+    fecha = fecha_manana_peru()
+
+    texto = texto_fixtures_fecha(
+        "FIXTURES EUROPA MAÑANA",
+        EUROPA_LEAGUES,
+        fecha
+    )
+
+    await update.message.reply_text(texto[:3900])
+
+
+async def fixtures_sudamerica_manana(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("📅 Buscando fixtures Sudamérica de mañana...")
+
+    fecha = fecha_manana_peru()
+
+    texto = texto_fixtures_fecha(
+        "FIXTURES SUDAMÉRICA MAÑANA",
+        SUDAMERICA_LEAGUES,
+        fecha
+    )
+
+    await update.message.reply_text(texto[:3900])
 
 async def top_manana(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("🏆 Buscando TOP prematch de mañana...")
@@ -4967,49 +3894,74 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     programar_reportes(context, chat_id)
 
     menu = (
-        "🤖 *HarryNine V14.2* activo 😎🔥\n"
+        "🤖 *HarryNine V14* activo 😎🔥\n"
         "━━━━━━━━━━\n"
         "📋 *FIXTURES*\n"
         "/fixtures — Partidos de hoy (todas las ligas)\n"
+        "/fixtures_europa — Solo Europa\n"
+        "/fixtures_sudamerica — Solo Sudamerica\n"
         "/fixtures_manana — Manana todas\n"
+        "/fixtures_europa_manana — Manana Europa\n"
+        "/fixtures_sudamerica_manana — Manana Sudamerica\n"
         "━━━━━━━━━━\n"
         "🔍 *ANALISIS*\n"
-        "/analizar_all — Analiza TODAS las ligas + selecciones + Mundial\n"
-        "/analizar — Mini-tickets del día (sin ID)\n"
-        "/analizar ID — Analiza un partido específico + mini-tickets\n"
+        "/analizar_all — Analiza TODAS las ligas automaticamente\n"
+        "/analizar ID — Analiza un partido especifico\n"
         "/detalle ID — Detalle completo de un partido\n"
         "/scanear — Escanea todas las ligas\n"
+        "/scanear_europa — Escanea Europa\n"
+        "/scanear_sudamerica — Escanea Sudamerica\n"
         "━━━━━━━━━━\n"
-        "🎫 *MINI-TICKETS Y COMBINADAS*\n"
-        "/analizar — Mini-tickets del día (Doble Op + Goles + Sin Roja)\n"
-        "/combinada_dia — Combinada garantizada del día (S/25 fijos)\n"
-        "/combinada — Combinada óptima prematch del día\n"
-        "/combinada_live — Combinada óptima picks live ahora\n"
+        "🎯 *PICKS PREMATCH*\n"
+        "/top — Mejores picks de hoy (score 7.5+)\n"
+        "/elite — Picks elite de hoy (score 9.0+)\n"
+        "/top_manana — Mejores picks de manana\n"
+        "/elite_manana — Picks elite de manana\n"
+        "━━━━━━━━━━\n"
+        "🔴 *PICKS LIVE*\n"
+        "/live_all — Analiza TODOS los partidos live auto\n"
+        "/live ID — Analisis de un partido live por ID\n"
+        "/toplive — Mejores picks en vivo\n"
+        "/elitelive — Picks elite en vivo\n"
+        "/alertas_on — Activa alertas automaticas live\n"
+        "/alertas_off — Desactiva alertas\n"
+        "━━━━━━━━━━\n"
+        "🎯 *COMBINADAS*\n"
+        "/combinada — Combinada optima prematch del dia\n"
+        "/combinada_live — Combinada optima picks live ahora\n"
         "/combinada_mixta — Combinada mixta prematch + live\n"
-        "/comb3 /comb4 /comb5 — Combinadas cuota alta\n"
+        "/comb3 — Combinada cuota 3x+ prematch\n"
+        "/comb3_live — Combinada cuota 3x+ live\n"
+        "/comb3_mixta — Combinada cuota 3x+ mixta\n"
+        "/comb4 — Combinada 4x+ prematch (3-4 picks)\n"
+        "/comb4_live — Combinada 4x+ live\n"
+        "/comb4_mixta — Combinada 4x+ mixta\n"
+        "/comb5 — Combinada 5x+ prematch (3-4 picks)\n"
+        "/comb5_live — Combinada 5x+ live\n"
+        "/comb5_mixta — Combinada 5x+ mixta\n"
         "━━━━━━━━━━\n"
-        "📊 *REPORTES*\n"
-        "/resumen — Resumen del dia (actualiza estados)\n"
-        "/resumen_ayer — Resumen de ayer + combinadas\n"
+        "📊 *REPORTES PDF*\n"
+        "/resumen — Resumen del dia (todos los picks)\n"
         "/resumen_prematch — Solo picks prematch de hoy\n"
         "/resumen_live — Solo picks live de hoy\n"
         "/resumen_combinadas — Solo combinadas de hoy\n"
         "/estado — Dashboard rapido del dia\n"
         "/escalera — Escalera cronologica de picks\n"
+        "/confirmar_escalera — Confirma la escalera\n"
+        "/cancelar_escalera — Cancela la escalera activa\n"
+        "/resumentop — Solo picks prematch\n"
+        "/resumentoplive — Solo picks live\n"
+        "/pdf_semana — Reporte semanal completo\n"
+        "/pdf_mes — Reporte mensual completo\n"
         "/rendimiento — Reporte de rendimiento + bank\n"
-        "/pdf_semana — Reporte semanal PDF\n"
-        "/pdf_mes — Reporte mensual PDF\n"
         "━━━━━━━━━━\n"
         "🔧 *UTILIDADES*\n"
-        "/feedback ID acierto|fallo — Marcar resultado\n"
+        "/feedback ID acierto — Marcar pick como acierto\n"
+        "/feedback ID fallo — Marcar pick como fallo\n"
         "━━━━━━━━━━\n"
-        "🔬 *HANDICAP ASIÁTICO*\n"
-        "/handicap — Picks de handicap del día (modo observación)\n"
-        "/handicap_stats — Estadísticas acumuladas de handicap\n"
-        "━━━━━━━━━━\n"
-        "⏰ *AUTOMATICO*\n"
-        "Estados: actualiza cada 20 min\n"
+        "⏰ *REPORTES AUTOMATICOS*\n"
         "Semanal: domingos 9:00 PM hora Peru\n"
+        "Mensual: diario 9:10 PM hora Peru\n"
         "Rendimiento nocturno: 11:59 PM hora Peru\n"
     )
     _registrar_chat_alarma(update.effective_chat.id)
@@ -5029,148 +3981,10 @@ async def sudamerica(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def analizar(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Sin ID — muestra mini-tickets del dia
     if not context.args:
-        _registrar_chat_alarma(update.effective_chat.id)
-        hoy = fecha_hoy_peru()
-
-        # Verificar si ya hay tickets generados hoy (cache del dia)
-        combinadas_hoy = leer_json(COMBINADAS_FILE)
-        mt_hoy = [c for c in combinadas_hoy
-                  if c.get("subtipo") == "MT"
-                  and c.get("fecha","")[:10] == hoy
-                  and c.get("estado") == "pendiente"]
-
-        if mt_hoy:
-            # Ya hay tickets del dia — mostrar los existentes sin regenerar
-            texto = f"💡 *Mini-tickets del día — {hoy}*\n"
-            texto += f"_{len(mt_hoy)} tickets (generados anteriormente hoy)_\n"
-            texto += "━━━━━━━━━━\n\n"
-
-            for i, mt in enumerate(mt_hoy, 1):
-                picks = mt.get("picks", [])
-                n = len(picks)
-                tipo = "Triple" if n == 3 else "Doble"
-                cuota = mt.get("cuota_combinada", 1.0)
-                prob = mt.get("prob_conjunta", 0)
-                ticket_id = mt.get("ticket_id", "")
-                ganancia_ref = round(10.0 * (cuota - 1), 2)
-
-                texto += f"🎫 *Ticket {i} — {tipo}* | `{ticket_id}`\n"
-                for j, e in enumerate(picks, 1):
-                    mismo_partido = sum(1 for x in picks if x["fixture_id"] == e["fixture_id"]) > 1
-                    est = " ⚠️est." if e.get("cuota_estimada") else ""
-                    mismo_txt = " 🔄" if mismo_partido else ""
-                    estado_e = e.get("estado","pendiente")
-                    icono = "✅" if estado_e == "acierto" else "❌" if estado_e == "fallo" else "✅"
-                    texto += (
-                        f"  {j}. *{e['partido']}*{mismo_txt}\n"
-                        f"     {e.get('league','')} | {e.get('hora','')}\n"
-                        f"     {icono} {e['jugada']}\n"
-                        f"     Cuota: {e['cuota']}x{est} | Prob: {e.get('prob',0)}%\n"
-                    )
-                texto += (
-                    f"📊 Cuota total: *{cuota}x* | Prob conjunta: *~{prob}%*\n"
-                    f"💰 Con S/10 → ganancia potencial: *S/ {ganancia_ref:.2f}*\n"
-                    f"━━━━━━━━━━\n\n"
-                )
-
-            texto += "_(Usa /analizar refresh para regenerar los tickets del día)_"
-            await _enviar_mensaje_paginado(update, texto)
-            return
-
-        await update.message.reply_text(
-            "💡 Generando mini-tickets del día...\n"
-            "Analizando todos los partidos disponibles. Esto puede tomar 1-2 minutos."
-        )
-        try:
-            tickets = generar_mini_tickets_dia()
-        except Exception as e:
-            await update.message.reply_text(f"❌ Error generando mini-tickets: {e}")
-            return
-
-        if not tickets:
-            await update.message.reply_text(
-                "❌ No encontré mini-tickets válidos para hoy.\n"
-                "Puede que no haya partidos disponibles o que las cuotas no alcancen el umbral mínimo."
-            )
-            return
-
-        # Guardar tickets en combinadas.json para seguimiento
-        for t in tickets:
-            _guardar_combinada(t)
-
-        # Formatear y enviar
-        texto = f"💡 *Mini-tickets del día — {hoy}*\n"
-        texto += f"_{len(tickets)} tickets sugeridos, ordenados por seguridad_\n"
-        texto += "━━━━━━━━━━\n\n"
-
-        for i, mt in enumerate(tickets, 1):
-            picks = mt["picks"]
-            n = mt["n_picks"]
-            tipo = "Triple" if n == 3 else "Doble"
-            cuota = mt["cuota_combinada"]
-            prob = mt["prob_conjunta"]
-            ticket_id = mt.get("ticket_id", "")
-            stake_ref = 10.0
-            ganancia_ref = round(stake_ref * (cuota - 1), 2)
-
-            texto += f"🎫 *Ticket {i} — {tipo}* | `{ticket_id}`\n"
-            for j, e in enumerate(picks, 1):
-                mismo_partido = sum(1 for x in picks if x["fixture_id"] == e["fixture_id"]) > 1
-                est = " ⚠️est." if e.get("cuota_estimada") else ""
-                mismo_txt = " 🔄" if mismo_partido else ""
-                texto += (
-                    f"  {j}. *{e['partido']}*{mismo_txt}\n"
-                    f"     {e['league']} | {e['hora']}\n"
-                    f"     ✅ {e['jugada']}\n"
-                    f"     Cuota: {e['cuota']}x{est} | Prob: {e['prob']}%\n"
-                )
-            texto += (
-                f"📊 Cuota total: *{cuota}x* | Prob conjunta: *~{prob}%*\n"
-                f"💰 Con S/10 → ganancia potencial: *S/ {ganancia_ref:.2f}*\n"
-                f"━━━━━━━━━━\n\n"
-            )
-
-        texto += (
-            "_(🔄 = mercados del mismo partido | ⚠️est. = cuota estimada, verifica en tu casa de apuestas)_\n"
-            "_(Tickets guardados para seguimiento automático)_"
-        )
-
-        await _enviar_mensaje_paginado(update, texto)
+        await update.message.reply_text("Usa: /analizar ID")
         return
 
-    # Con ID o "refresh"
-    if context.args and context.args[0].lower() == "refresh":
-        # Eliminar tickets pendientes del dia y regenerar
-        hoy_r = fecha_hoy_peru()
-        combinadas_r = leer_json(COMBINADAS_FILE)
-        combinadas_r = [c for c in combinadas_r
-                        if not (c.get("subtipo") == "MT"
-                                and c.get("fecha","")[:10] == hoy_r
-                                and c.get("estado") == "pendiente")]
-        guardar_json_lista(COMBINADAS_FILE, combinadas_r)
-
-        await update.message.reply_text(
-            "🔄 Tickets del día eliminados. Regenerando...\n"
-            "Esto puede tomar 1-2 minutos."
-        )
-        try:
-            tickets_r = generar_mini_tickets_dia()
-        except Exception as e:
-            await update.message.reply_text(f"❌ Error: {e}")
-            return
-        if not tickets_r:
-            await update.message.reply_text("❌ No encontré mini-tickets válidos para hoy.")
-            return
-        for t in tickets_r:
-            _guardar_combinada(t)
-        await update.message.reply_text(
-            f"✅ {len(tickets_r)} tickets nuevos generados y guardados. Usa /analizar para verlos."
-        )
-        return
-
-    # Con ID — análisis del partido específico
     fixture_id = context.args[0]
 
     fixture = api_get(f"/fixtures?id={fixture_id}", use_cache=False)
@@ -5214,7 +4028,7 @@ async def analizar(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             texto += "\n💾 Soporte prematch guardado automáticamente para seguimiento."
 
-        await _enviar_mensaje_paginado(update, texto)
+        await update.message.reply_text(texto[:3900])
         return
 
     if status in ["FT", "AET", "PEN"]:
@@ -5235,93 +4049,7 @@ async def analizar(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     guardar_pick_automatico(data)
-
-    # Generar mini-tickets del mismo partido
-    mini_tickets_partido = []
-    try:
-        home_gen = data.get("home_general") or {}
-        away_gen = data.get("away_general") or {}
-        home = data["home"]
-        away = data["away"]
-        league = data["league"]
-        country = data.get("country", "")
-        hora = data["hora"]
-
-        # Candidatos de eslabones para este partido
-        eslabones_p = []
-        for r in data.get("recomendaciones", []):
-            cuota_r = _cuota_segura(r)
-            prob_r = float(r.get("prob", 0) or 0)
-            if MINI_TICKET_CUOTA_MIN <= cuota_r <= MINI_TICKET_CUOTA_MAX and prob_r >= 60:
-                eslabones_p.append({
-                    "fixture_id": fixture_id,
-                    "partido": f"{home} vs {away}",
-                    "mercado": r.get("mercado", ""),
-                    "jugada": r.get("jugada", ""),
-                    "prob": prob_r,
-                    "cuota": cuota_r,
-                })
-
-        # Sin Tarjeta Roja para este partido - solo con cuota real de Pinnacle
-        fase_p = _detectar_fase_torneo(league, "")
-        prob_sr = calcular_prob_sin_roja(home_gen, away_gen, fase_p)
-        if prob_sr >= 75:
-            odds_sr_p = api_get(f"/odds?fixture={fixture_id}", use_cache=True, ttl=600)
-            cuota_sr_real = None
-            if odds_sr_p:
-                PINNACLE_NAMES_SR = {"Pinnacle", "Pinnacle Sports"}
-                RED_CARD_MARKETS_SR = {"Red Card", "Will There Be a Red Card",
-                                       "Red Cards", "Tarjeta Roja"}
-                for casa_sr in odds_sr_p:
-                    for book_sr in casa_sr.get("bookmakers", []):
-                        if book_sr.get("name","") not in PINNACLE_NAMES_SR:
-                            continue
-                        for bet_sr in book_sr.get("bets", []):
-                            if not any(rc.lower() in bet_sr.get("name","").lower()
-                                       for rc in RED_CARD_MARKETS_SR):
-                                continue
-                            for val_sr in bet_sr.get("values", []):
-                                if str(val_sr.get("value","")).lower() in ("no","nein","non"):
-                                    try:
-                                        c_r = float(val_sr.get("odd"))
-                                        if c_r > 1.0:
-                                            cuota_sr_real = round(c_r, 3)
-                                    except Exception:
-                                        pass
-            if cuota_sr_real and MINI_TICKET_CUOTA_MIN <= cuota_sr_real <= MINI_TICKET_CUOTA_MAX:
-                eslabones_p.append({
-                    "fixture_id": fixture_id,
-                    "partido": f"{home} vs {away}",
-                    "mercado": "Sin Tarjeta Roja",
-                    "jugada": "Sin Tarjeta Roja",
-                    "prob": prob_sr,
-                    "cuota": cuota_sr_real,
-                })
-
-        # Armar combinaciones de 2 eslabones del mismo partido
-        from itertools import combinations as _comb_p
-        for grupo_p in _comb_p(eslabones_p, 2):
-            grupo_p = list(grupo_p)
-            if not _son_compatibles(grupo_p[0]["jugada"], grupo_p[1]["jugada"]):
-                continue
-            cuota_p = round(grupo_p[0]["cuota"] * grupo_p[1]["cuota"], 2)
-            prob_p = round(grupo_p[0]["prob"] / 100 * grupo_p[1]["prob"] / 100 * 100, 1)
-            if MINI_TICKET_CUOTA_OBJ_MIN <= cuota_p <= MINI_TICKET_CUOTA_OBJ_MAX and prob_p >= MINI_TICKET_PROB_MIN:
-                mini_tickets_partido.append({
-                    "picks": grupo_p,
-                    "cuota_combinada": cuota_p,
-                    "prob_conjunta": prob_p,
-                    "n_picks": 2,
-                })
-
-        mini_tickets_partido.sort(key=lambda t: t["prob_conjunta"], reverse=True)
-    except Exception as e:
-        print(f"WARN mini_tickets_partido {fixture_id}: {e}")
-
-    await _enviar_mensaje_paginado(
-        update,
-        texto_resumen(data, mini_tickets=mini_tickets_partido[:3])
-    )
+    await update.message.reply_text(texto_resumen(data))
 
 
 async def detalle(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -5427,9 +4155,16 @@ async def fixtures(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ligas = {}
     ligas.update(EUROPA_LEAGUES)
     ligas.update(SUDAMERICA_LEAGUES)
-    ligas.update(OTRAS_LEAGUES)
-    ligas.update(SELECCIONES_LEAGUES)
-    await fixtures_ligas(update, context, ligas, "Europa + Sudamérica + Selecciones + Mundial")
+    ligas.update(LIGAS_NOCTURNAS)
+    await fixtures_ligas(update, context, ligas, "Europa + Sudamérica")
+
+
+async def fixtures_europa(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await fixtures_ligas(update, context, EUROPA_LEAGUES, "Europa")
+
+
+async def fixtures_sudamerica(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await fixtures_ligas(update, context, SUDAMERICA_LEAGUES, "Sudamérica")
 
 
 async def scanear_ligas(update: Update, context: ContextTypes.DEFAULT_TYPE, leagues, titulo):
@@ -5516,14 +4251,21 @@ async def scanear_ligas(update: Update, context: ContextTypes.DEFAULT_TYPE, leag
     await update.message.reply_text(texto[:3900])
 
 
+async def scanear_europa(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await scanear_ligas(update, context, EUROPA_LEAGUES, "Europa")
+
+
+async def scanear_sudamerica(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await scanear_ligas(update, context, SUDAMERICA_LEAGUES, "Sudamérica")
+
+
 async def scanear(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ligas = {}
     ligas.update(EUROPA_LEAGUES)
     ligas.update(SUDAMERICA_LEAGUES)
-    ligas.update(OTRAS_LEAGUES)
-    ligas.update(SELECCIONES_LEAGUES)
+    ligas.update(LIGAS_NOCTURNAS)
 
-    await scanear_ligas(update, context, ligas, "Europa + Sudamérica + Selecciones + Mundial")
+    await scanear_ligas(update, context, ligas, "Europa + Sudamérica")
 
 
 async def elite(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -5556,8 +4298,15 @@ async def elite(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def top(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ops = generar_top()
-    # generar_top ya ordena correctamente por score — no re-ordenar aqui
 
+    ops = sorted(
+    ops,
+    key=lambda x: (
+        -x["score"],
+        x["riesgo"]
+    )
+)
+    
     if not ops:
         await update.message.reply_text("❌ No encontré oportunidades fuertes.")
         return
@@ -5611,39 +4360,153 @@ async def top(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(texto[:3900])
 
 
+async def live(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.message.reply_text(listar_live())
+        return
+
+    analisis = analizar_live_fixture(context.args[0])
+
+    if not analisis:
+        await update.message.reply_text("❌ No encontré el partido.")
+        return
+
+    await update.message.reply_text(analisis["texto"])
+
+
+async def elitelive(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("🏆 Buscando picks ÉLITE LIVE...")
+
+    fixtures = api_get("/fixtures?live=all", use_cache=False)
+    oportunidades = []
+
+    for m in fixtures:
+        fixture_id = str(m["fixture"]["id"])
+        analisis = analizar_live_fixture(fixture_id)
+
+        if not analisis:
+            continue
+
+        if analisis["score_live"] >= 9 and analisis["sugerencias"]:
+            oportunidades.append({
+                "fixture_id": fixture_id,
+                "score": analisis["score_live"],
+                "texto": analisis["texto"]
+            })
+
+    oportunidades.sort(key=lambda x: x["score"], reverse=True)
+
+    if not oportunidades:
+        await update.message.reply_text("❌ No encontré picks ÉLITE LIVE score 9+.")
+        return
+
+    texto = "🏆 PICKS ÉLITE LIVE\n"
+
+    for op in oportunidades[:5]:
+        texto += f"\n⭐ Score {op['score']}/10\n{op['texto']}\n"
+
+    await update.message.reply_text(texto[:3900])
+
+
+async def toplive(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    fixtures = api_get("/fixtures?live=all", use_cache=False)
+    oportunidades = []
+
+    for m in fixtures:
+        fixture_id = str(m["fixture"]["id"])
+        analisis = analizar_live_fixture(fixture_id)
+
+        if not analisis:
+            continue
+
+        if analisis["score_live"] >= 6 and analisis["sugerencias"]:
+            mejor = analisis["sugerencias"][0]
+
+            oportunidades.append({
+                "id": fixture_id,
+                "fixture_id": fixture_id,
+                "home": m["teams"]["home"]["name"],
+                "away": m["teams"]["away"]["name"],
+                "league": m["league"]["name"],
+                "country": m["league"].get("country", ""),
+                "minute": m["fixture"]["status"].get("elapsed", ""),
+                "score": analisis["score_live"],
+                "texto": analisis["texto"],
+                "mercado": mejor.get("mercado", ""),
+                "jugada": mejor.get("jugada", ""),
+                "prob": mejor.get("prob", "N/D"),
+                "riesgo": mejor.get("riesgo", "N/D"),
+                "cuota_minima": mejor.get("cuota", "N/D"),
+                "cuota": mejor.get("cuota", "N/D"),
+                "motivo": mejor.get("motivo", "")
+            })
+
+    oportunidades.sort(key=lambda x: x["score"], reverse=True)
+
+    if not oportunidades:
+        await update.message.reply_text("❌ No hay oportunidades live fuertes.")
+        return
+
+    for o in oportunidades:
+        data_guardar = {
+            "fixture_id": str(o["fixture_id"]),
+            "fuente": "toplive",
+            "tipo": "live",
+            "fecha": fecha_hoy_peru(),
+            "hora": f"Min {o.get('minute', '')}",
+            "country": o.get("country", ""),
+            "league": o.get("league", ""),
+            "home": o["home"],
+            "away": o["away"],
+            "partido": f"{o['home']} vs {o['away']}",
+            "recomendaciones": [{
+                "mercado": o.get("mercado", ""),
+                "jugada": o.get("jugada", ""),
+                "prob": o.get("prob", "N/D"),
+                "score": o.get("score", "N/D"),
+                "riesgo": o.get("riesgo", "N/D"),
+                "cuota_minima": o.get("cuota_minima", "N/D"),
+                "cuota": o.get("cuota", "N/D"),
+                "motivo": o.get("motivo", "")
+            }]
+        }
+
+        guardar_pick_automatico(data_guardar)
+
+    texto = "🔥 TOP LIVE\n"
+
+    for op in oportunidades[:3]:
+        texto += f"\n⭐ Score {op['score']}/10\n{op['texto']}\n"
+
+    texto += "\n💾 Picks TOP LIVE guardados automáticamente para tracking."
+
+    await update.message.reply_text(texto[:3900])
+
+
 async def alertas_on(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
 
-    # Limpiar cualquier job por-usuario heredado del esquema antiguo
-    # (compatibilidad: instalaciones previas creaban un job con name=chat_id).
     for job in context.job_queue.get_jobs_by_name(str(chat_id)):
         job.schedule_removal()
 
-    suscribir_alerta(chat_id)
-    total = len(cargar_suscriptores_alertas())
-
-    await update.message.reply_text(
-        f"✅ Alertas LIVE activadas. El bot revisa cada "
-        f"{ALERTAS_INTERVALO} segundos.\n"
-        f"({total} usuario(s) suscrito(s) — el consumo de API es el mismo "
-        f"para todos)."
+    context.job_queue.run_repeating(
+        revisar_alertas_live,
+        interval=90,
+        first=5,
+        chat_id=chat_id,
+        name=str(chat_id)
     )
+
+    await update.message.reply_text("✅ Alertas LIVE activadas. Revisaré cada 90 segundos.")
 
 
 async def alertas_off(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
 
-    # Limpiar job heredado del esquema antiguo, si existiera.
     for job in context.job_queue.get_jobs_by_name(str(chat_id)):
         job.schedule_removal()
 
-    estaba = desuscribir_alerta(chat_id)
-    if estaba:
-        await update.message.reply_text("🛑 Alertas LIVE desactivadas.")
-    else:
-        await update.message.reply_text(
-            "ℹ️ No tenías alertas activas."
-        )
+    await update.message.reply_text("🛑 Alertas LIVE desactivadas.")
 
 def generar_pdf_resumentop():
     picks, cambios = actualizar_resultados_automaticos()
@@ -5786,241 +4649,14 @@ async def resumentoplive(update: Update, context: ContextTypes.DEFAULT_TYPE):
     with open(_tmp_path("resumen_toplive.pdf"), "rb") as f:
         await update.message.reply_document(f)
 
-def construir_resumen_textual(picks, titulo="Resumen Diario"):
-    """
-    Construye un resumen textual compacto estilo Telegram a partir de una
-    lista de picks. Calcula efectividad, profit/loss simulado, ROI, mejores
-    y peores mercados, y agrega observaciones automaticas.
-    """
-    if not picks:
-        return f"\U0001f4ca *{titulo}*\n\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\nSin picks registrados en el periodo."
-
-    cerrados = [p for p in picks if p.get("estado") in ("acierto", "fallo")
-                or p.get("resultado_real") in ("acierto", "fallo")]
-    pendientes = [p for p in picks if p not in cerrados]
-
-    def _es_acierto(p):
-        return p.get("estado") == "acierto" or p.get("resultado_real") == "acierto"
-
-    aciertos = [p for p in cerrados if _es_acierto(p)]
-    fallos = [p for p in cerrados if not _es_acierto(p)]
-    n_cerr = len(cerrados)
-    efectividad = (len(aciertos) / n_cerr * 100) if n_cerr else 0.0
-
-    # Simulacion profit/loss: stake fijo 1 unidad por pick cerrado
-    # Cuota se limita a 10.0 para evitar picks con cuotas incorrectas
-    # (ej: cuotas de selecciones mal calculadas en versiones anteriores)
-    profit = 0.0
-    for p in cerrados:
-        cuota = p.get("cuota_api") or p.get("cuota") or p.get("cuota_pinnacle") or p.get("cuota_minima") or 0
-        try:
-            cuota = float(cuota)
-        except Exception:
-            cuota = 0
-        # Limitar cuota a rango razonable (max 10.0) para evitar distorsiones
-        cuota = min(cuota, 10.0)
-        if _es_acierto(p) and cuota > 1.0:
-            profit += (cuota - 1)
-        elif not _es_acierto(p):
-            profit -= 1
-    roi = (profit / n_cerr * 100) if n_cerr else 0.0
-
-    # Mejor y peor mercado por efectividad
-    por_mercado = {}
-    for p in cerrados:
-        mkt = p.get("mercado", "N/D") or "N/D"
-        por_mercado.setdefault(mkt, {"ok": 0, "tot": 0})
-        por_mercado[mkt]["tot"] += 1
-        if _es_acierto(p):
-            por_mercado[mkt]["ok"] += 1
-
-    ranking = []
-    for mkt, d in por_mercado.items():
-        if d["tot"] >= 2:  # minimo 2 picks para ser representativo
-            ranking.append((mkt, d["ok"] / d["tot"] * 100, d["tot"]))
-    ranking.sort(key=lambda x: x[1], reverse=True)
-
-    mejor_mkt = ranking[0] if ranking else None
-    peor_mkt = ranking[-1] if len(ranking) > 1 else None
-
-    # Bank simulado acumulado del mes
-    try:
-        bank_data = _leer_bank_acumulado()
-        bank_actual = bank_data[-1].get("bank") if bank_data else BANK_INICIAL
-    except Exception:
-        bank_actual = BANK_INICIAL
-
-    # Observaciones automaticas
-    obs = []
-    if efectividad >= 75:
-        obs.append("Rendimiento solido, efectividad sobre objetivo.")
-    elif efectividad >= 60:
-        obs.append("Rendimiento aceptable, margen de mejora en seleccion.")
-    elif n_cerr > 0:
-        obs.append("Efectividad baja, revisar criterios de los picks.")
-    if mejor_mkt:
-        obs.append(f"El mercado {mejor_mkt[0]} fue el mas preciso ({mejor_mkt[1]:.0f}%).")
-    if peor_mkt and peor_mkt[1] < 50:
-        obs.append(f"El mercado {peor_mkt[0]} rindio por debajo del 50%, precaucion.")
-    if roi > 0:
-        obs.append(f"ROI positivo: cada unidad apostada genero retorno.")
-    elif n_cerr > 0:
-        obs.append("ROI negativo en el periodo.")
-    if not obs:
-        obs.append("Sin datos suficientes para un analisis detallado.")
-
-    profit_emoji = "\U0001f7e2" if profit >= 0 else "\U0001f534"
-    signo = "+" if profit >= 0 else ""
-
-    lineas = [
-        f"\U0001f4ca *{titulo}*",
-        "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501",
-        f"\U0001f3b2 Total picks: {len(picks)}  (cerrados: {n_cerr} | pendientes: {len(pendientes)})",
-        f"\u2705 Aciertos: {len(aciertos)}",
-        f"\u274c Fallos: {len(fallos)}",
-        f"\U0001f3af Efectividad: {efectividad:.1f}%",
-        f"{profit_emoji} Profit: {signo}{profit:.2f} u",
-        f"\U0001f4c8 ROI: {roi:+.1f}%",
-        f"\U0001f3e6 Bank acumulado: S/ {bank_actual:.2f}",
-        "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501",
-    ]
-    if mejor_mkt:
-        lineas.append(f"\U0001f3c6 Mejor mercado: {mejor_mkt[0]} ({mejor_mkt[1]:.0f}%, {mejor_mkt[2]} picks)")
-    if peor_mkt:
-        lineas.append(f"\U0001f53b Peor mercado: {peor_mkt[0]} ({peor_mkt[1]:.0f}%, {peor_mkt[2]} picks)")
-    lineas.append("")
-    lineas.append("\U0001f9e0 *Analisis:*")
-    for o in obs:
-        lineas.append(f"\u2022 {o}")
-
-    return "\n".join(lineas)
-
-
 async def resumen(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
-    await update.message.reply_text("📄 Actualizando estados y generando resumen del día...")
+    await update.message.reply_text("📄 Generando resumen PDF del día...")
 
-    # C: Actualizar estados ANTES de construir el texto
-    try:
-        actualizar_resultados_automaticos()
-    except Exception as e:
-        print(f"WARN resumen actualizar: {e}")
+    generar_pdf_resumen()
 
-    # PUNTO 5: resumen textual estilo Telegram (sin abrir archivos)
-    try:
-        picks_hoy = [p for p in leer_json(PICKS_FILE)
-                     if p.get("fecha") == fecha_hoy_peru()
-                     or p.get("fecha_partido") == fecha_hoy_peru()]
-        texto = construir_resumen_textual(picks_hoy, "Resumen Diario")
-        await _enviar_mensaje_paginado(update, texto)
-    except Exception as e:
-        await update.message.reply_text(f"⚠️ No se pudo generar el resumen textual: {e}")
-
-    # PDF como complemento
-    try:
-        generar_pdf_resumen()
-        with open(_tmp_path("resumen_dia.pdf"), "rb") as f:
-            await update.message.reply_document(f)
-    except Exception:
-        pass
-
-
-def _resumen_combinadas_texto(fecha):
-    """
-    Construye un bloque textual con el resumen de combinadas de una fecha.
-    Devuelve string formateado para Telegram.
-    """
-    try:
-        combinadas = leer_json(COMBINADAS_FILE)
-    except Exception:
-        return ""
-
-    combs = [c for c in combinadas
-             if (c.get("fecha", "") == fecha)
-             and not c.get("sin_combinada")
-             and c.get("picks")]
-
-    if not combs:
-        return "\U0001f3ab *Combinadas:* sin combinadas registradas ese dia."
-
-    cerradas = [c for c in combs if c.get("estado", "").lower() in ("acierto", "fallo")]
-    aciertos = [c for c in cerradas if c.get("estado", "").lower() == "acierto"]
-    fallos = [c for c in cerradas if c.get("estado", "").lower() == "fallo"]
-    pendientes = [c for c in combs if c not in cerradas]
-
-    ef = (len(aciertos) / len(cerradas) * 100) if cerradas else 0.0
-
-    # Simulacion de bank: stake 10% por combinada
-    profit = 0.0
-    for c in cerradas:
-        cuota = float(c.get("cuota_combinada", 0) or 0)
-        stake = 1.0  # 1 unidad por ticket
-        if c.get("estado", "").lower() == "acierto" and cuota > 1.0:
-            profit += stake * (cuota - 1)
-        else:
-            profit -= stake
-    roi = (profit / len(cerradas) * 100) if cerradas else 0.0
-
-    signo = "+" if profit >= 0 else ""
-    emoji_p = "\U0001f7e2" if profit >= 0 else "\U0001f534"
-
-    lineas = [
-        "\U0001f3ab *Combinadas del dia:*",
-        f"  Total: {len(combs)}  (cerradas: {len(cerradas)} | pendientes: {len(pendientes)})",
-        f"  \u2705 Aciertos: {len(aciertos)}   \u274c Fallos: {len(fallos)}",
-        f"  \U0001f3af Efectividad: {ef:.1f}%",
-        f"  {emoji_p} Profit: {signo}{profit:.2f} u   \U0001f4c8 ROI: {roi:+.1f}%",
-    ]
-    return "\n".join(lineas)
-
-
-async def resumen_ayer(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Comando /resumen_ayer — resumen del dia anterior, incluye combinadas."""
-    ayer = fecha_ayer_peru()
-    await update.message.reply_text(f"\U0001f4c5 Generando resumen de ayer ({ayer})...")
-
-    # Actualizar resultados antes de resumir
-    try:
-        actualizar_resultados_automaticos()
-        _actualizar_resultado_combinada()
-    except Exception:
-        pass
-
-    # Resumen de picks de ayer
-    try:
-        picks_ayer = [p for p in leer_json(PICKS_FILE)
-                      if p.get("fecha") == ayer
-                      or p.get("fecha_partido") == ayer]
-        texto = construir_resumen_textual(picks_ayer, f"Resumen de Ayer — {ayer}")
-    except Exception as e:
-        texto = f"\u26a0\ufe0f No se pudo generar el resumen de picks: {e}"
-
-    # Bloque de combinadas de ayer
-    bloque_comb = _resumen_combinadas_texto(ayer)
-
-    # Bloque handicap de ayer
-    bloque_ha = ""
-    try:
-        ha_ayer = [r for r in leer_json(HANDICAP_FILE)
-                   if r.get("fecha","")[:10] == ayer]
-        if ha_ayer:
-            cerrados_ha = [r for r in ha_ayer if r.get("estado") in ("acierto","fallo","push")]
-            aciertos_ha = sum(1 for r in cerrados_ha if r.get("estado") == "acierto")
-            fallos_ha = sum(1 for r in cerrados_ha if r.get("estado") == "fallo")
-            push_ha = sum(1 for r in cerrados_ha if r.get("estado") == "push")
-            validos_ha = aciertos_ha + fallos_ha
-            ef_ha = round(aciertos_ha / validos_ha * 100, 1) if validos_ha else 0
-            bloque_ha = (
-                f"\n\n🔬 *Handicap Asiático ayer (observación):*\n"
-                f"Total: {len(ha_ayer)} | Cerrados: {len(cerrados_ha)} | "
-                f"✅ {aciertos_ha} | ❌ {fallos_ha} | 🔄 {push_ha} push\n"
-                f"Efectividad: {ef_ha}%"
-            )
-    except Exception:
-        pass
-
-    mensaje = texto + "\n\n" + bloque_comb + bloque_ha
-    await update.message.reply_text(mensaje, parse_mode="Markdown")
+    with open(_tmp_path("resumen_dia.pdf"), "rb") as f:
+        await update.message.reply_document(f)
 
 
 async def pdf_semana(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -6083,15 +4719,6 @@ async def feedback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     guardar_json_lista(PICKS_FILE, picks)
 
-    # Tambien actualizar en HANDICAP_FILE si corresponde
-    handicaps = leer_json(HANDICAP_FILE)
-    for h in handicaps:
-        if str(h.get("fixture_id")) == str(fixture_id):
-            h["estado"] = resultado
-            h["resultado"] = resultado
-            actualizado = True
-    guardar_json_lista(HANDICAP_FILE, handicaps)
-
     agregar_json(FEEDBACK_FILE, {
         "fixture_id": fixture_id,
         "resultado": resultado,
@@ -6110,42 +4737,7 @@ async def feedback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 REPORTE_FILE_TEMPLATE = _os_bot.path.join(BOT_DIR, "reporte_{year}_{month:02d}.json")
 BANK_INICIAL = 500.0
-STAKE_COMBINADA = 0.10
-STAKE_COMBINADA_DIA = 25.0
-
-# ── HANDICAP ASIATICO — MODO OBSERVACION ─────────────────────────────
-HANDICAP_FILE = _tmp_path("handicap_seguimiento.json")
-MAX_HANDICAP_DIA = 10          # maximo picks de handicap por dia
-HANDICAP_CUOTA_MIN = 1.75      # cuota minima para que valga registrar
-HANDICAP_PICKS_MIN_CONFIANZA = 30  # picks cerrados minimos para confiar
-
-# Ligas que NO tienen estadisticas detalladas en API-Football
-# Para estas ligas NO se sugiere "Sin Tarjeta Roja" porque la API no puede verificarlo
-LIGAS_SIN_STATS = {
-    "Uruguay Uruguay Primera División",
-    "Uruguay Primera Division",
-    "Peru Liga 1",
-    "Bolivia Liga Profesional",
-    "Ecuador Liga Pro",
-    "Paraguay Division Profesional",
-    "Venezuela Primera Division",
-    "Baltic Cup",
-    "Friendlies Clubs",
-}
-
-# ── MINI-TICKETS ──────────────────────────────────────────────────────────
-# Cuota individual minima y maxima para eslabones de mini-tickets
-MINI_TICKET_CUOTA_MIN = 1.10
-MINI_TICKET_CUOTA_MAX = 1.80
-# Cuota total objetivo del mini-ticket
-MINI_TICKET_CUOTA_OBJ_MIN = 1.40
-MINI_TICKET_CUOTA_OBJ_MAX = 2.20
-# Probabilidad conjunta minima
-MINI_TICKET_PROB_MIN = 62.0
-# Maximos mini-tickets sugeridos por dia
-MINI_TICKET_MAX_DIA = 5
-# Mercados permitidos en mini-tickets
-MINI_TICKET_MERCADOS = {"Doble oportunidad", "Goles totales", "Sin Tarjeta Roja"}
+STAKE_COMBINADA = 0.10  # 10% del bank para todas las combinadas
 
 
 def _stake_pct(score, riesgo=None):
@@ -6468,21 +5060,13 @@ def _registrar_aprendizaje(pick, resultado):
         "away": away,
         "liga": pick.get("league") or pick.get("liga") or "Desconocida",
         "pais": pick.get("country", ""),
-        # Pick — valores originales Y recalibrados para ML
+        # Pick
         "mercado": pick.get("mercado", ""),
         "jugada": pick.get("jugada", ""),
         "score": float(pick.get("score", 0) or 0),
-        "score_original": float(pick.get("score_original", pick.get("score", 0)) or 0),
         "riesgo": float(pick.get("riesgo", 5) or 5),
         "probabilidad": float(pick.get("probabilidad", 0) or 0),
-        "prob_original": float(pick.get("prob_original", pick.get("probabilidad", 0)) or 0),
         "cuota": float(pick.get("cuota", 1.0) or 1.0),
-        "edge": pick.get("edge"),
-        "valor_esperado": pick.get("valor_esperado"),
-        # xG de predictions (si estuvo disponible)
-        "xg_pred_home": pick.get("xg_pred_home"),
-        "xg_pred_away": pick.get("xg_pred_away"),
-        "xg_pred_total": pick.get("xg_pred_total"),
         "tipo": pick.get("tipo", "prematch"),
         "minuto_consulta": pick.get("minuto_consulta"),  # para picks live
         "resultado": resultado,
@@ -6506,33 +5090,27 @@ def _analizar_tendencias_aprendizaje():
     if not datos:
         return None
 
-    cerrados = [d for d in datos if d.get("resultado") in ("acierto", "fallo", "push")]
+    cerrados = [d for d in datos if d.get("resultado") in ("acierto", "fallo")]
     if len(cerrados) < 5:
         return {"insuficiente": True, "total": len(cerrados)}
 
     def efectividad_grupo(items):
         if not items:
             return 0.0
-        # push no cuenta como acierto ni fallo para efectividad
-        validos = [i for i in items if i.get("resultado") in ("acierto", "fallo")]
-        if not validos:
-            return 0.0
-        ac = sum(1 for i in validos if i["resultado"] == "acierto")
-        return round(ac / len(validos) * 100, 1)
+        ac = sum(1 for i in items if i["resultado"] == "acierto")
+        return round(ac / len(items) * 100, 1)
 
     mercados = {}
     for d in cerrados:
         m = d.get("mercado") or d.get("jugada", "Otro")
         if "Corner" in m:
             m = "Corners"
-        elif "goles" in m.lower() or "over" in m.lower() or "under" in m.lower():
+        elif "goles" in m.lower():
             m = "Goles"
         elif "Tarjeta" in m:
             m = "Tarjetas"
         elif "BTTS" in m or "Ambos" in m:
             m = "BTTS"
-        elif "Handicap" in m or "handicap" in m or "AH" in m:
-            m = "Handicap"
         else:
             m = "Otro"
         mercados.setdefault(m, []).append(d)
@@ -6542,7 +5120,7 @@ def _analizar_tendencias_aprendizaje():
 
     ligas = {}
     for d in cerrados:
-        lg = d.get("liga") or d.get("league") or "Desconocida"
+        lg = d.get("liga", "Desconocida")
         ligas.setdefault(lg, []).append(d)
     ligas_ef = {lg: {"efectividad": efectividad_grupo(v), "total": len(v)}
                 for lg, v in ligas.items() if len(v) >= 3}
@@ -6632,9 +5210,8 @@ def _guardar_snapshot_aprendizaje():
 # ─────────────────────────────────────────────
 
 def _cuota_segura(pick):
-    """Extrae la cuota de un pick de forma segura, tolerando None, 0 y strings.
-    Orden: cuota_api (Pinnacle real) > cuota_pinnacle > cuota > cuota_minima."""
-    for campo in ("cuota_api", "cuota_pinnacle", "cuota", "cuota_minima"):
+    """Extrae la cuota de un pick de forma segura, tolerando None, 0 y strings."""
+    for campo in ("cuota", "cuota_minima"):
         val = pick.get(campo)
         if val is None:
             continue
@@ -6668,15 +5245,22 @@ def _guardar_bank_acumulado(entradas):
 
 def _actualizar_bank_acumulado():
     """
-    Recorre todas las operaciones cerradas del mes actual (picks individuales
-    Y combinadas) y reconstruye el bank acumulado.
-    Stake por pick individual: _stake_pct() segun score.
-    Stake por combinada: STAKE_COMBINADA (10%).
-    Se reinicia a BANK_INICIAL el primer dia de cada mes.
+    Recorre todas las combinadas cerradas del mes actual y reconstruye
+    el bank acumulado (S/500 al inicio del mes, stake 10%).
+    Se reinicia a S/500 el primer dia de cada mes (a las 11:59 PM del ultimo dia).
     """
     try:
+        combinadas = leer_json(COMBINADAS_FILE)
         hoy = fecha_hoy_peru()
         mes_actual = hoy[:7]  # YYYY-MM
+
+        cerradas = [
+            c for c in combinadas
+            if c.get("estado","").lower() in ("acierto","fallo")
+            and not c.get("sin_combinada")
+            and c.get("fecha","")[:7] == mes_actual
+        ]
+        cerradas.sort(key=lambda c: c.get("timestamp", c.get("fecha","")))
 
         bank = BANK_INICIAL
         historial = [{
@@ -6686,110 +5270,37 @@ def _actualizar_bank_acumulado():
             "nota": f"Reinicio mensual — S/ {BANK_INICIAL:.2f}"
         }]
 
-        # Recopilar todas las operaciones del mes (picks + combinadas)
-        operaciones = []
-
-        # 1. Picks individuales cerrados del mes
-        picks = leer_json(PICKS_FILE)
-        for p in picks:
-            estado = (p.get("estado") or p.get("resultado") or "").lower()
-            if estado not in ("acierto", "fallo"):
-                continue
-            fecha_p = (p.get("fecha_partido") or p.get("fecha") or "")[:10]
-            if fecha_p[:7] != mes_actual:
-                continue
-            score = float(p.get("score", 0) or 0)
-            riesgo = float(p.get("riesgo", 5) or 5)
-            stake_pct = _stake_pct(score, riesgo)
-            if stake_pct <= 0:
-                continue  # pick no apto para simulacion de bank
-            cuota = float(p.get("cuota_api") or p.get("cuota") or p.get("cuota_minima") or 1.5)
-            cuota = min(max(cuota, 1.01), 10.0)  # limitar a rango razonable
-            operaciones.append({
-                "timestamp": p.get("timestamp", fecha_p),
-                "fecha": fecha_p,
-                "tipo": "pick",
-                "ticket": p.get("fixture_id", ""),
-                "subtipo": p.get("mercado", "pick"),
-                "cuota": cuota,
-                "stake_pct": stake_pct,
-                "estado": estado,
-                "partido": p.get("partido", ""),
-            })
-
-        # 2. Combinadas y mini-tickets cerrados del mes
-        combinadas = leer_json(COMBINADAS_FILE)
-        for c in combinadas:
-            estado = (c.get("estado") or "").lower()
-            if estado not in ("acierto", "fallo"):
-                continue
-            if c.get("sin_combinada"):
-                continue
-            fecha_c = (c.get("fecha") or "")[:10]
-            if fecha_c[:7] != mes_actual:
-                continue
+        for c in cerradas:
+            stake = round(bank * STAKE_COMBINADA, 2)
             cuota = float(c.get("cuota_combinada", 1.0) or 1.0)
-            cuota = min(max(cuota, 1.01), 50.0)
-            # Mini-tickets usan stake fijo S/10, combinadas normales usan STAKE_COMBINADA
-            if c.get("subtipo") == "MT":
-                stake_pct_c = 10.0 / max(bank, 1.0)  # S/10 fijos
-                stake_fijo = 10.0
-            elif c.get("subtipo") == "DIA":
-                stake_pct_c = STAKE_COMBINADA_DIA / max(bank, 1.0)
-                stake_fijo = STAKE_COMBINADA_DIA
-            else:
-                stake_pct_c = STAKE_COMBINADA
-                stake_fijo = None
-            operaciones.append({
-                "timestamp": c.get("timestamp", fecha_c),
-                "fecha": fecha_c,
-                "tipo": "combinada",
-                "ticket": c.get("ticket_id", ""),
-                "subtipo": c.get("subtipo", "combinada"),
-                "cuota": cuota,
-                "stake_pct": stake_pct_c,
-                "stake_fijo": stake_fijo,
-                "estado": estado,
-            })
-
-        # Ordenar por timestamp
-        operaciones.sort(key=lambda x: x.get("timestamp", ""))
-
-        for op in operaciones:
-            stake_fijo = op.get("stake_fijo")
-            if stake_fijo:
-                stake = round(stake_fijo, 2)
-            else:
-                stake = round(bank * op["stake_pct"], 2)
-            cuota = op["cuota"]
-            estado = op["estado"]
+            estado = c.get("estado","").lower()
+            subtipo = c.get("subtipo","?")
+            ticket = c.get("ticket_id","")
+            fecha = c.get("fecha","")
 
             if estado == "acierto":
                 ganancia = round(stake * (cuota - 1), 2)
                 bank = round(bank + ganancia, 2)
-                op_txt = f"+S/{ganancia:.2f}"
+                op = f"+S/{ganancia:.2f}"
             else:
                 bank = round(bank - stake, 2)
-                op_txt = f"-S/{stake:.2f}"
+                op = f"-S/{stake:.2f}"
 
             historial.append({
-                "fecha": op["fecha"],
-                "ticket": op["ticket"],
-                "tipo": op["tipo"],
-                "subtipo": op["subtipo"],
+                "fecha": fecha,
+                "ticket": ticket,
+                "subtipo": subtipo,
                 "cuota": cuota,
-                "stake": stake,
                 "estado": estado,
-                "operacion": op_txt,
+                "stake": stake,
+                "operacion": op,
                 "bank": bank,
                 "mes": mes_actual,
-                "partido": op.get("partido", ""),
             })
 
         _guardar_bank_acumulado(historial)
         return historial
-    except Exception as e:
-        print(f"ERROR _actualizar_bank_acumulado: {e}")
+    except Exception:
         return []
 
 
@@ -6832,72 +5343,54 @@ def _resetear_bank_acumulado_fin_mes():
         pass
 
 
-def _prob_recalibrada_pick(p):
-    """
-    Probabilidad recalibrada de un pick guardado. Si el pick ya fue
-    recalibrado en origen, su 'probabilidad' ya es la corregida; si no,
-    se recalibra aqui. Idempotente gracias a recalibrar_probabilidad.
-    """
-    if p.get("_recalibrado"):
-        base = p.get("probabilidad", p.get("prob", 0))
-    else:
-        base = p.get("prob_original",
-                      p.get("probabilidad", p.get("prob", 0)))
-    return recalibrar_probabilidad(base)
-
-
-def _score_recalibrado_pick(p):
-    """Score recalibrado de un pick guardado (idempotente)."""
-    if p.get("_recalibrado"):
-        return float(p.get("score", 0) or 0)
-    base = p.get("score_original", p.get("score", 0))
-    liga = p.get("league", p.get("liga", ""))
-    s = recalibrar_score(base) * multiplicador_liga(liga)
-    return round(clamp(s, 0, 10), 1)
-
-
 def _valor_combinada(picks_sel):
     """
-    Valor de una combinada = VALOR ESPERADO REAL.
-    VE = prob_conjunta * (cuota_comb - 1) - (1 - prob_conjunta)
-    Usa la probabilidad RECALIBRADA de cada eslabon (no la declarada).
-    VE > 0  -> combinada con valor positivo.
-    VE <= 0 -> combinada sin valor (se descarta en el selector).
+    Calcula el valor de una combinada segun:
+    valor = cuota_combinada * prob_conjunta * (1 / riesgo_promedio)
+    Mayor valor = mejor combinacion.
     """
     if not picks_sel:
-        return -1.0
+        return 0.0
     cuota_comb = 1.0
     prob_conj = 1.0
+    riesgo_sum = 0.0
     for p in picks_sel:
         cuota = max(_cuota_segura(p), 1.0)
-        prob = _prob_recalibrada_pick(p) / 100.0
+        prob  = float(p.get("probabilidad", 50) or 50) / 100
+        riesgo = float(p.get("riesgo", 5) or 5)
         cuota_comb *= cuota
-        prob_conj *= prob
-    ve = prob_conj * (cuota_comb - 1.0) - (1.0 - prob_conj)
-    return round(ve, 4)
+        prob_conj  *= prob
+        riesgo_sum += riesgo
+    riesgo_prom = riesgo_sum / len(picks_sel)
+    return round(cuota_comb * prob_conj * (1 / max(riesgo_prom, 0.1)), 4)
 
 
-def _eslabon_valido_combinada(p):
+def _pick_valido_para_combinada(pick):
     """
-    True si un pick puede ser eslabon de combinada. Se evalua pick por
-    pick (no por promedio): un solo eslabon debil invalida el ticket.
-      - prob recalibrada >= COMB_PROB_MIN
-      - score recalibrado >= COMB_SCORE_MIN (8.0 para Over 1.5)
-      - cuota del eslabon >= CUOTA_MINIMA_ESLABON
-      - no es BTTS
+    Verifica si un pick es elegible para combinadas.
+    Excluye: Championship, ligas africanas, clásicos top 6.
     """
-    if _es_btts(p):
+    league = pick.get("league", pick.get("liga", "")) or ""
+    country = pick.get("country", "") or ""
+    partido = pick.get("partido", "") or ""
+    liga_id = int(pick.get("league_id", 0) or 0)
+
+    # Excluir ligas con alta variabilidad
+    if league in LIGAS_EXCLUIDAS_COMBINADAS:
         return False
-    cuota = _cuota_segura(p)
-    if cuota < CUOTA_MINIMA_ESLABON:
+
+    # Excluir ligas africanas
+    if country in PAISES_EXCLUIDOS_COMBINADAS:
         return False
-    if _prob_recalibrada_pick(p) < COMB_PROB_MIN:
-        return False
-    score_rec = _score_recalibrado_pick(p)
-    jugada = (p.get("jugada", "") or "").lower()
-    if "over 1.5" in jugada:
-        return score_rec >= COMB_SCORE_MIN_OVER15
-    return score_rec >= COMB_SCORE_MIN
+
+    # Excluir clásicos entre equipos top 6
+    if liga_id in TOP6_LIGAS:
+        top6 = TOP6_LIGAS[liga_id]
+        equipos_top = [e for e in top6 if e.lower() in partido.lower()]
+        if len(equipos_top) >= 2:
+            return False  # Clasico — excluir
+
+    return True
 
 
 def _es_btts(pick):
@@ -6976,658 +5469,13 @@ def _fixture_ids_ya_usados(hoy):
     return usados
 
 
-def _son_compatibles(jugada1, jugada2):
-    """
-    Valida que dos mercados del mismo partido no se contradigan.
-    Retorna True si son compatibles (correlacion positiva o neutra).
-    Retorna False si se contradicen (no deben ir juntos en un ticket).
-    """
-    j1 = jugada1.lower()
-    j2 = jugada2.lower()
-
-    # Contradicciones directas — nunca juntas
-    if "over 2.5" in j1 and "under 2.5" in j2: return False
-    if "under 2.5" in j1 and "over 2.5" in j2: return False
-    if "over 3.5" in j1 and "under 3.5" in j2: return False
-    if "under 3.5" in j1 and "over 3.5" in j2: return False
-    if "over 1.5" in j1 and "under 1.5" in j2: return False
-    if "under 1.5" in j1 and "over 1.5" in j2: return False
-    if "1x" in j1 and "x2" in j2: return False
-    if "x2" in j1 and "1x" in j2: return False
-
-    # Contradicciones logicas — partidos con muchos goles vs sin roja
-    # Over 2.5 + Sin Roja: tension alta con muchos goles es contradictorio
-    if "over 2.5" in j1 and "sin tarjeta roja" in j2: return False
-    if "sin tarjeta roja" in j1 and "over 2.5" in j2: return False
-
-    # Over 1.5 y Sin Roja: aceptable — puede haber goles sin tension
-    # Under 3.5 + Sin Roja: correlacion positiva (partido tranquilo)
-    # 1X/X2 + Sin Roja: correlacion positiva
-    # Doble op + Goles: correlacion positiva en general
-
-    return True
-
-
-def _armar_combinada_dia_garantizada():
-    """
-    Combinada garantizada del dia — criterios mas flexibles que _armar_combinada_del_dia:
-    - Cuota individual minima: 1.25 (vs 1.50 del sistema normal)
-    - Score minimo: 7.5 (vs 8.0)
-    - Cuota total objetivo: 2.0-3.5
-    - 3 eslabones de partidos DISTINTOS
-    - Mercados: Goles, Doble Oportunidad (no BTTS)
-    - Stake fijo: STAKE_COMBINADA_DIA (S/25)
-    """
-    from itertools import combinations as _comb_g
-    import uuid as _uuid_g
-
-    picks = leer_json(PICKS_FILE)
-    hoy = fecha_hoy_peru()
-    ahora_str = fecha_peru_obj().strftime("%H:%M")
-
-    # Candidatos: picks prematch pendientes de hoy con cuota >= 1.25
-    candidatos = []
-    for p in picks:
-        fecha_pick = (p.get("fecha_partido") or p.get("fecha") or "")[:10]
-        if fecha_pick != hoy:
-            continue
-        if p.get("tipo", "") != "prematch":
-            continue
-        if p.get("estado", "pendiente").lower() not in ("pendiente", "pendiente_manual"):
-            continue
-        if _es_btts(p):
-            continue
-
-        cuota = _cuota_segura(p)
-        if cuota < 1.25:  # mas permisivo que el sistema normal (1.50)
-            continue
-
-        score = float(p.get("score", 0) or 0)
-        if score < 7.5:
-            continue
-
-        # Verificar partido aun no empezado
-        hora_pick = p.get("hora", p.get("hour", ""))
-        if hora_pick and hora_pick <= ahora_str:
-            continue
-
-        candidatos.append(p)
-
-    # Si no hay suficientes en picks_guardados, analizar partidos del dia
-    if len(candidatos) < 3:
-        ligas = {}
-        ligas.update(EUROPA_LEAGUES)
-        ligas.update(SUDAMERICA_LEAGUES)
-        ligas.update(OTRAS_LEAGUES)
-        ligas.update(SELECCIONES_LEAGUES)
-        partidos_dia = obtener_fixtures_por_fecha(ligas, hoy)
-        ahora_ts = int(fecha_peru_obj().timestamp())
-
-        for p_dia in partidos_dia:
-            if int(p_dia.get("timestamp", 0)) <= ahora_ts + 1800:
-                continue
-            fid = str(p_dia["id"])
-            if any(str(c.get("fixture_id","")) == fid for c in candidatos):
-                continue
-            try:
-                data = preparar_analisis(fid, incluir_odds=True, incluir_contexto=False)
-                if not data or not data["recomendaciones"]:
-                    continue
-                top = data["recomendaciones"][0]
-                cuota_t = _cuota_segura(top)
-                score_t = float(top.get("score", 0) or 0)
-                if cuota_t >= 1.25 and score_t >= 7.5 and not _es_btts(top):
-                    candidato = {
-                        "fixture_id": fid,
-                        "partido": f"{data['home']} vs {data['away']}",
-                        "league": data["league"],
-                        "country": data.get("country", ""),
-                        "hora": data["hora"],
-                        "tipo": "prematch",
-                        **top,
-                    }
-                    candidatos.append(candidato)
-            except Exception:
-                continue
-
-    if len(candidatos) < 2:
-        return {
-            "sin_combinada": True,
-            "fecha": hoy,
-            "motivo": f"Solo {len(candidatos)} picks validos (minimo 2 para combinada garantizada)"
-        }
-
-    candidatos.sort(key=lambda x: float(x.get("score", 0) or 0), reverse=True)
-
-    mejor = None
-    mejor_valor = -999
-    n_objetivo = 3 if len(candidatos) >= 3 else 2
-
-    for n in ([n_objetivo, n_objetivo - 1] if n_objetivo > 2 else [2]):
-        if len(candidatos) < n:
-            continue
-        for grupo in _comb_g(candidatos, n):
-            grupo = list(grupo)
-            # Solo partidos distintos
-            fids_g = [str(p.get("fixture_id","")) for p in grupo]
-            if len(set(fids_g)) < len(fids_g):
-                continue
-            cuota_g = 1.0
-            for p in grupo:
-                cuota_g *= max(_cuota_segura(p), 1.0)
-            cuota_g = round(cuota_g, 2)
-            if cuota_g < 2.0 or cuota_g > 3.5:
-                continue
-            # VE
-            prob_g = 1.0
-            for p in grupo:
-                prob_g *= (_prob_recalibrada_pick(p) / 100.0)
-            ve = prob_g * (cuota_g - 1.0) - (1.0 - prob_g)
-            if ve > mejor_valor:
-                mejor_valor = ve
-                mejor = grupo
-
-    if not mejor:
-        return {
-            "sin_combinada": True,
-            "fecha": hoy,
-            "motivo": f"Ninguna combinacion con cuota 2.0-3.5 entre {len(candidatos)} candidatos"
-        }
-
-    cuota_final = round(
-        sum(_cuota_segura(p) for p in mejor) / len(mejor), 2
-    )
-    cuota_final = 1.0
-    for p in mejor:
-        cuota_final *= max(_cuota_segura(p), 1.0)
-    cuota_final = round(cuota_final, 2)
-
-    uid = str(_uuid_g.uuid4())[:6].upper()
-    ticket_id = f"COMB-DIA-{hoy.replace('-','')[2:]}-{uid}"
-
-    return {
-        "ticket_id": ticket_id,
-        "tipo": "combinada_dia",
-        "subtipo": "DIA",
-        "fecha": hoy,
-        "picks": mejor,
-        "n_picks": len(mejor),
-        "cuota_combinada": cuota_final,
-        "stake_fijo": STAKE_COMBINADA_DIA,
-        "score_promedio": round(
-            sum(float(p.get("score",0) or 0) for p in mejor) / len(mejor), 1
-        ),
-        "riesgo_promedio": round(
-            sum(float(p.get("riesgo",5) or 5) for p in mejor) / len(mejor), 1
-        ),
-        "estado": "pendiente",
-        "razon_seleccion": f"Combinada garantizada — cuota {cuota_final}x | VE={round(mejor_valor,3)}",
-        "timestamp": fecha_hora_peru(),
-    }
-
-
-def _extraer_cuota_handicap_pinnacle(odds, equipo, linea):
-    """
-    Extrae la cuota real de Asian Handicap de Pinnacle.
-    equipo: 'home' o 'away'
-    linea: -0.5, -0.25, -0.75, 0, +0.5, etc.
-    Devuelve (cuota, bookmaker) o (None, None) si no hay.
-    """
-    PINNACLE_NAMES = {"Pinnacle", "Pinnacle Sports"}
-    AH_MARKETS = {"Asian Handicap", "Asian handicap", "Handicap Asiatico",
-                  "Handicap Asian", "AH", "Asian"}
-    linea_str_variants = [
-        f"{linea:+.1f}", f"{linea:+.2f}",
-        f"{linea:.1f}", f"{linea:.2f}",
-        str(linea),
-    ]
-    equipo_label = "Home" if equipo == "home" else "Away"
-
-    for casa in odds:
-        for book in casa.get("bookmakers", []):
-            if book.get("name", "") not in PINNACLE_NAMES:
-                continue
-            for bet in book.get("bets", []):
-                bet_name = bet.get("name", "")
-                if not any(ah.lower() in bet_name.lower() for ah in AH_MARKETS):
-                    continue
-                for value in bet.get("values", []):
-                    nombre = str(value.get("value", ""))
-                    # nombre puede ser "Home -0.5", "Away +0.5", "-0.5", etc.
-                    coincide_equipo = equipo_label.lower() in nombre.lower()
-                    coincide_linea = any(v in nombre for v in linea_str_variants)
-                    if coincide_equipo and coincide_linea:
-                        try:
-                            cuota = float(value.get("odd"))
-                            if cuota > 1.0:
-                                return round(cuota, 3), "Pinnacle"
-                        except Exception:
-                            pass
-    return None, None
-
-
-def calcular_handicap_recomendado_club(home_general, away_general,
-                                        home_home, away_away, odds):
-    """
-    Calcula el handicap asiatico recomendado para un partido de clubes.
-    Usa gf_prom, gc_prom y forma de calcular_forma.
-    Solo recomienda si hay cuota real de Pinnacle >= HANDICAP_CUOTA_MIN.
-    Devuelve dict con jugada, equipo, linea, cuota, prob_estimada o None.
-    """
-    base_home = home_home or home_general
-    base_away = away_away or away_general
-
-    if not base_home or not base_away:
-        return None
-
-    gf_home = float(base_home.get("gf_prom", 0) or 0)
-    gc_home = float(base_home.get("gc_prom", 0) or 0)
-    gf_away = float(base_away.get("gf_prom", 0) or 0)
-    gc_away = float(base_away.get("gc_prom", 0) or 0)
-
-    # Fuerza atacante vs defensiva
-    ataque_home = gf_home - gc_away   # positivo = local domina
-    ataque_away = gf_away - gc_home   # positivo = visitante domina
-    diferencia = ataque_home - ataque_away
-
-    # Decidir linea y equipo
-    if diferencia >= 1.5:
-        equipo, linea = "home", -0.75
-        prob_est = 55.0
-    elif diferencia >= 0.8:
-        equipo, linea = "home", -0.5
-        prob_est = 62.0
-    elif diferencia >= 0.3:
-        equipo, linea = "home", -0.25
-        prob_est = 68.0
-    elif diferencia <= -1.5:
-        equipo, linea = "away", -0.75
-        prob_est = 55.0
-    elif diferencia <= -0.8:
-        equipo, linea = "away", -0.5
-        prob_est = 62.0
-    elif diferencia <= -0.3:
-        equipo, linea = "away", -0.25
-        prob_est = 68.0
-    else:
-        return None  # partido muy parejo, no recomendar
-
-    # Buscar cuota real de Pinnacle — Opcion B: solo con cuota real
-    cuota, book = _extraer_cuota_handicap_pinnacle(odds, equipo, linea)
-    if not cuota or cuota < HANDICAP_CUOTA_MIN:
-        return None  # sin cuota real o cuota insuficiente
-
-    return {
-        "equipo": equipo,
-        "linea": linea,
-        "cuota": cuota,
-        "bookmaker": book,
-        "prob_estimada": prob_est,
-        "diferencia_fuerza": round(diferencia, 2),
-    }
-
-
-def calcular_handicap_recomendado_seleccion(home, away, odds):
-    """
-    Calcula el handicap recomendado para selecciones usando ranking FIFA.
-    Solo recomienda si hay cuota real de Pinnacle >= HANDICAP_CUOTA_MIN.
-    """
-    rank_home = RANKING_FIFA.get(home, 60)
-    rank_away = RANKING_FIFA.get(away, 60)
-    diff_ranking = rank_away - rank_home  # positivo = local mejor rankeado
-
-    if diff_ranking >= 30:
-        equipo, linea = "home", -0.75
-        prob_est = 52.0
-    elif diff_ranking >= 15:
-        equipo, linea = "home", -0.5
-        prob_est = 60.0
-    elif diff_ranking >= 7:
-        equipo, linea = "home", -0.25
-        prob_est = 66.0
-    elif diff_ranking <= -30:
-        equipo, linea = "away", -0.75
-        prob_est = 52.0
-    elif diff_ranking <= -15:
-        equipo, linea = "away", -0.5
-        prob_est = 60.0
-    elif diff_ranking <= -7:
-        equipo, linea = "away", -0.25
-        prob_est = 66.0
-    else:
-        return None  # selecciones muy parejas, no recomendar
-
-    cuota, book = _extraer_cuota_handicap_pinnacle(odds, equipo, linea)
-    if not cuota or cuota < HANDICAP_CUOTA_MIN:
-        return None
-
-    return {
-        "equipo": equipo,
-        "linea": linea,
-        "cuota": cuota,
-        "bookmaker": book,
-        "prob_estimada": prob_est,
-        "diff_ranking": diff_ranking,
-    }
-
-
-def guardar_handicap(registro):
-    """
-    Guarda un pick de handicap en HANDICAP_FILE.
-    Evita duplicados por (fixture_id, equipo, linea).
-    """
-    data = leer_json(HANDICAP_FILE)
-    fid = str(registro.get("fixture_id", ""))
-    eq = registro.get("equipo", "")
-    ln = registro.get("linea", 0)
-
-    for r in data:
-        if (str(r.get("fixture_id","")) == fid
-                and r.get("equipo") == eq
-                and r.get("linea") == ln):
-            return False  # duplicado
-
-    data.append(registro)
-    guardar_json_lista(HANDICAP_FILE, data)
-    return True
-
-
-def filtrar_handicaps_por_dias(dias):
-    """Lee handicap_seguimiento.json y filtra por los ultimos N dias."""
-    cerrar_handicaps_pendientes()
-    data = leer_json(HANDICAP_FILE)
-    hoy = fecha_peru_obj()
-    limite = hoy - timedelta(days=dias)
-    filtrados = []
-    for r in data:
-        try:
-            fp = datetime.strptime(r.get("fecha","")[:10], "%Y-%m-%d")
-            if fp >= limite:
-                filtrados.append(r)
-        except Exception:
-            continue
-    return filtrados
-
-
-def filtrar_handicaps_mes_actual():
-    """Lee handicap_seguimiento.json y filtra por el mes actual."""
-    cerrar_handicaps_pendientes()
-    data = leer_json(HANDICAP_FILE)
-    hoy = fecha_peru_obj()
-    filtrados = []
-    for r in data:
-        try:
-            fp = datetime.strptime(r.get("fecha","")[:10], "%Y-%m-%d")
-            if fp.year == hoy.year and fp.month == hoy.month:
-                filtrados.append(r)
-        except Exception:
-            continue
-    return filtrados
-
-
-def cerrar_handicaps_pendientes():
-    """
-    Cierra automaticamente los picks de handicap pendientes.
-    Logica de cierre:
-      -0.5 / +0.5 : gana por 1+ -> acierto | empate/pierde -> fallo
-      -0.25       : gana por 1+ -> acierto | empate -> push | pierde -> fallo
-      -0.75       : gana por 2+ -> acierto | gana por 1 -> push | empata/pierde -> fallo
-      0           : gana -> acierto | empate -> push | pierde -> fallo
-    Registra resultado en aprendizaje.json.
-    """
-    data = leer_json(HANDICAP_FILE)
-    cambios = 0
-
-    for r in data:
-        if r.get("estado", "pendiente") not in ("pendiente",):
-            continue
-        fixture_id = r.get("fixture_id")
-        if not fixture_id:
-            continue
-        try:
-            fixture = api_get(f"/fixtures?id={fixture_id}", use_cache=False)
-        except Exception:
-            continue
-        if not fixture:
-            continue
-        fx = fixture[0]
-        status = fx["fixture"]["status"]["short"]
-        if status not in ("FT", "AET", "PEN"):
-            continue
-
-        gh = fx["goals"]["home"]
-        ga = fx["goals"]["away"]
-        if gh is None or ga is None:
-            continue
-
-        equipo = r.get("equipo", "home")
-        linea = float(r.get("linea", -0.5))
-
-        # Diferencia de goles desde perspectiva del equipo apostado
-        if equipo == "home":
-            diff = gh - ga
-        else:
-            diff = ga - gh
-
-        # Aplicar linea al diff
-        diff_ajustado = diff + linea
-
-        resultado = None
-        retorno = 0.0
-        cuota = float(r.get("cuota", 1.90) or 1.90)
-
-        if linea in (-0.5, 0.5, -1.0, 1.0, -1.5, 1.5):
-            # Linea entera: acierto o fallo
-            if diff_ajustado > 0:
-                resultado = "acierto"
-                retorno = round(cuota - 1, 3)
-            else:
-                resultado = "fallo"
-                retorno = -1.0
-
-        elif linea in (-0.25, 0.25, -1.25, 1.25):
-            # Linea cuarto: puede ser push parcial
-            if diff_ajustado > 0:
-                resultado = "acierto"
-                retorno = round(cuota - 1, 3)
-            elif diff_ajustado == 0:
-                # Si la linea es -0.25 y diff exacto es 0: push 50%
-                resultado = "push"
-                retorno = 0.0
-            else:
-                resultado = "fallo"
-                retorno = -1.0
-
-        elif linea in (-0.75, 0.75, -1.75, 1.75):
-            if diff_ajustado > 0:
-                resultado = "acierto"
-                retorno = round(cuota - 1, 3)
-            elif diff_ajustado == 0:
-                # gana por exactamente 1 con -0.75: push 50%
-                resultado = "push"
-                retorno = 0.0
-            else:
-                resultado = "fallo"
-                retorno = -1.0
-
-        elif linea == 0:
-            if diff > 0:
-                resultado = "acierto"
-                retorno = round(cuota - 1, 3)
-            elif diff == 0:
-                resultado = "push"
-                retorno = 0.0
-            else:
-                resultado = "fallo"
-                retorno = -1.0
-
-        else:
-            # Otras lineas: simplificar como entera
-            if diff_ajustado > 0:
-                resultado = "acierto"
-                retorno = round(cuota - 1, 3)
-            else:
-                resultado = "fallo"
-                retorno = -1.0
-
-        if resultado:
-            r["estado"] = resultado
-            r["resultado"] = resultado
-            r["retorno"] = retorno
-            r["gh"] = gh
-            r["ga"] = ga
-            r["resultado_real"] = f"{gh}-{ga}"
-            cambios += 1
-
-            # Registrar en aprendizaje.json para ML futuro
-            try:
-                ctx = {}
-                try:
-                    ctx = _enriquecer_contexto_pick(
-                        fixture_id,
-                        r.get("league_id"),
-                        r.get("season")
-                    )
-                except Exception:
-                    pass
-                entrada_ap = {
-                    "fecha": r.get("fecha", "")[:10],
-                    "fixture_id": fixture_id,
-                    "partido": r.get("partido", ""),
-                    "liga": r.get("league", ""),
-                    "pais": r.get("country", ""),
-                    "mercado": "Handicap Asiatico",
-                    "jugada": r.get("jugada", ""),
-                    "equipo": r.get("equipo", ""),
-                    "linea": r.get("linea"),
-                    "cuota": cuota,
-                    "prob_estimada": r.get("prob_estimada", 0),
-                    "tipo_equipo": r.get("tipo_equipo", "club"),
-                    "resultado": resultado,
-                    "retorno": retorno,
-                    "gh": gh,
-                    "ga": ga,
-                    "modo": "observacion",
-                    "timestamp_aprendizaje": fecha_hora_peru(),
-                    **ctx,
-                }
-                agregar_json(APRENDIZAJE_FILE, entrada_ap)
-            except Exception as e:
-                print(f"WARN aprendizaje handicap: {e}")
-
-    if cambios > 0:
-        guardar_json_lista(HANDICAP_FILE, data)
-        print(f"[handicap] {cambios} picks cerrados")
-
-    return cambios
-
-
-def _seccion_handicap_pdf(c, y, hoy):
-    """Agrega seccion de handicap al PDF del resumen diario."""
-    try:
-        data = leer_json(HANDICAP_FILE)
-        hoy_picks = [r for r in data if r.get("fecha","")[:10] == hoy]
-        if not hoy_picks:
-            return y
-
-        y -= 10
-        c.setFont("Helvetica-Bold", 11)
-        c.drawString(40, y, f"HANDICAP ASIATICO — MODO OBSERVACION ({len(hoy_picks)} picks)")
-        y -= 16
-        c.setFont("Helvetica", 9)
-
-        cerrados_h = [r for r in hoy_picks if r.get("estado") in ("acierto","fallo","push")]
-        if cerrados_h:
-            aciertos_h = sum(1 for r in cerrados_h if r.get("estado") == "acierto")
-            fallos_h = sum(1 for r in cerrados_h if r.get("estado") == "fallo")
-            push_h = sum(1 for r in cerrados_h if r.get("estado") == "push")
-            validos_h = aciertos_h + fallos_h
-            ef_h = round(aciertos_h / validos_h * 100, 1) if validos_h else 0
-            c.drawString(40, y, f"Cerrados: {len(cerrados_h)} | Aciertos: {aciertos_h} | Fallos: {fallos_h} | Push: {push_h} | Efectividad: {ef_h}%")
-            y -= 12
-
-        for r in hoy_picks:
-            estado = r.get("estado","pendiente").upper()
-            jugada = r.get("jugada","")
-            cuota = r.get("cuota","?")
-            resultado_real = r.get("resultado_real","")
-            linea = f"  • {r.get('partido','')} | {jugada} | {cuota}x | {estado}"
-            if resultado_real:
-                linea += f" | {resultado_real}"
-            c.drawString(40, y, linea[:110])
-            y -= 11
-            if y < 60:
-                c.showPage()
-                y = 780
-                c.setFont("Helvetica", 9)
-    except Exception as e:
-        print(f"WARN _seccion_handicap_pdf: {e}")
-    return y
-
-
-def _seccion_handicap_historico_pdf(elements, fecha_inicio, fecha_fin, styles):
-    """Agrega resumen historico de handicap al PDF semanal/mensual."""
-    try:
-        data = leer_json(HANDICAP_FILE)
-        periodo = [r for r in data
-                   if fecha_inicio <= r.get("fecha","")[:10] <= fecha_fin]
-        if not periodo:
-            return
-
-        cerrados = [r for r in periodo if r.get("estado") in ("acierto","fallo","push")]
-        if not cerrados:
-            return
-
-        aciertos = sum(1 for r in cerrados if r.get("estado") == "acierto")
-        fallos = sum(1 for r in cerrados if r.get("estado") == "fallo")
-        push = sum(1 for r in cerrados if r.get("estado") == "push")
-        validos = aciertos + fallos
-        ef = round(aciertos / validos * 100, 1) if validos else 0
-        roi_sim = sum(r.get("retorno", 0) for r in cerrados)
-
-        s_h2 = styles["Heading2"].clone("hh2")
-        s_h2.fontSize = 11
-        s_h2.spaceBefore = 10
-        elements.append(Paragraph("Handicap Asiatico — Modo Observacion", s_h2))
-        elements.append(Spacer(1, 4))
-
-        resumen_txt = (
-            f"Total picks: {len(periodo)} | Cerrados: {len(cerrados)} | "
-            f"Aciertos: {aciertos} | Fallos: {fallos} | Push: {push} | "
-            f"Efectividad: {ef}% | ROI simulado: {roi_sim:+.2f}u"
-        )
-        elements.append(Paragraph(resumen_txt, styles["Normal"]))
-        elements.append(Spacer(1, 6))
-
-        # Por tipo de linea
-        por_linea = {}
-        for r in cerrados:
-            ln = str(r.get("linea", "?"))
-            por_linea.setdefault(ln, {"ok": 0, "fallo": 0, "push": 0})
-            est = r.get("estado","")
-            if est == "acierto": por_linea[ln]["ok"] += 1
-            elif est == "fallo": por_linea[ln]["fallo"] += 1
-            elif est == "push": por_linea[ln]["push"] += 1
-
-        for ln, v in sorted(por_linea.items()):
-            tot = v["ok"] + v["fallo"]
-            ef_ln = round(v["ok"] / tot * 100, 1) if tot else 0
-            elements.append(Paragraph(
-                f"  Linea {ln}: {v['ok']}A / {v['fallo']}F / {v['push']}P — {ef_ln}%",
-                styles["Normal"]
-            ))
-    except Exception as e:
-        print(f"WARN _seccion_handicap_historico_pdf: {e}")
-
-
 def _armar_combinada_del_dia():
     """
     Selector automatico de combinadas prematch.
-    Cada eslabon se evalua individualmente (no por promedio): un solo
-    pick debil invalida el ticket. Filtros por eslabon:
-      - prob recalibrada >= 80%, score recalibrado >= 7.5 (8.0 para Over1.5)
-      - cuota del eslabon >= 1.50, no BTTS
-    Solo se arman combinadas con VALOR ESPERADO > 0 y cuota total 2.50-4.50.
+    Toma TODOS los picks prematch del dia con estado pendiente
+    (sin filtros de score/cuota minima por pick).
+    Cuota minima de la combinada: 2.50x.
+    Elige la combinacion que maximiza: cuota * prob_conjunta * (1/riesgo_promedio).
     """
     from itertools import combinations as _comb
 
@@ -7664,10 +5512,11 @@ def _armar_combinada_del_dia():
                     continue
             except Exception:
                 pass
-        # Filtro por eslabon: prob/score recalibrados, cuota minima, no BTTS.
-        # Reemplaza tanto la exclusion suelta de BTTS como la ausencia de
-        # filtros de calidad por pick.
-        if not _eslabon_valido_combinada(p):
+        # Excluir BTTS — efectividad historica insuficiente (50%)
+        if _es_btts(p):
+            continue
+        # Excluir por liga/pais/clasico
+        if not _pick_valido_para_combinada(p):
             continue
         # Priorizar picks con edge positivo vs Pinnacle
         edge_p = p.get("edge")
@@ -7684,8 +5533,9 @@ def _armar_combinada_del_dia():
         -float(x.get("score", 0) or 0)
     ))
 
+    CUOTA_MIN = 2.50
     mejor = None
-    mejor_valor = 0.0   # solo aceptamos combinadas con VE > 0
+    mejor_valor = -1.0
     mejor_razon = ""
 
     # Evaluar todas las combinaciones de 2 y 3 picks
@@ -7694,44 +5544,32 @@ def _armar_combinada_del_dia():
             continue
         for grupo in _comb(candidatos, n):
             grupo = list(grupo)
-            # G: Verificar que todos sean partidos DISTINTOS (no correlacionados)
-            ids_grupo = [str(p.get("fixture_id", "")) for p in grupo]
-            if len(set(ids_grupo)) < len(ids_grupo):
-                continue
             cuota_comb = 1.0
             for p in grupo:
                 cuota_comb *= max(_cuota_segura(p), 1.0)
             cuota_comb = round(cuota_comb, 2)
-            # Rango de cuota total aceptable.
-            if cuota_comb < CUOTA_COMBINADA_MIN:
+            if cuota_comb < CUOTA_MIN:
                 continue
-            if cuota_comb > CUOTA_COMBINADA_MAX:
-                continue
-            # Valor esperado real: solo combinadas con VE positivo.
             valor = _valor_combinada(grupo)
             if valor > mejor_valor:
                 mejor_valor = valor
                 mejor = grupo
                 mejor_razon = (
                     f"{'Triple' if n==3 else 'Doble'} optima — "
-                    f"cuota {cuota_comb}x | VE={valor}"
+                    f"cuota {cuota_comb}x | valor={valor}"
                 )
 
     if not mejor:
         # Guardar en aprendizaje: no hubo combinada rentable
-        motivo_sin = (
-            f"Ninguna combinacion con VE>0 y cuota "
-            f"{CUOTA_COMBINADA_MIN}-{CUOTA_COMBINADA_MAX}x "
-            f"({len(candidatos)} candidatos validos)"
-        )
         agregar_json(APRENDIZAJE_FILE, {
             "tipo": "sin_combinada",
             "fecha": hoy,
-            "motivo": motivo_sin,
+            "motivo": f"Ninguna combinacion supera {CUOTA_MIN}x con los criterios actuales",
             "candidatos": len(candidatos),
             "timestamp": fecha_hora_peru(),
         })
-        return {"sin_combinada": True, "fecha": hoy, "motivo": motivo_sin}
+        return {"sin_combinada": True, "fecha": hoy,
+                "motivo": f"Ninguna combinacion supera {CUOTA_MIN}x hoy ({len(candidatos)} candidatos disponibles)"}
 
     cuota_combinada = 1.0
     for p in mejor:
@@ -7769,341 +5607,6 @@ def _armar_combinada_del_dia():
     return resultado
 
 
-def generar_mini_tickets_dia():
-    """
-    Genera los mejores mini-tickets del dia.
-    Cada ticket tiene 2-3 eslabones con cuota individual 1.10-1.60.
-    Mercados: Doble Oportunidad, Goles (Over/Under segun partido), Sin Tarjeta Roja.
-    Cuota total objetivo: 1.40-2.20.
-    Probabilidad conjunta minima: 62%.
-    Maximo MINI_TICKET_MAX_DIA tickets por dia.
-    Puede mezclar partidos diferentes o usar maximo 2 mercados del mismo partido
-    si son compatibles (correlacion positiva).
-    """
-    from itertools import combinations as _comb_mt
-    import uuid as _uuid_mt
-
-    hoy = fecha_hoy_peru()
-    ahora_ts = int(fecha_peru_obj().timestamp())
-
-    # Recopilar todos los partidos de hoy que aun no empiezan
-    ligas = {}
-    ligas.update(EUROPA_LEAGUES)
-    ligas.update(SUDAMERICA_LEAGUES)
-    ligas.update(OTRAS_LEAGUES)
-    ligas.update(SELECCIONES_LEAGUES)
-
-    partidos_dia = obtener_fixtures_por_fecha(ligas, hoy)
-
-    # Filtrar solo partidos que empiezan en mas de 30 minutos
-    partidos_validos = []
-    for p in partidos_dia:
-        ts = p.get("timestamp", 0)
-        if ts - ahora_ts > 1800:  # 30 minutos
-            partidos_validos.append(p)
-
-    if not partidos_validos:
-        return []
-
-    # Generar eslabones candidatos para cada partido
-    eslabones = []
-    picks_ya_usados = set()  # (fixture_id, jugada) para evitar duplicar
-
-    for p in partidos_validos:
-        fixture_id = str(p["id"])
-        try:
-            data = preparar_analisis(
-                fixture_id,
-                incluir_odds=True,
-                incluir_contexto=True
-            )
-            if not data:
-                continue
-
-            home_gen = data.get("home_general") or {}
-            away_gen = data.get("away_general") or {}
-            home_hh = data.get("home_home") or home_gen
-            away_aa = data.get("away_away") or away_gen
-
-            if not home_gen or not away_gen:
-                continue
-
-            home = data["home"]
-            away = data["away"]
-            hora = data["hora"]
-            league = data["league"]
-            country = data.get("country", "")
-
-            # Obtener odds directamente para cuotas reales
-            odds_mt = api_get(f"/odds?fixture={fixture_id}", use_cache=True, ttl=600)
-
-            # 1. Goles Over/Under — directo desde estadisticas sin filtros conservadores
-            base_home = home_hh or home_gen
-            base_away = away_aa or away_gen
-            total_prom = (base_home.get("total_prom", 0) + base_away.get("total_prom", 0)) / 2
-            under35 = (base_home.get("under35", 0) + base_away.get("under35", 0)) / 2
-            over15 = (base_home.get("over15", 0) + base_away.get("over15", 0)) / 2
-
-            # Under 3.5
-            if under35 >= 0.65:
-                prob_u35 = round(under35 * 100, 1)
-                cuota_u35, _ = buscar_mejor_cuota(fixture_id, "Under 3.5 goles")
-                if cuota_u35 and MINI_TICKET_CUOTA_MIN <= cuota_u35 <= MINI_TICKET_CUOTA_MAX and prob_u35 >= 60:
-                    clave = (fixture_id, "Under 3.5 goles")
-                    if clave not in picks_ya_usados:
-                        picks_ya_usados.add(clave)
-                        eslabones.append({
-                            "fixture_id": fixture_id,
-                            "partido": f"{home} vs {away}",
-                            "home": home, "away": away,
-                            "league": league, "country": country,
-                            "hora": hora,
-                            "mercado": "Goles totales",
-                            "jugada": "Under 3.5 goles",
-                            "prob": prob_u35,
-                            "cuota": cuota_u35,
-                            "score": 7.5,
-                            "fecha": hoy,
-                        })
-
-            # Over 1.5
-            if over15 >= 0.70:
-                prob_o15 = round(over15 * 100, 1)
-                cuota_o15, _ = buscar_mejor_cuota(fixture_id, "Over 1.5 goles")
-                if cuota_o15 and MINI_TICKET_CUOTA_MIN <= cuota_o15 <= MINI_TICKET_CUOTA_MAX and prob_o15 >= 65:
-                    clave = (fixture_id, "Over 1.5 goles")
-                    if clave not in picks_ya_usados:
-                        picks_ya_usados.add(clave)
-                        eslabones.append({
-                            "fixture_id": fixture_id,
-                            "partido": f"{home} vs {away}",
-                            "home": home, "away": away,
-                            "league": league, "country": country,
-                            "hora": hora,
-                            "mercado": "Goles totales",
-                            "jugada": "Over 1.5 goles",
-                            "prob": prob_o15,
-                            "cuota": cuota_o15,
-                            "score": 7.5,
-                            "fecha": hoy,
-                        })
-
-            # 2. Doble Oportunidad — buscar cuota real de Pinnacle
-            # Calcular fuerza relativa
-            gf_h = base_home.get("gf_prom", 0)
-            gc_h = base_home.get("gc_prom", 0)
-            gf_a = base_away.get("gf_prom", 0)
-            gc_a = base_away.get("gc_prom", 0)
-            fuerza_h = gf_h - gc_a
-            fuerza_a = gf_a - gc_h
-            diff = fuerza_h - fuerza_a
-
-            # Local favorito -> 1X, Visitante favorito -> X2
-            if diff >= 0.3:
-                jugada_dc = "1X"
-                prob_dc = min(85.0, 68.0 + diff * 5)
-            elif diff <= -0.3:
-                jugada_dc = "X2"
-                prob_dc = min(85.0, 68.0 + abs(diff) * 5)
-            else:
-                jugada_dc = None
-
-            if jugada_dc:
-                cuota_dc, _ = buscar_mejor_cuota(fixture_id, jugada_dc)
-                if cuota_dc and MINI_TICKET_CUOTA_MIN <= cuota_dc <= MINI_TICKET_CUOTA_MAX:
-                    clave_dc = (fixture_id, jugada_dc)
-                    if clave_dc not in picks_ya_usados:
-                        picks_ya_usados.add(clave_dc)
-                        eslabones.append({
-                            "fixture_id": fixture_id,
-                            "partido": f"{home} vs {away}",
-                            "home": home, "away": away,
-                            "league": league, "country": country,
-                            "hora": hora,
-                            "mercado": "Doble oportunidad",
-                            "jugada": jugada_dc,
-                            "prob": round(prob_dc, 1),
-                            "cuota": cuota_dc,
-                            "score": 7.5,
-                            "fecha": hoy,
-                        })
-
-            # 3. Sin Tarjeta Roja — SOLO si hay cuota real de Pinnacle
-            # No usar cuota estimada en mini-tickets (mismo criterio que handicap)
-            liga_sin_stats = any(
-                ls.lower() in league.lower()
-                for ls in LIGAS_SIN_STATS
-            )
-            if not liga_sin_stats:
-                fase_p = "group"
-                if _es_partido_selecciones(league, country):
-                    round_p = p.get("round", "")
-                    fase_p = _detectar_fase_torneo(league, round_p)
-
-                prob_sin_roja = calcular_prob_sin_roja(home_gen, away_gen, fase_p)
-                if prob_sin_roja >= 75:
-                    # Buscar cuota REAL de Pinnacle en odds
-                    odds_sr = api_get(
-                        f"/odds?fixture={fixture_id}",
-                        use_cache=True, ttl=600
-                    )
-                    cuota_sin_roja_real = None
-                    if odds_sr:
-                        PINNACLE_NAMES = {"Pinnacle", "Pinnacle Sports"}
-                        RED_CARD_MARKETS = {"Red Card", "Will There Be a Red Card",
-                                           "Red Cards", "Tarjeta Roja"}
-                        for casa in odds_sr:
-                            for book in casa.get("bookmakers", []):
-                                if book.get("name","") not in PINNACLE_NAMES:
-                                    continue
-                                for bet in book.get("bets", []):
-                                    bet_name = bet.get("name","")
-                                    if not any(rc.lower() in bet_name.lower()
-                                               for rc in RED_CARD_MARKETS):
-                                        continue
-                                    for value in bet.get("values", []):
-                                        if str(value.get("value","")).lower() in ("no","nein","non"):
-                                            try:
-                                                c_real = float(value.get("odd"))
-                                                if c_real > 1.0:
-                                                    cuota_sin_roja_real = round(c_real, 3)
-                                            except Exception:
-                                                pass
-
-                    # Solo agregar si hay cuota real de Pinnacle
-                    if cuota_sin_roja_real and MINI_TICKET_CUOTA_MIN <= cuota_sin_roja_real <= MINI_TICKET_CUOTA_MAX:
-                        jugada_sr = "Sin Tarjeta Roja"
-                        clave_sr = (fixture_id, jugada_sr)
-                        if clave_sr not in picks_ya_usados:
-                            picks_ya_usados.add(clave_sr)
-                            eslabones.append({
-                                "fixture_id": fixture_id,
-                                "partido": f"{home} vs {away}",
-                                "home": home, "away": away,
-                                "league": league, "country": country,
-                                "hora": hora,
-                                "mercado": "Sin Tarjeta Roja",
-                                "jugada": jugada_sr,
-                                "prob": prob_sin_roja,
-                                "cuota": cuota_sin_roja_real,
-                                "score": 7.0,
-                                "fecha": hoy,
-                                # Sin cuota_estimada=True porque es real
-                            })
-
-        except Exception as e:
-            print(f"WARN mini_ticket partido {p.get('id','?')}: {e}")
-            continue
-
-    if not eslabones:
-        return []
-
-    # Ordenar eslabones por prob descendente
-    eslabones.sort(key=lambda x: x.get("prob", 0), reverse=True)
-
-    # Armar tickets evaluando combinaciones
-    tickets_generados = []
-    fixtures_usados_en_ticket = set()  # para evitar 3 picks del mismo partido
-
-    for n in [3, 2]:
-        if len(tickets_generados) >= MINI_TICKET_MAX_DIA:
-            break
-        if len(eslabones) < n:
-            continue
-
-        for grupo in _comb_mt(eslabones, n):
-            if len(tickets_generados) >= MINI_TICKET_MAX_DIA:
-                break
-
-            grupo = list(grupo)
-
-            # Verificar max 2 picks del mismo partido
-            fids = [e["fixture_id"] for e in grupo]
-            from collections import Counter as _Counter
-            conteo = _Counter(fids)
-            if max(conteo.values()) > 2:
-                continue
-
-            # Verificar compatibilidad entre picks del mismo partido
-            valido = True
-            for i in range(len(grupo)):
-                for j in range(i+1, len(grupo)):
-                    if grupo[i]["fixture_id"] == grupo[j]["fixture_id"]:
-                        if not _son_compatibles(grupo[i]["jugada"], grupo[j]["jugada"]):
-                            valido = False
-                            break
-                if not valido:
-                    break
-            if not valido:
-                continue
-
-            # Calcular cuota y prob conjunta
-            cuota_total = 1.0
-            prob_conjunta = 1.0
-            for e in grupo:
-                cuota_total *= e["cuota"]
-                prob_conjunta *= (e["prob"] / 100.0)
-            cuota_total = round(cuota_total, 2)
-            prob_conjunta_pct = round(prob_conjunta * 100, 1)
-
-            # Filtros de calidad
-            if cuota_total < MINI_TICKET_CUOTA_OBJ_MIN:
-                continue
-            if cuota_total > MINI_TICKET_CUOTA_OBJ_MAX:
-                continue
-            if prob_conjunta_pct < MINI_TICKET_PROB_MIN:
-                continue
-
-            # Verificar que no repita exactamente el mismo set de picks
-            clave_ticket = frozenset(
-                (e["fixture_id"], e["jugada"]) for e in grupo
-            )
-            if any(
-                frozenset((e["fixture_id"], e["jugada"]) for e in t["picks"]) == clave_ticket
-                for t in tickets_generados
-            ):
-                continue
-
-            uid = str(_uuid_mt.uuid4())[:5].upper()
-            ticket_id = f"MT-{hoy.replace('-','')[2:]}-{uid}"
-
-            ticket = {
-                "ticket_id": ticket_id,
-                "tipo": "mini_ticket",
-                "subtipo": "MT",
-                "fecha": hoy,
-                "picks": grupo,
-                "n_picks": n,
-                "cuota_combinada": cuota_total,
-                "prob_conjunta": prob_conjunta_pct,
-                "estado": "pendiente",
-                "timestamp": fecha_hora_peru(),
-            }
-            tickets_generados.append(ticket)
-
-    # Ordenar por probabilidad descendente
-    tickets_generados.sort(key=lambda t: t["prob_conjunta"], reverse=True)
-
-    # Cada ticket debe tener al menos 2 jugadas nuevas que no aparezcan
-    # en tickets anteriores. Esto garantiza diversidad real.
-    tickets_sin_repetir = []
-    jugadas_usadas_global = set()
-
-    for ticket in tickets_generados:
-        claves_ticket = set(
-            (str(e["fixture_id"]), e["jugada"]) for e in ticket["picks"]
-        )
-        jugadas_nuevas = claves_ticket - jugadas_usadas_global
-        if len(jugadas_nuevas) < 2:
-            continue
-        tickets_sin_repetir.append(ticket)
-        jugadas_usadas_global.update(claves_ticket)
-        if len(tickets_sin_repetir) >= MINI_TICKET_MAX_DIA:
-            break
-
-    return tickets_sin_repetir
-
-
 def _guardar_combinada(combinada):
     """Guarda la combinada en combinadas.json con ticket_id unico."""
     import uuid as _uuid
@@ -8127,34 +5630,12 @@ def _guardar_combinada(combinada):
     guardar_json_lista(COMBINADAS_FILE, combinadas)
 
 
-# Chat IDs que reciben alarmas de combinadas — persistidos en JSON
+# Chat IDs que reciben alarmas de combinadas
 _CHAT_IDS_ALARMAS = set()
-
-
-def _cargar_chat_ids_alarmas():
-    """Carga los chat_ids desde disco al arrancar."""
-    global _CHAT_IDS_ALARMAS
-    try:
-        data = leer_json(CHAT_IDS_ALARMAS_FILE)
-        if isinstance(data, list):
-            _CHAT_IDS_ALARMAS = set(str(c) for c in data)
-    except Exception:
-        pass
-    return _CHAT_IDS_ALARMAS
-
-
-def _guardar_chat_ids_alarmas():
-    """Persiste los chat_ids a disco."""
-    try:
-        guardar_json_lista(CHAT_IDS_ALARMAS_FILE, list(_CHAT_IDS_ALARMAS))
-    except Exception as e:
-        print(f"WARN guardar chat_ids_alarmas: {e}")
-
 
 def _registrar_chat_alarma(chat_id):
     """Registra un chat_id para recibir alarmas de combinadas."""
     _CHAT_IDS_ALARMAS.add(str(chat_id))
-    _guardar_chat_ids_alarmas()
 
 def _actualizar_resultado_combinada():
     """
@@ -8255,28 +5736,6 @@ def _actualizar_resultado_combinada():
                                         pick_c["resultado_real"] = f"{tt} tarjetas"
                                 elif "1X" in jugada_comb: acierto = gh >= ga
                                 elif "X2" in jugada_comb: acierto = ga >= gh
-                                elif "sin tarjeta roja" in jugada_comb.lower():
-                                    stats_sr = api_get(f"/fixtures/statistics?fixture={fid}", use_cache=False)
-                                    rojas_totales = 0
-                                    stats_disp = False
-                                    if stats_sr:
-                                        for td_sr in stats_sr:
-                                            stats_disp = True
-                                            for item_sr in td_sr.get("statistics", []):
-                                                if item_sr.get("type") == "Red Cards":
-                                                    val_sr = item_sr.get("value")
-                                                    if val_sr is not None:
-                                                        try:
-                                                            rojas_totales += int(str(val_sr))
-                                                        except Exception:
-                                                            pass
-                                    if not stats_disp:
-                                        pick_c["estado"] = "pendiente_manual"
-                                        pick_c["resultado_real"] = "Sin stats API — verificar manual"
-                                        acierto = None
-                                    else:
-                                        acierto = rojas_totales == 0
-                                        pick_c["resultado_real"] = f"{rojas_totales} rojas"
 
                                 if acierto is True:
                                     pick_c["estado"] = "acierto"
@@ -8399,437 +5858,6 @@ def _formato_combinada_telegram(combinada, bank_actual=None):
         f"🧠 Optimizacion: {combinada.get('razon_seleccion','')}",
     ]
     return "\n".join(lineas)
-
-
-async def enviar_combinada_dia(context: ContextTypes.DEFAULT_TYPE):
-    """
-    Job automatico 7:30 AM hora Peru (12:30 UTC).
-    Genera y envia la combinada garantizada del dia con stake S/25 fijos.
-    """
-    chat_id = context.job.chat_id
-    hoy = fecha_hoy_peru()
-
-    try:
-        await context.bot.send_message(
-            chat_id=chat_id,
-            text="🎯 Generando combinada garantizada del día...",
-        )
-
-        # Verificar freno de bank
-        bank_data = _leer_bank_acumulado()
-        bank_actual = bank_data[-1].get("bank", BANK_INICIAL) if bank_data else BANK_INICIAL
-        freno = BANK_INICIAL * BANK_FRENO_PCT
-        if bank_actual <= freno:
-            await context.bot.send_message(
-                chat_id=chat_id,
-                text=(
-                    f"🛑 *Combinada diaria suspendida*\n"
-                    f"Bank actual S/ {bank_actual:.2f} está por debajo del límite de S/ {freno:.2f}.\n"
-                    f"Revisa el estado del bank antes de continuar."
-                ),
-                parse_mode="Markdown"
-            )
-            return
-
-        # Verificar bank suficiente para el stake
-        if bank_actual < STAKE_COMBINADA_DIA * 2:
-            await context.bot.send_message(
-                chat_id=chat_id,
-                text=f"⚠️ Bank insuficiente (S/ {bank_actual:.2f}) para stake de S/ {STAKE_COMBINADA_DIA:.0f}.",
-            )
-            return
-
-        # Armar combinada del dia con criterios especiales
-        comb = _armar_combinada_dia_garantizada()
-
-        if not comb or comb.get("sin_combinada"):
-            motivo = comb.get("motivo", "Sin picks suficientes") if comb else "Sin picks disponibles"
-            await context.bot.send_message(
-                chat_id=chat_id,
-                text=(
-                    f"⚠️ *Combinada diaria — {hoy}*\n\n"
-                    f"No fue posible armar la combinada garantizada hoy.\n"
-                    f"Motivo: {motivo}\n\n"
-                    f"Usa /analizar para ver los mini-tickets del día."
-                ),
-                parse_mode="Markdown"
-            )
-            return
-
-        _guardar_combinada(comb)
-
-        ganancia_pot = round(STAKE_COMBINADA_DIA * (comb["cuota_combinada"] - 1), 2)
-        picks = comb["picks"]
-        ticket_id = comb.get("ticket_id", "")
-
-        lineas = [
-            f"🎯 *COMBINADA GARANTIZADA DEL DÍA — {hoy}*",
-            f"🎟 Ticket: `{ticket_id}`",
-            "━━━━━━━━━━",
-        ]
-        for i, p in enumerate(picks, 1):
-            cuota_p = _cuota_segura(p)
-            lineas.append(
-                f"{i}. *{p.get('partido','')}*\n"
-                f"   {p.get('league','')} | {p.get('hora','')}\n"
-                f"   ✅ {p.get('jugada','')}\n"
-                f"   Score: {p.get('score','')} | Prob: {p.get('prob','')}% | Cuota: {cuota_p if cuota_p else 'N/D'}"
-            )
-        lineas += [
-            "━━━━━━━━━━",
-            f"📊 Cuota combinada: *{comb['cuota_combinada']}x*",
-            f"💰 Stake fijo: *S/ {STAKE_COMBINADA_DIA:.0f}*",
-            f"📈 Ganancia potencial: *S/ {ganancia_pot:.2f}*",
-            f"📉 Pérdida máxima: *S/ {STAKE_COMBINADA_DIA:.0f}*",
-            "",
-            "_(Ticket guardado para seguimiento automático)_",
-        ]
-
-        await context.bot.send_message(
-            chat_id=chat_id,
-            text="\n".join(lineas),
-            parse_mode="Markdown"
-        )
-
-    except Exception as e:
-        print(f"ERROR enviar_combinada_dia: {e}")
-        try:
-            await context.bot.send_message(
-                chat_id=chat_id,
-                text=f"⚠️ Error generando combinada diaria: {e}"
-            )
-        except Exception:
-            pass
-
-
-async def combinada_dia(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Comando /combinada_dia — genera la combinada garantizada del dia manualmente."""
-    _registrar_chat_alarma(update.effective_chat.id)
-    await update.message.reply_text("🎯 Generando combinada garantizada del día...")
-
-    # Verificar freno de bank
-    bank_data = _leer_bank_acumulado()
-    bank_actual = bank_data[-1].get("bank", BANK_INICIAL) if bank_data else BANK_INICIAL
-    freno = BANK_INICIAL * BANK_FRENO_PCT
-    if bank_actual <= freno:
-        await update.message.reply_text(
-            f"🛑 *Combinada diaria suspendida*\n"
-            f"Bank actual S/ {bank_actual:.2f} está por debajo del límite de S/ {freno:.2f}.",
-            parse_mode="Markdown"
-        )
-        return
-
-    comb = _armar_combinada_dia_garantizada()
-
-    if not comb or comb.get("sin_combinada"):
-        motivo = comb.get("motivo", "Sin picks suficientes") if comb else "Sin picks disponibles"
-        await update.message.reply_text(
-            f"⚠️ No fue posible armar la combinada garantizada hoy.\n"
-            f"Motivo: {motivo}\n\n"
-            f"Usa /analizar para ver los mini-tickets del día."
-        )
-        return
-
-    _guardar_combinada(comb)
-
-    ganancia_pot = round(STAKE_COMBINADA_DIA * (comb["cuota_combinada"] - 1), 2)
-    picks = comb["picks"]
-    ticket_id = comb.get("ticket_id", "")
-    hoy = fecha_hoy_peru()
-
-    lineas = [
-        f"🎯 *COMBINADA GARANTIZADA DEL DÍA — {hoy}*",
-        f"🎟 Ticket: `{ticket_id}`",
-        "━━━━━━━━━━",
-    ]
-    for i, p in enumerate(picks, 1):
-        cuota_p = _cuota_segura(p)
-        lineas.append(
-            f"{i}. *{p.get('partido','')}*\n"
-            f"   {p.get('league','')} | {p.get('hora','')}\n"
-            f"   ✅ {p.get('jugada','')}\n"
-            f"   Score: {p.get('score','')} | Prob: {p.get('prob','')}% | Cuota: {cuota_p if cuota_p else 'N/D'}"
-        )
-    lineas += [
-        "━━━━━━━━━━",
-        f"📊 Cuota combinada: *{comb['cuota_combinada']}x*",
-        f"💰 Stake fijo: *S/ {STAKE_COMBINADA_DIA:.0f}*",
-        f"📈 Ganancia potencial: *S/ {ganancia_pot:.2f}*",
-        f"📉 Pérdida máxima: *S/ {STAKE_COMBINADA_DIA:.0f}*",
-        "",
-        "_(Ticket guardado para seguimiento automático)_",
-    ]
-
-    await update.message.reply_text(
-        "\n".join(lineas),
-        parse_mode="Markdown"
-    )
-
-
-async def handicap(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    /handicap — Analiza todos los partidos del dia y sugiere handicap asiatico.
-    MODO OBSERVACION: no afecta el bank. Solo acumula base de datos.
-    Solo recomienda picks con cuota real de Pinnacle >= HANDICAP_CUOTA_MIN.
-    """
-    _registrar_chat_alarma(update.effective_chat.id)
-    hoy = fecha_hoy_peru()
-    ahora_ts = int(fecha_peru_obj().timestamp())
-
-    # Estadisticas acumuladas
-    data_ha = leer_json(HANDICAP_FILE)
-    total_ha = len(data_ha)
-    cerrados_ha = [r for r in data_ha if r.get("estado") in ("acierto","fallo","push")]
-    n_cerrados = len(cerrados_ha)
-    aciertos_ha = sum(1 for r in cerrados_ha if r.get("estado") == "acierto")
-    fallos_ha = sum(1 for r in cerrados_ha if r.get("estado") == "fallo")
-    validos_ha = aciertos_ha + fallos_ha
-    ef_ha = round(aciertos_ha / validos_ha * 100, 1) if validos_ha else 0
-
-    if n_cerrados < HANDICAP_PICKS_MIN_CONFIANZA:
-        nivel = f"⚠️ Modo observación — faltan {HANDICAP_PICKS_MIN_CONFIANZA - n_cerrados} picks para confiar"
-    elif n_cerrados < 60:
-        nivel = "🟡 Datos preliminares — usar con cautela"
-    else:
-        nivel = "✅ Base de datos suficiente"
-
-    await update.message.reply_text(
-        f"🔬 *Handicap Asiático — Modo Observación*\n"
-        f"📊 Base: {n_cerrados} cerrados / {total_ha} total | Efectividad: {ef_ha}%\n"
-        f"{nivel}\n\n"
-        f"Analizando partidos del día... esto puede tomar 1-2 minutos.",
-        parse_mode="Markdown"
-    )
-
-    # Construir lista de ligas
-    ligas = {}
-    ligas.update(EUROPA_LEAGUES)
-    ligas.update(SUDAMERICA_LEAGUES)
-    ligas.update(OTRAS_LEAGUES)
-    ligas.update(SELECCIONES_LEAGUES)
-
-    partidos = obtener_fixtures_por_fecha(ligas, hoy)
-    partidos_futuros = [
-        p for p in partidos
-        if p.get("timestamp", 0) - ahora_ts > 1800
-    ]
-
-    if not partidos_futuros:
-        await update.message.reply_text("❌ No hay partidos disponibles con más de 30 minutos de anticipación.")
-        return
-
-    # Prefetch de odds en paralelo
-    try:
-        import aiohttp as _aiohttp_ha
-        fixture_ids_ha = [str(p["id"]) for p in partidos_futuros]
-
-        async def _prefetch_ha(fids):
-            async with _aiohttp_ha.ClientSession() as sess:
-                tasks = [
-                    api_get_async(sess, f"/odds?fixture={fid}", use_cache=True, ttl=600)
-                    for fid in fids
-                ]
-                await asyncio.gather(*tasks, return_exceptions=True)
-
-        for i in range(0, len(fixture_ids_ha), 10):
-            await _prefetch_ha(fixture_ids_ha[i:i+10])
-            await asyncio.sleep(0.3)
-    except Exception:
-        pass
-
-    picks_ha = []
-    guardados_hoy = set(
-        (str(r.get("fixture_id","")), r.get("equipo",""), str(r.get("linea","")))
-        for r in data_ha if r.get("fecha","")[:10] == hoy
-    )
-
-    for p in partidos_futuros:
-        if len(picks_ha) >= MAX_HANDICAP_DIA:
-            break
-        try:
-            fixture_id = str(p["id"])
-            home = p["home"]
-            away = p["away"]
-            league = p["league"]
-            country = p.get("country","")
-            hora = p.get("hour","")
-
-            odds = api_get(f"/odds?fixture={fixture_id}", use_cache=True, ttl=600)
-            if not odds:
-                continue
-
-            es_seleccion = _es_partido_selecciones(league, country)
-
-            if es_seleccion:
-                rec_ha = calcular_handicap_recomendado_seleccion(home, away, odds)
-            else:
-                home_general = calcular_forma(p.get("home_id") or
-                    api_get(f"/fixtures?id={fixture_id}", use_cache=True, ttl=3600)[0]["teams"]["home"]["id"]
-                    if not p.get("home_id") else p["home_id"])
-                away_general = calcular_forma(p.get("away_id") or
-                    api_get(f"/fixtures?id={fixture_id}", use_cache=True, ttl=3600)[0]["teams"]["away"]["id"]
-                    if not p.get("away_id") else p["away_id"])
-
-                if not home_general or not away_general:
-                    continue
-
-                home_home = calcular_forma(
-                    api_get(f"/fixtures?id={fixture_id}", use_cache=True, ttl=3600)[0]["teams"]["home"]["id"],
-                    "home"
-                )
-                away_away = calcular_forma(
-                    api_get(f"/fixtures?id={fixture_id}", use_cache=True, ttl=3600)[0]["teams"]["away"]["id"],
-                    "away"
-                )
-                rec_ha = calcular_handicap_recomendado_club(
-                    home_general, away_general, home_home, away_away, odds
-                )
-
-            if not rec_ha:
-                continue
-
-            equipo = rec_ha["equipo"]
-            linea = rec_ha["linea"]
-            cuota = rec_ha["cuota"]
-
-            # Verificar duplicado del dia
-            clave = (fixture_id, equipo, str(linea))
-            if clave in guardados_hoy:
-                continue
-
-            equipo_nombre = home if equipo == "home" else away
-            jugada = f"{equipo_nombre} {linea:+.2f}"
-
-            registro = {
-                "fixture_id": fixture_id,
-                "partido": f"{home} vs {away}",
-                "home": home,
-                "away": away,
-                "league": league,
-                "country": country,
-                "hora": hora,
-                "fecha": hoy,
-                "equipo": equipo,
-                "linea": linea,
-                "jugada": jugada,
-                "cuota": cuota,
-                "bookmaker": rec_ha.get("bookmaker","Pinnacle"),
-                "prob_estimada": rec_ha.get("prob_estimada", 0),
-                "tipo_equipo": "seleccion" if es_seleccion else "club",
-                "modo": "observacion",
-                "estado": "pendiente",
-                "resultado": None,
-                "resultado_real": None,
-                "gh": None,
-                "ga": None,
-                "retorno": None,
-                "timestamp": fecha_hora_peru(),
-            }
-
-            guardado = guardar_handicap(registro)
-            if guardado:
-                picks_ha.append(registro)
-                guardados_hoy.add(clave)
-
-        except Exception as e:
-            print(f"WARN handicap partido {p.get('id','?')}: {e}")
-            continue
-
-    if not picks_ha:
-        await update.message.reply_text(
-            "❌ No encontré picks de handicap para hoy.\n"
-            "Pinnacle no tiene cuotas de Asian Handicap disponibles para los partidos de hoy, "
-            "o todos los partidos son muy parejos para recomendar."
-        )
-        return
-
-    texto = f"🔬 *Handicap Asiático del día — {hoy}*\n"
-    texto += f"_{len(picks_ha)} picks encontrados con cuota real de Pinnacle_\n"
-    texto += "⚠️ *MODO OBSERVACIÓN — No apostar hasta tener 30+ picks cerrados*\n"
-    texto += "━━━━━━━━━━\n\n"
-
-    for i, r in enumerate(picks_ha, 1):
-        tipo = "🌍 SELECCIÓN" if r.get("tipo_equipo") == "seleccion" else "⚽ Club"
-        texto += (
-            f"{i}. *{r['partido']}*\n"
-            f"   {r['league']} | {r['hora']} | {tipo}\n"
-            f"   ✅ *{r['jugada']}*\n"
-            f"   Cuota: *{r['cuota']}x* (Pinnacle) | Prob estimada: {r['prob_estimada']}%\n\n"
-        )
-
-    texto += (
-        f"📊 *Base acumulada:* {n_cerrados} cerrados | {ef_ha}% efectividad\n"
-        f"_Picks guardados en seguimiento. Usa /handicap_stats para ver estadísticas._"
-    )
-
-    await _enviar_mensaje_paginado(update, texto)
-
-
-async def handicap_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    /handicap_stats — Estadísticas acumuladas del handicap asiático.
-    """
-    cerrar_handicaps_pendientes()
-    data = leer_json(HANDICAP_FILE)
-
-    if not data:
-        await update.message.reply_text(
-            "📊 Aún no hay picks de handicap registrados.\nUsa /handicap para empezar."
-        )
-        return
-
-    cerrados = [r for r in data if r.get("estado") in ("acierto","fallo","push")]
-    pendientes = [r for r in data if r.get("estado") == "pendiente"]
-    aciertos = sum(1 for r in cerrados if r.get("estado") == "acierto")
-    fallos = sum(1 for r in cerrados if r.get("estado") == "fallo")
-    push = sum(1 for r in cerrados if r.get("estado") == "push")
-    validos = aciertos + fallos
-    ef = round(aciertos / validos * 100, 1) if validos else 0
-    roi_sim = sum(r.get("retorno", 0) for r in cerrados)
-
-    if validos < HANDICAP_PICKS_MIN_CONFIANZA:
-        nivel = f"⚠️ Insuficiente — faltan {HANDICAP_PICKS_MIN_CONFIANZA - validos} picks válidos"
-    elif validos < 60:
-        nivel = "🟡 Preliminar — usar con cautela"
-    else:
-        nivel = "✅ Confiable"
-
-    # Por linea
-    por_linea = {}
-    for r in cerrados:
-        ln = str(r.get("linea","?"))
-        por_linea.setdefault(ln, {"ok":0,"fallo":0,"push":0})
-        est = r.get("estado","")
-        if est == "acierto": por_linea[ln]["ok"] += 1
-        elif est == "fallo": por_linea[ln]["fallo"] += 1
-        elif est == "push": por_linea[ln]["push"] += 1
-
-    # Por tipo
-    clubs = [r for r in cerrados if r.get("tipo_equipo") != "seleccion"]
-    sels = [r for r in cerrados if r.get("tipo_equipo") == "seleccion"]
-    ef_club = round(sum(1 for r in clubs if r.get("estado")=="acierto") / max(len([r for r in clubs if r.get("estado") in ("acierto","fallo")]),1) * 100, 1)
-    ef_sel = round(sum(1 for r in sels if r.get("estado")=="acierto") / max(len([r for r in sels if r.get("estado") in ("acierto","fallo")]),1) * 100, 1)
-
-    texto = (
-        f"🔬 *Handicap Asiático — Estadísticas*\n"
-        f"━━━━━━━━━━\n"
-        f"📊 Total picks: {len(data)}\n"
-        f"✅ Cerrados: {len(cerrados)} | ⏳ Pendientes: {len(pendientes)}\n"
-        f"✅ Aciertos: {aciertos} | ❌ Fallos: {fallos} | 🔄 Push: {push}\n"
-        f"🎯 Efectividad: *{ef}%*\n"
-        f"💰 ROI simulado (1u/pick): *{roi_sim:+.2f}u*\n"
-        f"📈 Nivel: {nivel}\n\n"
-        f"*Por tipo de equipo:*\n"
-        f"⚽ Clubes: {ef_club}% ({len([r for r in clubs if r.get('estado') in ('acierto','fallo')])} válidos)\n"
-        f"🌍 Selecciones: {ef_sel}% ({len([r for r in sels if r.get('estado') in ('acierto','fallo')])} válidos)\n\n"
-        f"*Por línea de handicap:*\n"
-    )
-    for ln, v in sorted(por_linea.items()):
-        tot = v["ok"] + v["fallo"]
-        ef_ln = round(v["ok"] / tot * 100, 1) if tot else 0
-        texto += f"  Línea {ln}: {v['ok']}✅ {v['fallo']}❌ {v['push']}🔄 — {ef_ln}%\n"
-
-    await _enviar_mensaje_paginado(update, texto)
 
 
 async def combinada(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -8981,9 +6009,7 @@ def _calcular_rendimiento_mes(anio, mes):
 
     ligas = {}
     for p in cerrados:
-        # Los picks guardan la liga como "league"; algunos reconstruidos
-        # usan "liga". Se leen ambas claves para no caer todo en "Desconocida".
-        liga = p.get("league") or p.get("liga") or "Desconocida"
+        liga = p.get("liga", "Desconocida")
         if liga not in ligas:
             ligas[liga] = {"total": 0, "aciertos": 0}
         ligas[liga]["total"] += 1
@@ -9239,13 +6265,8 @@ def _insertar_graficos_pdf(elements, picks, prefijo="reporte", styles=None):
 
     tmps = []
 
-    def add_graph(gen_fn, seccion_titulo, width, height, **kwargs):
-        """Genera un grafico y lo agrega al PDF de forma segura.
-
-        'seccion_titulo' es el encabezado de la seccion en el PDF.
-        Se renombro desde 'titulo' para evitar colision con el argumento
-        'titulo' que algunas funciones de grafico reciben via **kwargs.
-        """
+    def add_graph(gen_fn, titulo, width, height, **kwargs):
+        """Genera un grafico y lo agrega al PDF de forma segura."""
         try:
             path = gen_fn(**kwargs)
             if not path:
@@ -9253,7 +6274,7 @@ def _insertar_graficos_pdf(elements, picks, prefijo="reporte", styles=None):
             # Verificar que el archivo existe y tiene contenido
             if not _os_bot.path.exists(path) or _os_bot.path.getsize(path) == 0:
                 return
-            elements.append(Paragraph(seccion_titulo, s_h2))
+            elements.append(Paragraph(titulo, s_h2))
             elements.append(RLImage(path, width=width*_cm, height=height*_cm))
             elements.append(Spacer(1, 0.3*_cm))
             tmps.append(path)
@@ -9601,8 +6622,6 @@ def generar_pdf_rendimiento(datos):
                             topMargin=1.5*cm, bottomMargin=1.5*cm)
     styles = getSampleStyleSheet()
     story = []
-    # PUNTO 2 FIX: lista de PNG temporales a borrar DESPUES de doc.build()
-    _tmps_pendientes = []
 
     def titulo(txt, size=14):
         s = styles["Heading1"].clone("t")
@@ -10087,10 +7106,12 @@ def generar_pdf_rendimiento(datos):
                           == f"{datos['anio']}-{datos['mes']:02d}"]
         if picks_mes_rend:
             tmps_rend = _insertar_graficos_pdf(story, picks_mes_rend, prefijo="rend", styles=styles)
-            # PUNTO 2 FIX: NO borrar los PNG aqui. ReportLab los lee recien
-            # en doc.build(). Se acumulan en _tmps_pendientes y se borran
-            # despues del build.
-            _tmps_pendientes.extend(tmps_rend)
+            for tmp in tmps_rend:
+                try:
+                    if tmp and os.path.exists(tmp):
+                        os.remove(tmp)
+                except Exception:
+                    pass
     except Exception:
         pass
 
@@ -10137,17 +7158,13 @@ def generar_pdf_rendimiento(datos):
         story.append(Paragraph(resumen_comb, sc))
     else:
         story.append(Paragraph(
-            "No hay combinada para hoy: ninguna combinacion alcanza "
-            "valor esperado positivo con los criterios actuales "
-            "(cada eslabon requiere prob 80%+, cuota 1.50+, sin BTTS).",
+            "No hay combinada para hoy (se requieren picks con score >= 7.5 y riesgo <= 2).",
             styles["Normal"]
         ))
 
     doc.build(story)
 
-    # PUNTO 2 FIX: borrar TODOS los temporales DESPUES del build,
-    # cuando ReportLab ya leyo las imagenes.
-    for tmp in [img_bank, img_ef] + _tmps_pendientes:
+    for tmp in [img_bank, img_ef]:
         try:
             if tmp and os.path.exists(tmp):
                 os.remove(tmp)
@@ -10328,24 +7345,6 @@ async def rendimiento(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ─────────────────────────────────────────────
-# === Corte centralizado de analisis live (Punto 3) ===
-MINUTO_CORTE_LIVE = 80
-
-
-def _live_minuto_valido(minuto):
-    """
-    Regla centralizada: a partir del minuto 80 NO se analizan partidos live.
-    Devuelve True si el partido AUN puede analizarse (<= 80), False si debe
-    descartarse. Aplica a todos los mercados sin excepcion.
-    """
-    try:
-        m = int(minuto)
-    except (ValueError, TypeError):
-        # Minuto desconocido ("?", None): por seguridad, descartar
-        return False
-    return m <= MINUTO_CORTE_LIVE
-
-
 #  /live_all — Analiza todos los partidos en vivo automaticamente
 # ─────────────────────────────────────────────
 
@@ -10408,10 +7407,6 @@ async def live_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
         marcador_h = m["goals"]["home"] or 0
         marcador_a = m["goals"]["away"] or 0
 
-        # PUNTO 3: corte en minuto 80 - descartar partido sin analizarlo
-        if not _live_minuto_valido(minuto):
-            continue
-
         try:
             analisis = analizar_live_fixture(fixture_id)
             analizados += 1
@@ -10421,28 +7416,11 @@ async def live_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             score_live = analisis.get("score_live", 0)
 
-            # Tomar la mejor sugerencia
-            mejor = analisis["sugerencias"][0]
-
-            # Criterio V14: el live se filtra por la probabilidad de la
-            # sugerencia (>= 70%). El sistema de scoring live es propio y
-            # NO se recalibra con las tablas prematch; por eso aqui se usa
-            # la probabilidad live directa, no recalibrar_probabilidad.
-            prob_live = float(mejor.get("prob", 0) or 0)
-            if prob_live < 70:
+            if score_live < 7.5:
                 continue
 
-            # PUNTO 5: refrescar la cuota con la cuota REAL EN VIVO.
-            # analizar_live_fixture trae una cuota estimada/estatica;
-            # /odds/live da la cuota actual segun el minuto del partido.
-            try:
-                cuota_live, book_live = buscar_cuota_live(fixture_id, mejor.get("jugada", ""))
-                if cuota_live and cuota_live > 1.0:
-                    mejor["cuota"] = cuota_live
-                    mejor["cuota_api"] = cuota_live
-                    mejor["bookmaker"] = book_live
-            except Exception:
-                pass
+            # Tomar la mejor sugerencia
+            mejor = analisis["sugerencias"][0]
 
             # Guardar pick live
             guardar_pick_live_automatico(
@@ -10562,15 +7540,14 @@ async def analizar_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     hoy = fecha_hoy_peru()
     await update.message.reply_text(
-        f"🔍 *Analizando TODAS las ligas — {hoy}*\nLigas: {len(EUROPA_LEAGUES)+len(SUDAMERICA_LEAGUES)+len(OTRAS_LEAGUES)} | Filtro: score 7.5+\nEsto puede tardar varios minutos...",
+        f"🔍 *Analizando TODAS las ligas — {hoy}*\nLigas: {len(EUROPA_LEAGUES)+len(SUDAMERICA_LEAGUES)+len(LIGAS_NOCTURNAS)} | Filtro: score 7.5+\nEsto puede tardar varios minutos...",
         parse_mode="Markdown"
     )
 
     ligas_todas = {}
     ligas_todas.update(EUROPA_LEAGUES)
     ligas_todas.update(SUDAMERICA_LEAGUES)
-    ligas_todas.update(OTRAS_LEAGUES)
-    ligas_todas.update(SELECCIONES_LEAGUES)
+    ligas_todas.update(LIGAS_NOCTURNAS)
 
     partidos = obtener_fixtures_por_fecha(ligas_todas, hoy)
 
@@ -10656,7 +7633,7 @@ async def analizar_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     "rank_away": analisis_sel.get("rank_away"),
                     **top,
                 }
-                guardar_pick_plano(pick_data)
+                guardar_pick_automatico(pick_data)
                 picks_encontrados.append(pick_data)
 
                 emoji = "\U0001f30d"
@@ -10691,11 +7668,9 @@ async def analizar_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             else:
                 # Analisis normal de clubes
-                # PUNTO 2: incluir_odds=True para usar cuota Pinnacle real,
-                # igual que /top. Mismo motor de decision para ambos.
                 data = preparar_analisis(
                     fixture_id,
-                    incluir_odds=True,
+                    incluir_odds=False,
                     incluir_contexto=False
                 )
                 analizados += 1
@@ -10706,20 +7681,7 @@ async def analizar_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 top = data["recomendaciones"][0]
                 score = float(top.get("score", 0) or 0)
 
-                # El pick ya paso por preparar_analisis: recalibracion +
-                # filtro de cuota 1.50 ya aplicados. Aqui solo se exige una
-                # probabilidad recalibrada minima para guardar (mismo
-                # criterio que el resto del sistema). NO se filtra por score
-                # crudo: tras recalibrar, el score 7.5+ descartaria casi
-                # todo y los picks no entrarian al resumen.
-                prob_rec = float(top.get("prob", 0) or 0)
-                score_rec = float(top.get("score", 0) or 0)
-                # V14.2: filtrar por SCORE como criterio principal (no prob)
-                if score_rec < 7.5:
-                    continue
-
-                # Limit: max MAX_PICKS_DIA picks por dia
-                if len(picks_encontrados) >= MAX_PICKS_DIA:
+                if score < 7.5:
                     continue
 
                 # Usar cuota real de la API si existe, si no la calculada
@@ -10740,7 +7702,7 @@ async def analizar_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     "cuota": cuota_real_api if cuota_real_api > 1.0 else _cuota_segura(top),
                     **top,
                 }
-                guardar_pick_plano(pick_data)
+                guardar_pick_automatico(pick_data)
                 picks_encontrados.append(pick_data)
 
                 if score >= 9.0:
@@ -10781,18 +7743,12 @@ async def analizar_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Resumen final
     if not picks_encontrados:
         await update.message.reply_text(
-            f"📊 Analisis completo.\nPartidos analizados: {analizados}\n"
-            f"No se encontraron picks que superen los criterios de hoy "
-            f"(prob recalibrada 70%+, cuota 1.50+)."
+            f"📊 Analisis completo.\nPartidos analizados: {analizados}\nNo se encontraron picks con score 7.5+ hoy."
         )
         return
 
-    # Clasificacion por PROBABILIDAD recalibrada (coherente con el filtro
-    # de guardado). Elite = prob >= 85%, resto = los demas guardados.
-    elite = [p for p in picks_encontrados
-             if float(p.get("prob", 0) or 0) >= 85]
-    top75 = [p for p in picks_encontrados
-             if float(p.get("prob", 0) or 0) < 85]
+    elite = [p for p in picks_encontrados if float(p.get("score",0) or 0) >= 9.0]
+    top75 = [p for p in picks_encontrados if 7.5 <= float(p.get("score",0) or 0) < 9.0]
 
     # Intentar armar combinada del dia
     comb = _armar_combinada_del_dia()
@@ -10803,8 +7759,8 @@ async def analizar_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"📊 *Resumen /analizar_all — {hoy}*",
         "━━━━━━━━━━",
         f"Partidos analizados: {analizados} | Errores: {errores}",
-        f"🌟 Elite (prob 85%+): {len(elite)} picks",
-        f"⭐ Resto guardados: {len(top75)} picks",
+        f"🌟 Elite (9.0+): {len(elite)} picks",
+        f"⭐ TOP (7.5-8.9): {len(top75)} picks",
         f"Total guardados: {len(picks_encontrados)}",
         "━━━━━━━━━━",
     ]
@@ -11030,7 +7986,7 @@ def _obtener_picks_live_ahora(score_min=7.5, riesgo_max=2):
                 continue
 
             cuota = _cuota_segura(mejor)
-            if cuota < CUOTA_MINIMA_PICK:
+            if cuota < 1.20:
                 continue
 
             # Excluir BTTS de combinadas live
@@ -11122,7 +8078,7 @@ def _obtener_picks_live_ahora(score_min=7.5, riesgo_max=2):
                 "minuto_consulta": minuto,
                 "marcador": f"{gh}-{ga}",
                 "score": score_live,
-                "riesgo": float(mejor.get("riesgo", 5) or 5),
+                "riesgo": riesgo,
                 "probabilidad": mejor.get("prob", 0),
                 "cuota": cuota if cuota > 1.0 else 0.0,
                 "cuota_minima": cuota if cuota > 1.0 else 0.0,
@@ -11167,8 +8123,9 @@ def _armar_combinada_live():
             "motivo": f"No hay picks live con score 8.5+ y riesgo 2 en este momento",
         }
 
+    CUOTA_MIN = 2.50
     mejor = None
-    mejor_valor = 0.0   # solo combinadas con VE > 0
+    mejor_valor = -1.0
     mejor_razon = ""
 
     for n in [3, 2]:
@@ -11184,9 +8141,7 @@ def _armar_combinada_live():
             for p in grupo:
                 cuota_comb *= float(p.get("cuota", 1.0) or 1.0)
             cuota_comb = round(cuota_comb, 2)
-            if cuota_comb < CUOTA_COMBINADA_MIN:
-                continue
-            if cuota_comb > CUOTA_COMBINADA_MAX:
+            if cuota_comb < CUOTA_MIN:
                 continue
             valor = _valor_combinada(grupo)
             if valor > mejor_valor:
@@ -11194,7 +8149,7 @@ def _armar_combinada_live():
                 mejor = grupo
                 mejor_razon = (
                     f"{'Triple' if n==3 else 'Doble'} live optima — "
-                    f"cuota {cuota_comb}x | VE={valor}"
+                    f"cuota {cuota_comb}x | valor={valor}"
                 )
 
     if not mejor:
@@ -11317,8 +8272,9 @@ def _armar_combinada_mixta():
         })
         return {"sin_combinada": True, "subtipo": "mixta", "fecha": hoy, "motivo": motivo}
 
+    CUOTA_MIN = 2.50
     mejor = None
-    mejor_valor = 0.0   # solo combinadas con VE > 0
+    mejor_valor = -1.0
     mejor_razon = ""
 
     for n in [3, 2]:
@@ -11338,9 +8294,7 @@ def _armar_combinada_mixta():
             for p in grupo:
                 cuota_comb *= max(_cuota_segura(p), 1.0)
             cuota_comb = round(cuota_comb, 2)
-            if cuota_comb < CUOTA_COMBINADA_MIN:
-                continue
-            if cuota_comb > CUOTA_COMBINADA_MAX:
+            if cuota_comb < CUOTA_MIN:
                 continue
             valor = _valor_combinada(grupo)
             if valor > mejor_valor:
@@ -11350,7 +8304,7 @@ def _armar_combinada_mixta():
                 n_liv = fuentes.count("live")
                 mejor_razon = (
                     f"Mixta {n_pre} prematch + {n_liv} live — "
-                    f"cuota {cuota_comb}x | VE={valor}"
+                    f"cuota {cuota_comb}x | valor={valor}"
                 )
 
     if not mejor:
@@ -11534,10 +8488,7 @@ async def combinada_mixta(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ─────────────────────────────────────────────
 
 CUOTA_MIN_ALTA = 3.0
-# Migrado a criterios V14: cuota minima por eslabon 1.50 (igual que el
-# resto del sistema). Estos comandos buscan cuota combinada alta, pero
-# cada eslabon debe seguir siendo rentable individualmente.
-CUOTA_MIN_PICK_ALTA = 1.50
+CUOTA_MIN_PICK_ALTA = 1.40
 SCORE_MIN_ALTA = 7.5
 RIESGO_MAX_ALTA = 3
 
@@ -11567,6 +8518,9 @@ def _armar_comb3_prematch():
             continue
         # Excluir BTTS
         if _es_btts(p):
+            continue
+        # Excluir por liga/pais/clasico
+        if not _pick_valido_para_combinada(p):
             continue
         # Riesgo maximo 3 (excepcion: tarjetas)
         if not _riesgo_ok(p, riesgo_max=3):
@@ -11623,6 +8577,9 @@ def _armar_comb3_mixta():
             continue
         # Excluir BTTS
         if _es_btts(p):
+            continue
+        # Excluir por liga/pais/clasico
+        if not _pick_valido_para_combinada(p):
             continue
         # Riesgo maximo 3 (excepcion: tarjetas)
         if not _riesgo_ok(p, riesgo_max=3):
@@ -11688,27 +8645,8 @@ def _evaluar_comb3(candidatos, subtipo, hoy, mixta=False):
         })
         return {"sin_combinada": True, "subtipo": subtipo, "fecha": hoy, "motivo": motivo}
 
-    # Filtro por eslabon (criterios V14): cada pick debe ser valido
-    # individualmente. Estos comandos buscan cuota combinada alta, pero
-    # un eslabon flojo invalida el ticket igual que en /combinada.
-    candidatos = [p for p in candidatos if _eslabon_valido_combinada(p)]
-    if not candidatos:
-        motivo = ("Ningun pick pasa el filtro por eslabon V14 "
-                  f"(prob>={COMB_PROB_MIN}%, score>={COMB_SCORE_MIN}, "
-                  f"cuota>={CUOTA_MINIMA_ESLABON}, sin BTTS)")
-        agregar_json(APRENDIZAJE_FILE, {
-            "tipo": "sin_comb3",
-            "subtipo": subtipo,
-            "fecha": hoy,
-            "motivo": motivo,
-            "candidatos": 0,
-            "timestamp": fecha_hora_peru(),
-        })
-        return {"sin_combinada": True, "subtipo": subtipo,
-                "fecha": hoy, "motivo": motivo}
-
     mejor = None
-    mejor_valor = 0.0   # solo combinadas con VALOR ESPERADO > 0
+    mejor_valor = -1.0
     mejor_razon = ""
 
     for n in [3, 2]:
@@ -11729,8 +8667,6 @@ def _evaluar_comb3(candidatos, subtipo, hoy, mixta=False):
             for p in grupo:
                 cuota_comb *= max(_cuota_segura(p), 1.0)
             cuota_comb = round(cuota_comb, 2)
-            # Cuota combinada minima alta (proposito de estos comandos).
-            # No hay tope superior: el filtro de VE descarta lo fragil.
             if cuota_comb < CUOTA_MIN_ALTA:
                 continue
             valor = _valor_combinada(grupo)
@@ -11739,17 +8675,15 @@ def _evaluar_comb3(candidatos, subtipo, hoy, mixta=False):
                 mejor = grupo
                 fuentes_str = ""
                 if mixta:
-                    fs = [p.get("_fuente", "pre") for p in grupo]
-                    fuentes_str = (f" ({fs.count('prematch')}pre+"
-                                   f"{fs.count('live')}live)")
+                    fs = [p.get("_fuente","pre") for p in grupo]
+                    fuentes_str = f" ({fs.count('prematch')}pre+{fs.count('live')}live)"
                 mejor_razon = (
-                    f"{'Triple' if n==3 else 'Doble'}{fuentes_str} "
-                    f"cuota alta — {cuota_comb}x | VE={valor}"
+                    f"{'Triple' if n==3 else 'Doble'}{fuentes_str} cuota alta — "
+                    f"{cuota_comb}x | valor={valor}"
                 )
 
     if not mejor:
-        motivo = (f"Ninguna combinacion con VE>0 supera {CUOTA_MIN_ALTA}x "
-                  f"({len(candidatos)} candidatos validos)")
+        motivo = f"Ninguna combinacion supera {CUOTA_MIN_ALTA}x ({len(candidatos)} candidatos con cuota {CUOTA_MIN_PICK_ALTA}+)"
         agregar_json(APRENDIZAJE_FILE, {
             "tipo": "sin_comb3",
             "subtipo": subtipo,
@@ -12373,7 +9307,7 @@ async def actualizar_combinadas_cmd(update: Update, context: ContextTypes.DEFAUL
 
 ESCALERA_STAKE_INICIAL = 20.0
 ESCALERA_SCORE_MIN = 8.5
-ESCALERA_CUOTA_MIN = 1.50   # Consistente con CUOTA_MINIMA_PICK del sistema
+ESCALERA_CUOTA_MIN = 1.30
 
 _escaleras_activas = {}  # chat_id -> escalera dict
 
@@ -12834,11 +9768,8 @@ async def cancelar_escalera(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 CUOTA_MIN_4X = 4.0
 CUOTA_MIN_5X = 5.0
-# Migrado a criterios V14: cuota minima por eslabon 1.50, igual que todo
-# el sistema. El filtro por eslabon (_eslabon_valido_combinada) y el VE>0
-# son los que garantizan que la combinada de cuota alta tenga valor real.
-CUOTA_MIN_PICK_4X = 1.50
-CUOTA_MIN_PICK_5X = 1.50
+CUOTA_MIN_PICK_4X = 1.30   # 1.35^4 = 3.32 minimo, con mejores picks llega a 4x
+CUOTA_MIN_PICK_5X = 1.40   # 1.45^4 = 4.42, con 1.50x llega a 5.06x
 N_PICKS_ALTA = 4            # Minimo 4 picks para estas combinadas
 
 
@@ -12868,6 +9799,9 @@ def _armar_comb_alta(subtipo, cuota_min_comb, cuota_min_pick, hoy, mixta=False):
                 continue
             # Excluir BTTS
             if _es_btts(p):
+                continue
+            # Excluir por liga/pais/clasico
+            if not _pick_valido_para_combinada(p):
                 continue
             # Riesgo maximo 3 (excepcion: tarjetas)
             if not _riesgo_ok(p, riesgo_max=3):
@@ -12909,13 +9843,8 @@ def _armar_comb_alta(subtipo, cuota_min_comb, cuota_min_pick, hoy, mixta=False):
     else:
         todos = candidatos_pre + candidatos_live
 
-    # Filtro por eslabon (criterios V14): cada pick valido individualmente.
-    todos = [p for p in todos if _eslabon_valido_combinada(p)]
-
     if not todos:
-        motivo = (f"Ningun pick pasa el filtro por eslabon V14 "
-                  f"(prob>={COMB_PROB_MIN}%, score>={COMB_SCORE_MIN}, "
-                  f"cuota>={CUOTA_MINIMA_ESLABON}, sin BTTS)")
+        motivo = f"No hay picks con cuota >= {cuota_min_pick} disponibles"
         agregar_json(APRENDIZAJE_FILE, {
             "tipo": f"sin_comb_{int(cuota_min_comb)}x",
             "subtipo": subtipo,
@@ -12926,7 +9855,7 @@ def _armar_comb_alta(subtipo, cuota_min_comb, cuota_min_pick, hoy, mixta=False):
         return {"sin_combinada": True, "subtipo": subtipo, "fecha": hoy, "motivo": motivo}
 
     mejor = None
-    mejor_valor = 0.0   # solo combinadas con VALOR ESPERADO > 0
+    mejor_valor = -1.0
     mejor_razon = ""
 
     # Evaluar combinaciones de 4 y 3 picks
@@ -13210,31 +10139,22 @@ LIGAS_SELECCIONES = {
     "World Cup - Qualification South America",
 }
 
-# Ranking FIFA oficial — actualizado a abril 2026 (ultimo antes del Mundial)
-# Proxima actualizacion oficial: 11 junio 2026 (inicio del Mundial)
+# Ranking FIFA aproximado (Top 50, actualizado mensualmente)
 RANKING_FIFA = {
-    # Top 20 (fuente: FIFA oficial abril 2026)
-    "France": 1, "Spain": 2, "Argentina": 3, "England": 4,
-    "Portugal": 5, "Brazil": 6, "Netherlands": 7, "Morocco": 8,
-    "Belgium": 9, "Germany": 10, "Croatia": 11, "Italy": 12,
-    "Colombia": 13, "Senegal": 14, "Mexico": 15, "United States": 16,
-    "USA": 16, "Uruguay": 17, "Japan": 18, "Switzerland": 19,
-    "Denmark": 20,
-    # 21-50
-    "Ecuador": 21, "Austria": 22, "South Korea": 23, "Hungary": 24,
-    "Turkey": 25, "Türkiye": 25, "Australia": 26, "Canada": 27,
-    "Ukraine": 28, "Norway": 29, "Panama": 30, "Poland": 31,
-    "Wales": 32, "Chile": 32, "Algeria": 34, "Egypt": 35,
-    "Scotland": 36, "Serbia": 37, "Nigeria": 38, "Paraguay": 39,
-    "Peru": 40, "Tunisia": 41, "Ivory Coast": 42, "Sweden": 43,
-    "Czech Republic": 44, "Czechia": 44, "Slovakia": 45, "Greece": 46,
-    "Romania": 47, "Venezuela": 48, "Costa Rica": 49, "Uzbekistan": 50,
-    # Equipos clasificados al Mundial 2026
-    "Qatar": 53, "Saudi Arabia": 60, "South Africa": 61,
-    "Jordan": 64, "Cabo Verde": 67, "Cape Verde": 67,
-    "Ghana": 72, "Curaçao": 82, "Curacao": 82, "Haiti": 84,
-    "New Zealand": 87, "Honduras": 65, "Bolivia": 85,
-    "Iraq": 64, "Indonesia": 130,
+    "Argentina": 1, "France": 2, "England": 3, "Belgium": 4,
+    "Brazil": 5, "Portugal": 6, "Netherlands": 7, "Spain": 8,
+    "Morocco": 9, "Italy": 10, "Croatia": 11, "USA": 12,
+    "Uruguay": 13, "Colombia": 14, "Mexico": 15, "Germany": 16,
+    "Switzerland": 17, "Japan": 18, "Senegal": 19, "Denmark": 20,
+    "Ecuador": 21, "Australia": 22, "Austria": 23, "South Korea": 24,
+    "Hungary": 25, "Turkey": 26, "Ukraine": 27, "Poland": 28,
+    "Sweden": 29, "Serbia": 30, "Peru": 31, "Chile": 32,
+    "Paraguay": 33, "Venezuela": 34, "Bolivia": 35,
+    "Costa Rica": 36, "Panama": 37, "Jamaica": 38,
+    "Egypt": 39, "Nigeria": 40, "Ivory Coast": 41,
+    "Cameroon": 42, "Ghana": 43, "Tunisia": 44,
+    "Iran": 45, "Saudi Arabia": 46, "Qatar": 47,
+    "New Zealand": 48, "Norway": 49, "Czech Republic": 50,
 }
 
 # Fases del torneo y sus caracteristicas
@@ -13276,10 +10196,10 @@ FASES_TORNEO = {
     },
     "friendly": {
         "label": "Amistoso",
-        "mercados_preferidos": ["Over 1.5 goles", "Doble Oportunidad", "Under 3.5 goles"],
-        "mercados_evitar": ["Ambos marcan - Si", "Corners Over 9.5"],
+        "mercados_preferidos": ["Over 2.5 goles", "Ambos marcan - Si", "Corners Over 9.5"],
+        "mercados_evitar": [],
         "ajuste_score": -0.5,
-        "nota": "Amistosos: rotacion de jugadores, menor motivacion defensiva. Evitar corners.",
+        "nota": "Amistosos tienen mas goles — menor motivacion defensiva",
     },
 }
 
@@ -13567,8 +10487,23 @@ def analizar_seleccion(fixture_id, home, away, league, country, hora, round_name
             "motivo": f"Ranking diff: {diff_ranking} | Descanso visitante: {desc_away} dias",
         })
 
-    # TARJETAS ELIMINADO tambien para selecciones: dependen del arbitro y
-    # del animo de los jugadores, factores que el modelo no mide.
+    # Tarjetas (fases eliminatorias — motivacion alta = mas tarjetas)
+    if any("Tarjeta" in m for m in mercados_pref):
+        tarj_jugada = next((m for m in mercados_pref if "Tarjeta" in m), "Tarjetas Over 3.5")
+        prob_tarj = 65 if es_motivacion_alta else 55
+        if altitud > 2000:
+            prob_tarj += 3  # altitud genera mas friccion fisica
+        sugerencias.append({
+            "mercado": "Tarjetas",
+            "jugada": tarj_jugada,
+            "prob": prob_tarj,
+            "score": round(score_final - 0.2, 1),
+            "riesgo": 2.5,
+            "cuota_minima": cuota_minima(prob_tarj/100, 2.5),
+            "cuota": cuota_minima(prob_tarj/100, 2.5),
+            "confianza": etiqueta_confianza(score_final - 0.2),
+            "motivo": f"Eliminatoria — alta tension | Bajas home:{bajas_home} away:{bajas_away}",
+        })
 
     # Corners (equipos ofensivos generan mas corners)
     if any("Corner" in m for m in mercados_pref):
@@ -13856,25 +10791,629 @@ async def _alerta_edge_excelente_job(context):
         p["alerta_edge_enviada"] = True
     guardar_json_lista(PICKS_FILE, picks_todos)
 
+
+# ─────────────────────────────────────────────
+#  SISTEMA AUTOMATICO 00:00
+#  Picks diarios + Combinadas + Minitickets
+# ─────────────────────────────────────────────
+
+def _armar_minitickets(picks_hoy, hoy):
+    """
+    Arma minitickets: combinadas de 2-3 picks con score 9.5+,
+    riesgo 1, cuota individual 1.15-1.35.
+    Son muy seguros pero de cuota baja — al juntarlos sube la cuota.
+    """
+    from itertools import combinations as _comb_it
+    ya_usados = _fixture_ids_ya_usados(hoy)
+
+    candidatos = [
+        p for p in picks_hoy
+        if float(p.get("score", 0) or 0) >= 9.5
+        and float(p.get("riesgo", 10) or 10) <= 1.0
+        and not _es_btts(p)
+        and _pick_valido_para_combinada(p)
+        and str(p.get("fixture_id","")) not in ya_usados
+        and 1.10 <= float(_cuota_segura(p) or 0) <= 1.40
+    ]
+
+    if len(candidatos) < 2:
+        return []
+
+    minitickets = []
+    for n in [3, 2]:
+        if len(candidatos) < n:
+            continue
+        for grupo in _comb_it(candidatos, n):
+            grupo = list(grupo)
+            ids = [p.get("fixture_id","") for p in grupo]
+            if len(set(ids)) < len(ids):
+                continue
+            cuota_comb = 1.0
+            for p in grupo:
+                cuota_comb *= float(_cuota_segura(p) or 1.0)
+            cuota_comb = round(cuota_comb, 2)
+            if cuota_comb < 1.25:
+                continue
+            scores = [float(p.get("score",0) or 0) for p in grupo]
+            minitickets.append({
+                "picks": grupo,
+                "cuota": cuota_comb,
+                "score_prom": round(sum(scores)/len(scores), 2),
+                "n": n,
+            })
+
+    # Ordenar por score promedio descendente, tomar los 3 mejores
+    minitickets.sort(key=lambda x: (-x["score_prom"], -x["cuota"]))
+    return minitickets[:3]
+
+
+async def _job_automatico_medianoche(context):
+    """
+    Job a las 00:00 hora Peru:
+    1. Analiza todas las ligas y guarda picks del dia (score 8.0+)
+    2. Arma combinadas automaticamente
+    3. Arma minitickets
+    4. Notifica por Telegram con resumen completo
+    """
+    hoy = fecha_hoy_peru()
+    manana = (fecha_peru_obj() + __import__('datetime').timedelta(days=1)).strftime("%Y-%m-%d")
+
+    # ── Recopilar fixtures del dia siguiente ──────────────────────────
+    ligas_todas = {}
+    ligas_todas.update(EUROPA_LEAGUES)
+    ligas_todas.update(SUDAMERICA_LEAGUES)
+    ligas_todas.update(LIGAS_NOCTURNAS)
+
+    partidos_manana = []
+    for nombre_liga, cfg in ligas_todas.items():
+        try:
+            fx = api_get(
+                f"/fixtures?league={cfg['id']}&season={cfg['season']}&date={manana}",
+                use_cache=False
+            )
+            for m in (fx or []):
+                partidos_manana.append({
+                    "id": m["fixture"]["id"],
+                    "home": m["teams"]["home"]["name"],
+                    "away": m["teams"]["away"]["name"],
+                    "league": nombre_liga,
+                    "league_id": cfg["id"],
+                    "country": cfg.get("country",""),
+                    "hour": hora_peru(m["fixture"]["date"]),
+                    "fecha": manana,
+                })
+        except Exception:
+            continue
+
+    if not partidos_manana:
+        for chat_id in _CHAT_IDS_ALARMAS:
+            try:
+                await context.bot.send_message(
+                    chat_id=chat_id,
+                    text=f"\U0001f4cb *Analisis 00:00 — {manana}*\nNo se encontraron partidos para manana.",
+                    parse_mode="Markdown"
+                )
+            except Exception:
+                pass
+        return
+
+    # ── Analizar partidos y guardar picks ────────────────────────────
+    picks_nuevos = []
+    score_umbral = 8.0
+
+    for p in partidos_manana:
+        try:
+            fixture_id = str(p["id"])
+            es_seleccion = _es_partido_selecciones(p["league"], p["country"])
+
+            if es_seleccion:
+                analisis = analizar_seleccion(
+                    fixture_id, p["home"], p["away"],
+                    p["league"], p["country"], p["hour"]
+                )
+            else:
+                analisis = preparar_analisis(fixture_id, incluir_odds=True)
+
+            if not analisis:
+                continue
+
+            recomendaciones = analisis.get("recomendaciones") or analisis.get("sugerencias") or []
+            if not recomendaciones:
+                continue
+
+            top = recomendaciones[0]
+            score = float(top.get("score", 0) or 0)
+
+            if score < score_umbral:
+                continue
+
+            cuota_real = top.get("cuota_api") or 0
+            try:
+                cuota_real = float(cuota_real) if cuota_real else 0
+            except Exception:
+                cuota_real = 0
+
+            pick_data = {
+                "fixture_id": fixture_id,
+                "fecha": manana,
+                "hora": p["hour"],
+                "fecha_partido": manana,
+                "country": p["country"],
+                "league": p["league"],
+                "league_id": p.get("league_id", 0),
+                "partido": f"{p['home']} vs {p['away']}",
+                "home": p["home"],
+                "away": p["away"],
+                "mercado": top.get("mercado",""),
+                "jugada": top.get("jugada",""),
+                "probabilidad": top.get("prob", 0),
+                "score": score,
+                "riesgo": top.get("riesgo", 0),
+                "cuota_minima": _cuota_segura(top),
+                "cuota": cuota_real if cuota_real > 1.0 else _cuota_segura(top),
+                "cuota_pinnacle": cuota_real if cuota_real > 1.0 else None,
+                "edge": edge_estimado(float(top.get("prob",0) or 0), cuota_real) if cuota_real > 1.0 else None,
+                "edge_categoria": clasificar_edge(edge_estimado(float(top.get("prob",0) or 0), cuota_real) if cuota_real > 1.0 else None)[0],
+                "estado": "pendiente",
+                "resultado_real": None,
+                "tipo": "prematch",
+                "es_seleccion": es_seleccion,
+                "timestamp": fecha_hora_peru(),
+                "generado_automatico": True,
+            }
+            guardar_pick_automatico(pick_data)
+            picks_nuevos.append(pick_data)
+        except Exception:
+            continue
+
+    # Si hay pocos picks con 8.0+, bajar umbral a 7.5
+    if len(picks_nuevos) < 6:
+        for p in partidos_manana:
+            try:
+                fixture_id = str(p["id"])
+                if any(pk["fixture_id"] == fixture_id for pk in picks_nuevos):
+                    continue
+                analisis = preparar_analisis(fixture_id, incluir_odds=True)
+                if not analisis:
+                    continue
+                recomendaciones = analisis.get("recomendaciones") or []
+                if not recomendaciones:
+                    continue
+                top = recomendaciones[0]
+                score = float(top.get("score", 0) or 0)
+                if score < 7.5:
+                    continue
+                pick_data = {
+                    "fixture_id": fixture_id,
+                    "fecha": manana,
+                    "hora": p["hour"],
+                    "fecha_partido": manana,
+                    "country": p["country"],
+                    "league": p["league"],
+                    "league_id": p.get("league_id", 0),
+                    "partido": f"{p['home']} vs {p['away']}",
+                    "mercado": top.get("mercado",""),
+                    "jugada": top.get("jugada",""),
+                    "probabilidad": top.get("prob", 0),
+                    "score": score,
+                    "riesgo": top.get("riesgo", 0),
+                    "cuota_minima": _cuota_segura(top),
+                    "cuota": _cuota_segura(top),
+                    "estado": "pendiente",
+                    "resultado_real": None,
+                    "tipo": "prematch",
+                    "timestamp": fecha_hora_peru(),
+                    "generado_automatico": True,
+                }
+                guardar_pick_automatico(pick_data)
+                picks_nuevos.append(pick_data)
+                if len(picks_nuevos) >= 10:
+                    break
+            except Exception:
+                continue
+
+    picks_nuevos.sort(key=lambda x: float(x.get("score",0) or 0), reverse=True)
+
+    # ── Armar combinadas automaticas ─────────────────────────────────
+    combs_generadas = []
+    try:
+        for fn_comb, label in [
+            (_armar_combinada_del_dia, "PREMATCH 2.5x"),
+            (_armar_comb3_prematch, "PREMATCH 3x"),
+        ]:
+            comb = fn_comb()
+            if comb and not comb.get("sin_combinada"):
+                _guardar_combinada(comb)
+                combs_generadas.append((label, comb))
+    except Exception:
+        pass
+
+    # ── Armar minitickets ────────────────────────────────────────────
+    minitickets = _armar_minitickets(picks_nuevos, manana)
+    for mt in minitickets:
+        mt_comb = {
+            "fecha": manana,
+            "subtipo": "miniticket",
+            "picks": mt["picks"],
+            "cuota_combinada": mt["cuota"],
+            "n_picks": mt["n"],
+            "score_promedio": mt["score_prom"],
+            "riesgo_promedio": 1.0,
+            "estado": "pendiente",
+            "timestamp": fecha_hora_peru(),
+        }
+        _guardar_combinada(mt_comb)
+        combs_generadas.append((f"MINITICKET {mt['n']} picks", mt_comb))
+
+    # ── Notificacion Telegram ────────────────────────────────────────
+    for chat_id in _CHAT_IDS_ALARMAS:
+        try:
+            # Mensaje 1: Picks del dia
+            lineas_picks = [
+                f"\U0001f4cb *ANALISIS AUTOMATICO — {manana}*",
+                f"\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501",
+                f"\U0001f3af {len(picks_nuevos)} picks encontrados ({len([p for p in picks_nuevos if float(p.get('score',0) or 0) >= 8.0])} con score 8.0+)",
+                f"\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501",
+            ]
+            for i, p in enumerate(picks_nuevos[:8], 1):
+                cuota_p = _cuota_segura(p)
+                edge_p = p.get("edge")
+                edge_str = f" | Edge: +{edge_p}%" if edge_p and float(str(edge_p) or 0) >= 5 else ""
+                emoji_s = "\U0001f31f" if float(p.get("score",0) or 0) >= 9.5 else "\u2b50" if float(p.get("score",0) or 0) >= 8.5 else "\u2705"
+                lineas_picks.append(
+                    f"{emoji_s} *{p['partido']}*\n"
+                    f"   {p.get('league','')} | \u23f0 {p.get('hora','')}\n"
+                    f"   {p.get('jugada','')} | Score:{p.get('score','')} | Cuota:{cuota_p}{edge_str}"
+                )
+
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text="\n".join(lineas_picks)[:4000],
+                parse_mode="Markdown"
+            )
+
+            # Mensaje 2: Combinadas y minitickets
+            if combs_generadas:
+                lineas_combs = [
+                    f"\U0001f4b0 *COMBINADAS Y MINITICKETS — {manana}*",
+                    f"\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501",
+                ]
+                for label, c in combs_generadas:
+                    cuota_c = c.get("cuota_combinada","?")
+                    ticket = c.get("ticket_id","")[-8:] if c.get("ticket_id") else "auto"
+                    n_picks = c.get("n_picks", len(c.get("picks",[])))
+                    lineas_combs.append(
+                        f"\U0001f3af *[{label}]* {n_picks} picks | Cuota: {cuota_c}x\n"
+                        f"   Score prom: {c.get('score_promedio','?')} | `{ticket}`"
+                    )
+                    for p in c.get("picks",[]):
+                        lineas_combs.append(f"   • {p.get('partido','')} | {p.get('jugada','')}")
+                    lineas_combs.append("")
+
+                await context.bot.send_message(
+                    chat_id=chat_id,
+                    text="\n".join(lineas_combs)[:4000],
+                    parse_mode="Markdown"
+                )
+            else:
+                await context.bot.send_message(
+                    chat_id=chat_id,
+                    text=f"\u26a0\ufe0f No se generaron combinadas para {manana} — no hay suficientes picks de calidad.",
+                    parse_mode="Markdown"
+                )
+
+        except Exception:
+            pass
+
+
+# ─────────────────────────────────────────────
+#  COMANDOS /combinada_manana etc.
+# ─────────────────────────────────────────────
+
+def _picks_manana():
+    """Retorna picks prematch del dia siguiente guardados."""
+    manana = (fecha_peru_obj() + __import__('datetime').timedelta(days=1)).strftime("%Y-%m-%d")
+    picks = leer_json(PICKS_FILE)
+    return [
+        p for p in picks
+        if (p.get("fecha_partido") or p.get("fecha",""))[:10] == manana
+        and p.get("tipo","prematch") == "prematch"
+        and p.get("estado","pendiente").lower() in ("pendiente","pendiente_manual")
+    ]
+
+
+async def combinada_manana(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Combinada 2.5x+ con picks de manana."""
+    _registrar_chat_alarma(update.effective_chat.id)
+    await update.message.reply_text("\U0001f4cb Armando combinada con picks de manana...")
+    try:
+        picks_m = _picks_manana()
+        if not picks_m:
+            await update.message.reply_text(
+                "\u274c No hay picks guardados para manana.\n"
+                "El sistema los genera automaticamente a las 00:00, o usa /analizar_all ahora."
+            )
+            return
+        manana = (fecha_peru_obj() + __import__('datetime').timedelta(days=1)).strftime("%Y-%m-%d")
+        comb = _armar_combinada_del_dia()
+        if comb and not comb.get("sin_combinada"):
+            _guardar_combinada(comb)
+            await update.message.reply_text(
+                f"\u2705 Combinada manana guardada | Ticket: `{comb.get('ticket_id','')}`",
+                parse_mode="Markdown"
+            )
+            await update.message.reply_text(
+                _formato_combinada_telegram(comb), parse_mode="Markdown"
+            )
+        else:
+            motivo = comb.get("motivo","") if comb else "Sin candidatos suficientes"
+            await update.message.reply_text(f"\u274c Sin combinada para manana: {motivo}")
+    except Exception as e:
+        await update.message.reply_text(f"\u274c Error: {e}")
+
+
+async def comb3_manana(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Combinada 3x+ con picks de manana."""
+    _registrar_chat_alarma(update.effective_chat.id)
+    await update.message.reply_text("\U0001f4cb Armando combinada 3x+ con picks de manana...")
+    try:
+        picks_m = _picks_manana()
+        if not picks_m:
+            await update.message.reply_text("\u274c No hay picks para manana. Se generan a las 00:00.")
+            return
+        comb = _armar_comb3_prematch()
+        if comb and not comb.get("sin_combinada"):
+            _guardar_combinada(comb)
+            await update.message.reply_text(
+                _formato_combinada_telegram(comb), parse_mode="Markdown"
+            )
+        else:
+            motivo = comb.get("motivo","") if comb else "Sin candidatos"
+            await update.message.reply_text(f"\u274c Sin comb3 para manana: {motivo}")
+    except Exception as e:
+        await update.message.reply_text(f"\u274c Error: {e}")
+
+
+async def comb4_manana(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Combinada 4x+ con picks de manana."""
+    _registrar_chat_alarma(update.effective_chat.id)
+    await update.message.reply_text("\U0001f4cb Armando combinada 4x+ con picks de manana...")
+    try:
+        picks_m = _picks_manana()
+        if not picks_m:
+            await update.message.reply_text("\u274c No hay picks para manana.")
+            return
+        hoy = fecha_hoy_peru()
+        comb = _armar_comb_alta("prematch", CUOTA_MIN_4X, CUOTA_MIN_PICK_4X, hoy)
+        if comb and not comb.get("sin_combinada"):
+            _guardar_combinada(comb)
+            await update.message.reply_text(
+                _formato_comb_alta(comb, 4), parse_mode="Markdown"
+            )
+        else:
+            motivo = comb.get("motivo","") if comb else "Sin candidatos"
+            await update.message.reply_text(f"\u274c Sin comb4 para manana: {motivo}")
+    except Exception as e:
+        await update.message.reply_text(f"\u274c Error: {e}")
+
+
+async def comb5_manana(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Combinada 5x+ con picks de manana."""
+    _registrar_chat_alarma(update.effective_chat.id)
+    await update.message.reply_text("\U0001f4cb Armando combinada 5x+ con picks de manana...")
+    try:
+        picks_m = _picks_manana()
+        if not picks_m:
+            await update.message.reply_text("\u274c No hay picks para manana.")
+            return
+        hoy = fecha_hoy_peru()
+        comb = _armar_comb_alta("prematch", CUOTA_MIN_5X, CUOTA_MIN_PICK_5X, hoy)
+        if comb and not comb.get("sin_combinada"):
+            _guardar_combinada(comb)
+            await update.message.reply_text(
+                _formato_comb_alta(comb, 5), parse_mode="Markdown"
+            )
+        else:
+            motivo = comb.get("motivo","") if comb else "Sin candidatos"
+            await update.message.reply_text(f"\u274c Sin comb5 para manana: {motivo}")
+    except Exception as e:
+        await update.message.reply_text(f"\u274c Error: {e}")
+
+
+async def minitickets(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    /minitickets — Muestra los minitickets del dia:
+    combinadas de 2-3 picks con score 9.5+, riesgo 1, cuota baja pero muy segura.
+    """
+    _registrar_chat_alarma(update.effective_chat.id)
+    hoy = fecha_hoy_peru()
+    picks_hoy = [
+        p for p in leer_json(PICKS_FILE)
+        if (p.get("fecha_partido") or p.get("fecha",""))[:10] == hoy
+        and p.get("estado","pendiente").lower() in ("pendiente","pendiente_manual")
+    ]
+
+    mts = _armar_minitickets(picks_hoy, hoy)
+
+    if not mts:
+        await update.message.reply_text(
+            "\u274c No hay minitickets disponibles hoy.\n"
+            "Se necesitan al menos 2 picks con score 9.5+, riesgo 1 y cuota 1.10-1.40."
+        )
+        return
+
+    for i, mt in enumerate(mts, 1):
+        lineas = [
+            f"\U0001f4b0 *MINITICKET {i} — {mt['n']} picks*",
+            f"Score prom: {mt['score_prom']} | Cuota combinada: *{mt['cuota']}x*",
+            f"\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501",
+        ]
+        for j, p in enumerate(mt["picks"], 1):
+            cuota_p = _cuota_segura(p)
+            lineas.append(
+                f"{j}. *{p.get('partido','')}*\n"
+                f"   {p.get('league','')} | \u23f0 {p.get('hora','')}\n"
+                f"   {p.get('jugada','')} | Score:{p.get('score','')} | Cuota:{cuota_p}"
+            )
+        stake = round(BANK_INICIAL * STAKE_COMBINADA, 2)
+        ganancia = round(stake * (mt["cuota"] - 1), 2)
+        lineas += [
+            f"\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501",
+            f"\U0001f4b0 Stake: S/{stake:.2f} | Ganancia pot: *S/{ganancia:.2f}*",
+            f"\U0001f9e0 Alta confianza — todos score 9.5+ riesgo 1",
+        ]
+        await update.message.reply_text("\n".join(lineas), parse_mode="Markdown")
+
+# ─────────────────────────────────────────────
+#  VALIDACION DE LIGAS CONTRA LA API
+#  Comprueba que cada ID de liga pertenezca al pais configurado.
+#  Si un ID apunta a otro pais, la liga se desactiva y se avisa.
+# ─────────────────────────────────────────────
+_LIGAS_SNAPSHOT = None
+
+
+def _validar_ligas_config():
+    """
+    Consulta /leagues?id=X por cada liga configurada y compara el pais real
+    con el pais de la configuracion.
+    - OK:        el pais coincide.
+    - ERROR:     el pais NO coincide -> la liga se quita de los diccionarios activos.
+    - SIN_DATOS: la API no respondio -> la liga se mantiene activa.
+    Devuelve una lista de dicts con el detalle de cada liga.
+    """
+    global _LIGAS_SNAPSHOT
+    grupos = {
+        "EUROPA": EUROPA_LEAGUES,
+        "SUDAMERICA": SUDAMERICA_LEAGUES,
+        "NOCTURNAS": LIGAS_NOCTURNAS,
+    }
+    # Copia de la configuracion original (para poder re-validar sin perder ligas)
+    if _LIGAS_SNAPSHOT is None:
+        _LIGAS_SNAPSHOT = {g: dict(d) for g, d in grupos.items()}
+
+    resultados = []
+    for grupo, dic_activo in grupos.items():
+        for nombre, cfg in _LIGAS_SNAPSHOT[grupo].items():
+            estado = "SIN_DATOS"
+            real_nombre = ""
+            real_pais = ""
+            try:
+                data = api_get(f"/leagues?id={cfg['id']}", ttl=86400)
+                if data:
+                    real_nombre = (data[0].get("league") or {}).get("name", "") or ""
+                    real_pais = (data[0].get("country") or {}).get("name", "") or ""
+                    esperado = (cfg.get("country") or "").strip().lower()
+                    if esperado and real_pais and esperado != real_pais.strip().lower():
+                        estado = "ERROR"
+                    elif real_pais:
+                        estado = "OK"
+            except Exception:
+                pass
+
+            if estado == "ERROR":
+                dic_activo.pop(nombre, None)       # desactivar liga con ID equivocado
+            elif nombre not in dic_activo:
+                dic_activo[nombre] = cfg           # re-activar si ahora es valida
+
+            resultados.append({
+                "nombre": nombre,
+                "id": cfg["id"],
+                "pais": cfg.get("country", ""),
+                "real_nombre": real_nombre,
+                "real_pais": real_pais,
+                "estado": estado,
+            })
+    return resultados
+
+
+def _formato_validacion_ligas(resultados, detalle=True):
+    """Texto plano (sin Markdown) con el resultado de la validacion."""
+    ok = [r for r in resultados if r["estado"] == "OK"]
+    err = [r for r in resultados if r["estado"] == "ERROR"]
+    sin = [r for r in resultados if r["estado"] == "SIN_DATOS"]
+
+    lineas = [f"🔎 Validación de ligas: {len(ok)}/{len(resultados)} correctas"]
+
+    if err:
+        lineas.append("")
+        lineas.append(f"❌ {len(err)} con ID equivocado (se desactivan):")
+        for r in err:
+            lineas.append(
+                f"  • {r['nombre']} (ID {r['id']}): la API dice "
+                f"{r['real_nombre']} de {r['real_pais']}, se esperaba {r['pais']}"
+            )
+    if sin:
+        lineas.append("")
+        lineas.append(f"⚠️ {len(sin)} sin respuesta de la API (siguen activas):")
+        for r in sin:
+            lineas.append(f"  • {r['nombre']} (ID {r['id']})")
+    if detalle and ok:
+        lineas.append("")
+        lineas.append("✅ Correctas:")
+        for r in ok:
+            lineas.append(f"  • {r['nombre']} (ID {r['id']}) → {r['real_nombre']} · {r['real_pais']}")
+    if not err and not sin:
+        lineas.append("Todas las ligas coinciden con su país.")
+    return "\n".join(lineas)
+
+
+async def validar_ligas(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/validar_ligas — Verifica contra la API que cada ID de liga sea del pais correcto."""
+    _registrar_chat_alarma(update.effective_chat.id)
+    await update.message.reply_text("🔎 Validando ligas contra la API, un momento...")
+    try:
+        resultados = await asyncio.to_thread(_validar_ligas_config)
+    except Exception as e:
+        await update.message.reply_text(f"❌ Error validando ligas: {e}")
+        return
+    texto = _formato_validacion_ligas(resultados, detalle=True)
+    for i in range(0, len(texto), 3800):
+        await update.message.reply_text(texto[i:i + 3800])
+
+
+async def _job_validar_ligas_inicio(context):
+    """Se ejecuta unos segundos despues de arrancar el bot."""
+    try:
+        resultados = await asyncio.to_thread(_validar_ligas_config)
+    except Exception as e:
+        print(f"Validacion de ligas fallo: {e}")
+        return
+    texto = _formato_validacion_ligas(resultados, detalle=False)
+    try:
+        print(texto)
+    except Exception:
+        pass
+    for chat_id in list(_CHAT_IDS_ALARMAS):
+        try:
+            await context.bot.send_message(chat_id=chat_id, text=texto)
+        except Exception:
+            pass
+
+
 app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
 
 app.add_handler(CommandHandler("start", start))
-app.add_handler(CommandHandler("handicap", handicap))
-app.add_handler(CommandHandler("handicap_stats", handicap_stats))
-app.add_handler(CommandHandler("combinada_dia", combinada_dia))
 app.add_handler(CommandHandler("analizar", analizar))
 app.add_handler(CommandHandler("detalle", detalle))
 app.add_handler(CommandHandler("top", top))
 app.add_handler(CommandHandler("top_manana", top_manana))
+app.add_handler(CommandHandler("toplive", toplive))
 app.add_handler(CommandHandler("elite", elite))
+app.add_handler(CommandHandler("elitelive", elitelive))
 app.add_handler(CommandHandler("elite_manana", elite_manana))
 app.add_handler(CommandHandler("fixtures", fixtures))
+app.add_handler(CommandHandler("fixtures_europa", fixtures_europa))
+app.add_handler(CommandHandler("fixtures_sudamerica", fixtures_sudamerica))
 app.add_handler(CommandHandler("fixtures_manana", fixtures_manana))
+app.add_handler(CommandHandler("fixtures_europa_manana", fixtures_europa_manana))
+app.add_handler(CommandHandler("fixtures_sudamerica_manana", fixtures_sudamerica_manana))
 app.add_handler(CommandHandler("scanear", scanear))
+app.add_handler(CommandHandler("scanear_europa", scanear_europa))
+app.add_handler(CommandHandler("scanear_sudamerica", scanear_sudamerica))
+app.add_handler(CommandHandler("live", live))
 app.add_handler(CommandHandler("alertas_on", alertas_on))
 app.add_handler(CommandHandler("alertas_off", alertas_off))
 app.add_handler(CommandHandler("resumen", resumen))
-app.add_handler(CommandHandler("resumen_ayer", resumen_ayer))
 app.add_handler(CommandHandler("resumentop", resumentop))
 app.add_handler(CommandHandler("resumentoplive", resumentoplive))
 app.add_handler(CommandHandler("pdf_semana", pdf_semana))
@@ -13899,6 +11438,12 @@ app.add_handler(CommandHandler("resumen_prematch", resumen_prematch))
 app.add_handler(CommandHandler("resumen_live", resumen_live))
 app.add_handler(CommandHandler("resumen_combinadas", resumen_combinadas))
 app.add_handler(CommandHandler("estado", estado))
+app.add_handler(CommandHandler("validar_ligas", validar_ligas))
+app.add_handler(CommandHandler("minitickets", minitickets))
+app.add_handler(CommandHandler("combinada_manana", combinada_manana))
+app.add_handler(CommandHandler("comb3_manana", comb3_manana))
+app.add_handler(CommandHandler("comb4_manana", comb4_manana))
+app.add_handler(CommandHandler("comb5_manana", comb5_manana))
 app.add_handler(CommandHandler("escalera", escalera))
 app.add_handler(CommandHandler("confirmar_escalera", confirmar_escalera))
 app.add_handler(CommandHandler("cancelar_escalera", cancelar_escalera))
@@ -13914,20 +11459,28 @@ async def _set_commands(app_instance):
         BotCommand("analizar",                  "Analiza partido por ID"),
         BotCommand("detalle",                   "Detalle completo partido"),
         BotCommand("fixtures",                  "Partidos hoy todas ligas"),
+        BotCommand("fixtures_europa",           "Partidos Europa hoy"),
+        BotCommand("fixtures_sudamerica",       "Partidos Sudamerica hoy"),
         BotCommand("fixtures_manana",           "Partidos manana"),
+        BotCommand("fixtures_europa_manana",    "Europa manana"),
+        BotCommand("fixtures_sudamerica_manana","Sudamerica manana"),
         BotCommand("top",                       "Picks TOP hoy 7.5+"),
         BotCommand("elite",                     "Picks ELITE hoy 9.0+"),
         BotCommand("top_manana",                "Picks TOP manana"),
         BotCommand("elite_manana",              "Picks ELITE manana"),
+        BotCommand("toplive",                   "Picks TOP live"),
+        BotCommand("elitelive",                 "Picks ELITE live"),
         BotCommand("live_all",                  "Analiza TODOS los partidos live"),
+        BotCommand("live",                      "Analisis de un partido live por ID"),
         BotCommand("alertas_on",                "Activar alertas live"),
         BotCommand("alertas_off",               "Desactivar alertas"),
         BotCommand("combinada",                 "Combinada optima prematch del dia"),
         BotCommand("combinada_live",            "Combinada optima con picks live"),
         BotCommand("combinada_mixta",           "Combinada mixta prematch + live"),
         BotCommand("scanear",                   "Escanea todas las ligas"),
+        BotCommand("scanear_europa",            "Escanea Europa"),
+        BotCommand("scanear_sudamerica",        "Escanea Sudamerica"),
         BotCommand("resumen",                   "Resumen PDF del dia"),
-        BotCommand("resumen_ayer",              "Resumen de ayer + combinadas"),
         BotCommand("resumentop",                "PDF picks prematch"),
         BotCommand("resumentoplive",            "PDF picks live"),
         BotCommand("pdf_semana",                "Reporte semanal PDF"),
@@ -13947,11 +11500,18 @@ async def _registrar_comandos_bot(context):
         BotCommand("analizar",                   "Analiza partido por ID"),
         BotCommand("detalle",                    "Detalle completo partido"),
         BotCommand("fixtures",                   "Partidos hoy todas ligas"),
+        BotCommand("fixtures_europa",            "Partidos Europa hoy"),
+        BotCommand("fixtures_sudamerica",        "Partidos Sudamerica hoy"),
         BotCommand("fixtures_manana",            "Partidos manana"),
+        BotCommand("fixtures_europa_manana",     "Europa manana"),
+        BotCommand("fixtures_sudamerica_manana", "Sudamerica manana"),
         BotCommand("top",                        "Picks TOP hoy 7.5+"),
         BotCommand("elite",                      "Picks ELITE hoy 9.0+"),
         BotCommand("top_manana",                 "Picks TOP manana"),
         BotCommand("elite_manana",               "Picks ELITE manana"),
+        BotCommand("toplive",                    "Picks TOP live"),
+        BotCommand("elitelive",                  "Picks ELITE live"),
+        BotCommand("live",                       "Analisis de un partido live"),
         BotCommand("live_all",                   "Analiza TODOS los partidos live"),
         BotCommand("alertas_on",                 "Activar alertas live"),
         BotCommand("alertas_off",                "Desactivar alertas"),
@@ -13968,12 +11528,19 @@ async def _registrar_comandos_bot(context):
         BotCommand("comb5_live",                 "Combinada 5x+ live"),
         BotCommand("comb5_mixta",                "Combinada 5x+ mixta"),
         BotCommand("scanear",                    "Escanea todas las ligas"),
+        BotCommand("scanear_europa",             "Escanea Europa"),
+        BotCommand("scanear_sudamerica",         "Escanea Sudamerica"),
         BotCommand("resumen",                    "Resumen PDF del dia"),
-        BotCommand("resumen_ayer",               "Resumen de ayer + combinadas"),
         BotCommand("resumen_prematch",           "Resumen diario solo prematch"),
         BotCommand("resumen_live",               "Resumen diario solo live"),
         BotCommand("resumen_combinadas",         "Resumen diario de combinadas"),
         BotCommand("estado",                     "Dashboard rapido del dia"),
+        BotCommand("validar_ligas",              "Verifica que los IDs de ligas sean correctos"),
+        BotCommand("minitickets",                "Minitickets del dia — picks 9.5+ riesgo 1"),
+        BotCommand("combinada_manana",           "Combinada 2.5x+ de manana"),
+        BotCommand("comb3_manana",               "Combinada 3x+ de manana"),
+        BotCommand("comb4_manana",               "Combinada 4x+ de manana"),
+        BotCommand("comb5_manana",               "Combinada 5x+ de manana"),
         BotCommand("escalera",                   "Arma escalera cronologica de picks"),
         BotCommand("confirmar_escalera",         "Confirma la escalera propuesta"),
         BotCommand("cancelar_escalera",          "Cancela la escalera activa"),
@@ -13990,27 +11557,5 @@ async def _registrar_comandos_bot(context):
         pass
 
 app.job_queue.run_once(_registrar_comandos_bot, when=3)
-
-# Cargar chat_ids de alarmas persistidos (sobreviven reinicios)
-_cargar_chat_ids_alarmas()
-
-# Job GLOBAL de actualizacion de estados cada 20 minutos
-# Independiente de alertas — siempre activo.
-app.job_queue.run_repeating(
-    _job_actualizar_estados,
-    interval=1200,   # cada 20 minutos
-    first=30,
-    name="auto_update_estados_global",
-)
-
-# Job GLOBAL de alertas live: uno solo para todos los suscriptores.
-# Se registra siempre al arrancar; si no hay suscriptores el job retorna
-# de inmediato sin gastar llamadas a la API.
-app.job_queue.run_repeating(
-    revisar_alertas_live,
-    interval=ALERTAS_INTERVALO,
-    first=20,
-    name="alertas_live_global",
-)
-
+app.job_queue.run_once(_job_validar_ligas_inicio, when=10)
 app.run_polling()
