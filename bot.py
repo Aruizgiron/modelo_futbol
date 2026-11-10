@@ -1226,6 +1226,749 @@ def cuota_ticket(picks):
     return round(total, 2), reales, estimadas
 
 
+# ═════════════════════════════════════════════════════════════════
+#  MODELO HARRYNINE v4
+#  1) Fuerza de cada equipo con TODA la temporada de su liga (1 llamada
+#     por liga al dia): ataque y defensa ajustados por rival, ventaja de
+#     local propia de cada liga, partidos recientes pesan mas.
+#  2) Poisson con correccion Dixon-Coles -> probabilidades coherentes de
+#     1X2, doble oportunidad, empate no apuesta, Over/Under y ambos marcan.
+#  3) Mezcla con la probabilidad del mercado (Pinnacle sin margen) y
+#     comparacion con la cuota de TU casa -> solo se recomienda con valor.
+# ═════════════════════════════════════════════════════════════════
+import math as _m
+
+# ── Configuracion (puedes cambiar estos valores) ────────────────────
+CASAS_PREFERIDAS = []          # Ej: ["Betsson", "Bet365"]. Vacio = Pinnacle / mediana
+PESO_MODELO = 0.5              # 0.5 = mitad modelo, mitad mercado
+EDGE_MIN = 0.02                # valor minimo para recomendar (2%)
+EDGE_MAX = 0.15                # mas de 15% suele ser error del modelo
+MAX_DISCREPANCIA = 0.15        # modelo vs mercado: mas de 15 puntos = no confiar
+PROB_MIN_PREMATCH = 0.60
+CUOTA_MIN_RECOMENDAR = 1.20
+CUOTA_MAX_RECOMENDAR = 3.50
+VIDA_MEDIA_DIAS = 120          # un partido de hace 120 dias pesa la mitad
+SHRINK_PARTIDOS = 3.0          # "partidos virtuales" de promedio (evita extremos)
+MIN_PARTIDOS_EQUIPO = 5
+RHO_DC = -0.08                 # correccion Dixon-Coles (marcadores bajos)
+MEDIA_CORNERS = 10.0
+MEDIA_TARJETAS = 4.6
+DISPERSION_CORNERS = 1.3       # varianza = 1.3 x media
+DISPERSION_TARJETAS = 1.4
+
+LINEAS_GOLES = (0.5, 1.5, 2.5, 3.5, 4.5)
+
+
+# ── Utilidades de probabilidad ──────────────────────────────────────
+def _poisson_pmf(k, lam):
+    if lam <= 0:
+        return 1.0 if k == 0 else 0.0
+    return _m.exp(-lam + k * _m.log(lam) - _m.lgamma(k + 1))
+
+
+def _poisson_sf(k, lam):
+    """P(X >= k)"""
+    if k <= 0:
+        return 1.0
+    return max(0.0, 1.0 - sum(_poisson_pmf(i, lam) for i in range(k)))
+
+
+def _negbin_sf(k, media, dispersion):
+    """P(X >= k) con binomial negativa (conteos con mas varianza que Poisson)."""
+    if k <= 0:
+        return 1.0
+    var = media * dispersion
+    if var <= media * 1.0001:
+        return _poisson_sf(k, media)
+    p = media / var
+    r = media * p / (1 - p)
+    acc = 0.0
+    for i in range(k):
+        acc += _m.exp(_m.lgamma(i + r) - _m.lgamma(r) - _m.lgamma(i + 1)
+                      + r * _m.log(p) + i * _m.log(1 - p))
+    return max(0.0, 1.0 - acc)
+
+
+def _tau_dc(x, y, lh, la, rho):
+    if x == 0 and y == 0:
+        return 1 - lh * la * rho
+    if x == 0 and y == 1:
+        return 1 + lh * rho
+    if x == 1 and y == 0:
+        return 1 + la * rho
+    if x == 1 and y == 1:
+        return 1 - rho
+    return 1.0
+
+
+def matriz_marcadores(lh, la, max_goles=10, rho=RHO_DC):
+    mat = [[0.0] * (max_goles + 1) for _ in range(max_goles + 1)]
+    tot = 0.0
+    for x in range(max_goles + 1):
+        px = _poisson_pmf(x, lh)
+        for y in range(max_goles + 1):
+            v = px * _poisson_pmf(y, la) * _tau_dc(x, y, lh, la, rho)
+            v = max(v, 0.0)
+            mat[x][y] = v
+            tot += v
+    if tot > 0:
+        for x in range(max_goles + 1):
+            for y in range(max_goles + 1):
+                mat[x][y] /= tot
+    return mat
+
+
+def probabilidades_partido(lh, la):
+    """Todas las probabilidades de goles a partir de los goles esperados."""
+    mat = matriz_marcadores(lh, la)
+    n = len(mat)
+    p1 = sum(mat[x][y] for x in range(n) for y in range(n) if x > y)
+    px = sum(mat[x][x] for x in range(n))
+    p2 = 1 - p1 - px
+    pr = {
+        "1": p1, "x": px, "2": p2,
+        "1x": p1 + px, "x2": px + p2, "12": p1 + p2,
+        "dnb1": p1 / (p1 + p2) if (p1 + p2) > 0 else 0.5,
+        "dnb2": p2 / (p1 + p2) if (p1 + p2) > 0 else 0.5,
+        "btts_si": sum(mat[x][y] for x in range(1, n) for y in range(1, n)),
+        "lh": lh, "la": la,
+    }
+    pr["btts_no"] = 1 - pr["btts_si"]
+    for linea in LINEAS_GOLES:
+        over = sum(mat[x][y] for x in range(n) for y in range(n) if x + y > linea)
+        pr[f"over_{linea}"] = over
+        pr[f"under_{linea}"] = 1 - over
+    return pr
+
+
+# ── Fuerza de equipos por liga ──────────────────────────────────────
+_CACHE_RATINGS = {}
+
+
+def _partidos_temporada(league_id, season):
+    data = api_get(
+        f"/fixtures?league={league_id}&season={season}&status=FT-AET-PEN",
+        use_cache=True, ttl=43200
+    )
+    partidos = []
+    for m in data or []:
+        try:
+            gh = m["goals"]["home"]
+            ga = m["goals"]["away"]
+            if gh is None or ga is None:
+                continue
+            partidos.append({
+                "id": m["fixture"]["id"],
+                "ts": int(m["fixture"]["timestamp"]),
+                "home": m["teams"]["home"]["id"],
+                "away": m["teams"]["away"]["id"],
+                "home_name": m["teams"]["home"]["name"],
+                "away_name": m["teams"]["away"]["name"],
+                "gh": int(gh), "ga": int(ga),
+            })
+        except Exception:
+            continue
+    partidos.sort(key=lambda x: x["ts"])
+    return partidos
+
+
+def calcular_ratings(partidos, ts_ref=None, iteraciones=12):
+    """
+    Ataque/defensa por equipo (1.0 = promedio de la liga), ajustados por rival.
+    Usa pesos por antiguedad y 'shrinkage' hacia el promedio.
+    """
+    if not partidos:
+        return None
+    ts_ref = ts_ref or max(p["ts"] for p in partidos)
+    decaimiento = _m.log(2) / (VIDA_MEDIA_DIAS * 86400)
+    filas = []
+    for p in partidos:
+        if p["ts"] > ts_ref:
+            continue
+        w = _m.exp(-decaimiento * max(0, ts_ref - p["ts"]))
+        filas.append((p, w))
+    if len(filas) < 10:
+        return None
+
+    sw = sum(w for _, w in filas)
+    media_local = sum(p["gh"] * w for p, w in filas) / sw
+    media_visita = sum(p["ga"] * w for p, w in filas) / sw
+    media_local = max(media_local, 0.5)
+    media_visita = max(media_visita, 0.4)
+
+    equipos = set()
+    for p, _ in filas:
+        equipos.add(p["home"]); equipos.add(p["away"])
+    ata = {e: 1.0 for e in equipos}
+    defe = {e: 1.0 for e in equipos}
+    k = SHRINK_PARTIDOS
+
+    for _ in range(iteraciones):
+        g_for = {e: 0.0 for e in equipos}; e_for = {e: 0.0 for e in equipos}
+        g_ag = {e: 0.0 for e in equipos}; e_ag = {e: 0.0 for e in equipos}
+        for p, w in filas:
+            h, a = p["home"], p["away"]
+            g_for[h] += w * p["gh"]; e_for[h] += w * media_local * defe[a]
+            g_for[a] += w * p["ga"]; e_for[a] += w * media_visita * defe[h]
+            g_ag[h] += w * p["ga"]; e_ag[h] += w * media_visita * ata[a]
+            g_ag[a] += w * p["gh"]; e_ag[a] += w * media_local * ata[h]
+        ata = {e: (g_for[e] + k) / (e_for[e] + k) for e in equipos}
+        defe = {e: (g_ag[e] + k) / (e_ag[e] + k) for e in equipos}
+        ma = sum(ata.values()) / len(ata)
+        md = sum(defe.values()) / len(defe)
+        ata = {e: v / ma for e, v in ata.items()}
+        defe = {e: v / md for e, v in defe.items()}
+
+    jugados = {e: 0 for e in equipos}
+    ultimo = {}
+    for p, _ in filas:
+        jugados[p["home"]] += 1; jugados[p["away"]] += 1
+        ultimo[p["home"]] = max(ultimo.get(p["home"], 0), p["ts"])
+        ultimo[p["away"]] = max(ultimo.get(p["away"], 0), p["ts"])
+
+    return {"ata": ata, "def": defe, "media_local": media_local,
+            "media_visita": media_visita, "jugados": jugados,
+            "ultimo_partido_liga": ultimo, "n_partidos": len(filas)}
+
+
+def ratings_liga(league_id, season):
+    clave = (int(league_id), int(season))
+    hoy = fecha_hoy_peru()
+    c = _CACHE_RATINGS.get(clave)
+    if c and c["fecha"] == hoy:
+        return c["data"]
+    partidos = _partidos_temporada(league_id, season)
+    data = calcular_ratings(partidos)
+    if data:
+        data["partidos"] = partidos
+    _CACHE_RATINGS[clave] = {"fecha": hoy, "data": data}
+    return data
+
+
+def _goles_esperados_forma(home_id, away_id):
+    """Respaldo para copas o ligas sin datos: forma reciente, acercada al promedio."""
+    fh = calcular_forma(home_id) or {}
+    fa = calcular_forma(away_id) or {}
+    if not fh or not fa:
+        return None
+    k = 4
+    nh, na = fh.get("jugados", 0), fa.get("jugados", 0)
+    lh = ((fh["gf_prom"] + fa["gc_prom"]) / 2 * (nh + na) / 2 + 1.45 * k) / ((nh + na) / 2 + k)
+    la = ((fa["gf_prom"] + fh["gc_prom"]) / 2 * (nh + na) / 2 + 1.15 * k) / ((nh + na) / 2 + k)
+    return max(lh, 0.2), max(la, 0.15)
+
+
+# ── Contexto: descanso y motivacion ─────────────────────────────────
+def _dias_descanso(team_id, ts_partido):
+    data = api_get(f"/fixtures?team={team_id}&last=2", use_cache=True, ttl=21600)
+    previos = []
+    for m in data or []:
+        try:
+            ts = int(m["fixture"]["timestamp"])
+            if ts < ts_partido - 3600:
+                previos.append(ts)
+        except Exception:
+            continue
+    if not previos:
+        return None
+    return round((ts_partido - max(previos)) / 86400, 1)
+
+
+def _contexto_tabla(league_id, season, team_id):
+    """Devuelve 'sin_objetivos' si a fin de temporada el equipo no pelea nada."""
+    try:
+        data = api_get(f"/standings?league={league_id}&season={season}", use_cache=True, ttl=21600)
+        tablas = data[0]["league"]["standings"]
+    except Exception:
+        return None
+    for tabla in tablas:
+        if not any(r["team"]["id"] == team_id for r in tabla):
+            continue
+        n = len(tabla)
+        if n < 8:
+            return None
+        total_fechas = 2 * (n - 1)
+        fila = next(r for r in tabla if r["team"]["id"] == team_id)
+        jugados = fila["all"]["played"]
+        if jugados < 0.8 * total_fechas:
+            return None
+        restantes_pts = (total_fechas - jugados) * 3
+        con_desc = [r for r in tabla if r.get("description")]
+        arriba = [r for r in con_desc if r["rank"] <= n // 2]
+        abajo = [r for r in con_desc if r["rank"] > n // 2]
+        pts = fila["points"]
+        lejos_arriba = (not arriba) or (min(r["points"] for r in arriba) - pts > restantes_pts)
+        lejos_abajo = (not abajo) or (pts - max(r["points"] for r in abajo) > restantes_pts)
+        en_zona = bool(fila.get("description"))
+        if lejos_arriba and lejos_abajo and not en_zona:
+            return "sin_objetivos"
+        return None
+    return None
+
+
+def goles_esperados(fixture):
+    """
+    Devuelve dict con lh, la, fuente ('liga' o 'forma'), confianza y motivos.
+    """
+    lg = fixture["league"]
+    home_id = fixture["teams"]["home"]["id"]
+    away_id = fixture["teams"]["away"]["id"]
+    ts = int(fixture["fixture"].get("timestamp") or 0)
+    motivos, confianza, fuente = [], "alta", "liga"
+    lh = la = None
+
+    rat = None
+    try:
+        rat = ratings_liga(lg["id"], lg["season"])
+    except Exception as e:
+        print("ERROR ratings:", e)
+    if (rat and home_id in rat["ata"] and away_id in rat["ata"]
+            and rat["jugados"].get(home_id, 0) >= MIN_PARTIDOS_EQUIPO
+            and rat["jugados"].get(away_id, 0) >= MIN_PARTIDOS_EQUIPO):
+        lh = rat["media_local"] * rat["ata"][home_id] * rat["def"][away_id]
+        la = rat["media_visita"] * rat["ata"][away_id] * rat["def"][home_id]
+        motivos.append(f"Fuerza de liga ({rat['n_partidos']} partidos de la temporada)")
+    else:
+        r = _goles_esperados_forma(home_id, away_id)
+        if not r:
+            return None
+        lh, la = r
+        fuente, confianza = "forma", "baja"
+        motivos.append("Sin datos de liga suficientes: se usa forma reciente (confianza baja)")
+
+    # Descanso
+    try:
+        dh = _dias_descanso(home_id, ts) if ts else None
+        da = _dias_descanso(away_id, ts) if ts else None
+        if dh is not None and dh < 3:
+            lh *= 0.95; la *= 1.03
+            motivos.append(f"Local con {dh} días de descanso")
+        if da is not None and da < 3:
+            la *= 0.95; lh *= 1.03
+            motivos.append(f"Visitante con {da} días de descanso")
+    except Exception:
+        pass
+
+    # Motivacion (solo ligas, fin de temporada)
+    if fuente == "liga":
+        try:
+            if _contexto_tabla(lg["id"], lg["season"], home_id) == "sin_objetivos":
+                lh *= 0.95
+                motivos.append("Local sin objetivos en la tabla")
+            if _contexto_tabla(lg["id"], lg["season"], away_id) == "sin_objetivos":
+                la *= 0.95
+                motivos.append("Visitante sin objetivos en la tabla")
+        except Exception:
+            pass
+
+    return {"lh": round(lh, 3), "la": round(la, 3), "fuente": fuente,
+            "confianza": confianza, "motivos": motivos}
+
+
+# ── Cuotas del partido (todas las casas) ────────────────────────────
+_MAPA_MERCADOS = {
+    "match winner": "1x2", "double chance": "doble", "home/away": "dnb",
+    "goals over/under": "goles", "both teams score": "btts",
+    "corners over under": "corners", "corners over/under": "corners",
+    "cards over/under": "tarjetas",
+}
+
+
+def _clave_valor(mercado, valor):
+    v = str(valor or "").lower().strip()
+    if mercado == "1x2":
+        return {"home": "1", "draw": "x", "away": "2"}.get(v)
+    if mercado == "doble":
+        return {"home/draw": "1x", "draw/away": "x2", "home/away": "12"}.get(v)
+    if mercado == "dnb":
+        return {"home": "dnb1", "away": "dnb2"}.get(v)
+    if mercado == "btts":
+        return {"yes": "btts_si", "no": "btts_no"}.get(v)
+    if mercado in ("goles", "corners", "tarjetas"):
+        mm = _re_cuotas.match(r"^(over|under)\s*(\d+(?:\.\d+)?)$", v)
+        if mm:
+            return f"{mm.group(1)}_{float(mm.group(2))}"
+    return None
+
+
+def cuotas_partido(fixture_id):
+    """
+    {mercado: {clave: {casa: cuota}}}  p.ej. cuotas["goles"]["over_2.5"]["Pinnacle"] = 1.85
+    """
+    data = api_get(f"/odds?fixture={fixture_id}", use_cache=True, ttl=600)
+    out = {}
+    for item in data or []:
+        for book in item.get("bookmakers", []):
+            casa = book.get("name", "")
+            for bet in book.get("bets", []):
+                mercado = _MAPA_MERCADOS.get(str(bet.get("name", "")).lower().strip())
+                if not mercado:
+                    continue
+                for val in bet.get("values", []):
+                    clave = _clave_valor(mercado, val.get("value"))
+                    if not clave:
+                        continue
+                    try:
+                        odd = float(val.get("odd"))
+                    except (TypeError, ValueError):
+                        continue
+                    if CUOTA_MIN_VALIDA <= odd <= CUOTA_MAX_VALIDA:
+                        out.setdefault(mercado, {}).setdefault(clave, {})[casa] = odd
+    return out
+
+
+def _es_pinnacle(casa):
+    return "pinnacle" in str(casa).lower()
+
+
+def cuota_para_apostar(por_casa):
+    """Cuota de TU casa si existe; si no Pinnacle; si no, mediana de casas."""
+    if not por_casa:
+        return None, None
+    for pref in CASAS_PREFERIDAS:
+        for casa, odd in por_casa.items():
+            if pref.lower() in casa.lower():
+                return odd, casa
+    for casa, odd in por_casa.items():
+        if _es_pinnacle(casa):
+            return odd, casa
+    vals = sorted(por_casa.values())
+    if len(vals) == 1:
+        return vals[0], next(iter(por_casa))
+    return round(_stats_cuotas.median(vals), 2), f"Mediana {len(vals)} casas"
+
+
+def _cuota_referencia(por_casa):
+    """Cuota para estimar la probabilidad del mercado: Pinnacle o mediana."""
+    if not por_casa:
+        return None
+    for casa, odd in por_casa.items():
+        if _es_pinnacle(casa):
+            return odd
+    return _stats_cuotas.median(por_casa.values())
+
+
+def probabilidad_mercado(cuotas, mercado, clave):
+    """Probabilidad sin margen (devig proporcional) del mercado."""
+    grupo = cuotas.get(mercado, {})
+    if clave not in grupo:
+        # Doble oportunidad desde 1X2 si falta
+        if mercado == "doble" and "1x2" in cuotas:
+            p = {k: probabilidad_mercado(cuotas, "1x2", k) for k in ("1", "x", "2")}
+            if all(v is not None for v in p.values()):
+                return {"1x": p["1"] + p["x"], "x2": p["x"] + p["2"], "12": p["1"] + p["2"]}.get(clave)
+        return None
+    if mercado == "1x2":
+        claves = ["1", "x", "2"]
+    elif mercado == "doble":
+        p = {k: probabilidad_mercado(cuotas, "1x2", k) for k in ("1", "x", "2")}
+        if all(v is not None for v in p.values()):
+            return {"1x": p["1"] + p["x"], "x2": p["x"] + p["2"], "12": p["1"] + p["2"]}.get(clave)
+        ref = _cuota_referencia(grupo[clave])
+        return 1 / ref if ref else None
+    elif mercado == "dnb":
+        claves = ["dnb1", "dnb2"]
+    elif mercado == "btts":
+        claves = ["btts_si", "btts_no"]
+    else:
+        lado, linea = clave.split("_")
+        claves = [f"over_{linea}", f"under_{linea}"]
+    refs = {k: _cuota_referencia(grupo.get(k, {})) for k in claves}
+    if any(not v for v in refs.values()):
+        ref = _cuota_referencia(grupo[clave])
+        return (1 / ref) * 0.96 if ref else None   # sin pareja: quitar ~4% de margen
+    inv = {k: 1 / v for k, v in refs.items()}
+    s = sum(inv.values())
+    return inv[clave] / s if s else None
+
+
+# ── Calibracion automatica con tus resultados ───────────────────────
+_CACHE_CALIB = {"ts": 0, "factores": {}}
+
+
+def factores_calibracion():
+    """Por mercado: aciertos reales / prob. predicha (con >=100 picks cerrados del modelo v4)."""
+    import time as _t
+    if _t.time() - _CACHE_CALIB["ts"] < 3600:
+        return _CACHE_CALIB["factores"]
+    grupos = {}
+    for p in leer_json(PICKS_FILE):
+        if not p.get("modelo_v4") or _es_live(p):
+            continue
+        e = _estado(p)
+        if e not in ("acierto", "fallo"):
+            continue
+        prob = _prob_de_pick(p)
+        if not prob:
+            continue
+        m = clasificar_mercado(p.get("jugada"))
+        g = grupos.setdefault(m, [0, 0.0, 0])
+        g[0] += 1 if e == "acierto" else 0
+        g[1] += prob / 100
+        g[2] += 1
+    factores = {}
+    for m, (ac, pred, n) in grupos.items():
+        if n >= 100 and pred > 0:
+            factores[m] = max(0.85, min(1.05, ac / pred))
+    _CACHE_CALIB.update({"ts": _t.time(), "factores": factores})
+    return factores
+
+
+# ── Recomendaciones prematch ────────────────────────────────────────
+def _score_desde(prob, edge, con_cuota=True, confianza="alta"):
+    s = 4 + (prob - 0.5) * 12 + (edge or 0) * 15
+    if not con_cuota:
+        s -= 1.5
+    if confianza == "baja":
+        s -= 0.7
+    return round(max(0.0, min(10.0, s)), 1)
+
+
+def _texto_jugada(mercado, clave, home, away):
+    if mercado == "1x2":
+        return {"1": f"Gana {home}", "x": "Empate", "2": f"Gana {away}"}[clave]
+    if mercado == "doble":
+        return {"1x": f"1X ({home} o empate)", "x2": f"X2 ({away} o empate)",
+                "12": f"12 ({home} o {away})"}[clave]
+    if mercado == "dnb":
+        return {"dnb1": f"Empate no apuesta: {home}", "dnb2": f"Empate no apuesta: {away}"}[clave]
+    if mercado == "btts":
+        return "Ambos marcan - Sí" if clave == "btts_si" else "Ambos marcan - No"
+    lado, linea = clave.split("_")
+    if mercado == "goles":
+        return f"{lado.capitalize()} {linea} goles"
+    if mercado == "corners":
+        return f"Corners {lado.capitalize()} {linea}"
+    if mercado == "tarjetas":
+        return f"Tarjetas {lado.capitalize()} {linea}"
+    return clave
+
+
+NOMBRE_MERCADO_V4 = {"1x2": "Resultado final", "doble": "Doble oportunidad",
+                     "dnb": "Empate no apuesta", "btts": "Ambos marcan",
+                     "goles": "Goles", "corners": "Corners", "tarjetas": "Tarjetas"}
+
+
+def _evaluar_opcion(mercado, clave, p_modelo, cuotas, home, away, confianza, motivo_base, calib):
+    """Construye una recomendacion con valor/mercado/score."""
+    nombre = NOMBRE_MERCADO_V4[mercado]
+    factor = calib.get(clasificar_mercado(_texto_jugada(mercado, clave, home, away)), 1.0)
+    p_modelo = max(0.01, min(0.99, p_modelo * factor))
+    por_casa = cuotas.get(mercado, {}).get(clave, {})
+    cuota, casa = cuota_para_apostar(por_casa)
+    p_mkt = probabilidad_mercado(cuotas, mercado, clave) if cuotas else None
+
+    if p_mkt is not None:
+        p_final = PESO_MODELO * p_modelo + (1 - PESO_MODELO) * p_mkt
+    else:
+        p_final = p_modelo
+    edge = (p_final * cuota - 1) if cuota else None
+    justa = round(1 / p_final, 2) if p_final > 0 else None
+    minima = round((1 + EDGE_MIN) / p_final, 2) if p_final > 0 else None
+
+    motivos_no = []
+    if p_mkt is not None and abs(p_modelo - p_mkt) > MAX_DISCREPANCIA:
+        motivos_no.append(f"modelo ({p_modelo*100:.0f}%) y mercado ({p_mkt*100:.0f}%) no coinciden")
+    if not cuota:
+        motivos_no.append("sin cuota de mercado")
+    else:
+        if edge < EDGE_MIN:
+            motivos_no.append(f"sin valor (la casa paga {cuota}, se necesita {minima})")
+        elif edge > EDGE_MAX:
+            motivos_no.append("valor demasiado alto: probable error del modelo")
+        if not (CUOTA_MIN_RECOMENDAR <= cuota <= CUOTA_MAX_RECOMENDAR):
+            motivos_no.append(f"cuota {cuota} fuera de rango")
+    if p_final < PROB_MIN_PREMATCH:
+        motivos_no.append(f"probabilidad {p_final*100:.0f}% baja")
+
+    recomendado = not motivos_no
+    score = _score_desde(p_final, edge if recomendado else 0, bool(cuota), confianza)
+    if not recomendado:
+        score = min(score, 6.0)
+    prob_pct = round(p_final * 100, 1)
+    return {
+        "mercado": nombre,
+        "mercado_v4": mercado,
+        "clave_v4": clave,
+        "jugada": _texto_jugada(mercado, clave, home, away),
+        "prob": prob_pct,
+        "prob_modelo": round(p_modelo * 100, 1),
+        "prob_mercado": round(p_mkt * 100, 1) if p_mkt is not None else None,
+        "score": score,
+        "riesgo": round(min(10, (1 - p_final) * 10 + (0 if cuota else 1)), 1),
+        "confianza": etiqueta_confianza(score),
+        "motivo": motivo_base + (f" | No recomendado: {'; '.join(motivos_no)}" if motivos_no else ""),
+        "cuota_justa": justa,
+        "cuota_minima": minima,
+        "cuota_api": cuota,
+        "bookmaker": casa or "",
+        "edge": round(edge * 100, 1) if edge is not None else None,
+        "recomendado": recomendado,
+        "motivos_no": motivos_no,
+        "modelo_v4": True,
+    }
+
+
+def _stats_conteos_equipo(team_id, last=10):
+    """Corners y tarjetas a favor/en contra (ignora partidos sin datos)."""
+    partidos = api_get(f"/fixtures?team={team_id}&last={last}", use_cache=True, ttl=21600)
+    c_for, c_ag, t_for, t_ag, n_c, n_t = 0.0, 0.0, 0.0, 0.0, 0, 0
+    for p in partidos or []:
+        st = api_get(f"/fixtures/statistics?fixture={p['fixture']['id']}", use_cache=True, ttl=86400)
+        if not st or len(st) < 2:
+            continue
+        mio, rival = {}, {}
+        for td in st:
+            dest = mio if td["team"]["id"] == team_id else rival
+            for it in td.get("statistics", []):
+                dest[it.get("type")] = it.get("value")
+        def _v(d, k):
+            v = d.get(k)
+            try:
+                return float(str(v).replace("%", "")) if v is not None else None
+            except ValueError:
+                return None
+        cm, cr = _v(mio, "Corner Kicks"), _v(rival, "Corner Kicks")
+        if cm is not None and cr is not None:
+            c_for += cm; c_ag += cr; n_c += 1
+        tm = (_v(mio, "Yellow Cards") or 0) + 2 * (_v(mio, "Red Cards") or 0)
+        tr = (_v(rival, "Yellow Cards") or 0) + 2 * (_v(rival, "Red Cards") or 0)
+        if _v(mio, "Yellow Cards") is not None or _v(rival, "Yellow Cards") is not None:
+            t_for += tm; t_ag += tr; n_t += 1
+    return {"c_for": c_for, "c_ag": c_ag, "n_c": n_c, "t_for": t_for, "t_ag": t_ag, "n_t": n_t}
+
+
+def _esperado_conteo(sh, sa, campo, media):
+    """(local a favor + visitante en contra)/2 + (visitante a favor + local en contra)/2, acercado a la media."""
+    k = 3.0
+    n_h = sh[f"n_{campo}"]; n_a = sa[f"n_{campo}"]
+    if n_h < 4 or n_a < 4:
+        return None
+    h_for = sh[f"{campo}_for"] / n_h; h_ag = sh[f"{campo}_ag"] / n_h
+    a_for = sa[f"{campo}_for"] / n_a; a_ag = sa[f"{campo}_ag"] / n_a
+    bruto = (h_for + a_ag) / 2 + (a_for + h_ag) / 2
+    n = (n_h + n_a) / 2
+    return (bruto * n + media * k) / (n + k)
+
+
+def recomendaciones_modelo(fixture, incluir_conteos=True):
+    """
+    Recomendaciones prematch del modelo v4 para un fixture crudo de la API.
+    Devuelve (recomendaciones, info) con TODAS las opciones evaluadas,
+    ordenadas: primero las recomendadas, por score.
+    """
+    home = fixture["teams"]["home"]["name"]
+    away = fixture["teams"]["away"]["name"]
+    fid = fixture["fixture"]["id"]
+    ge = goles_esperados(fixture)
+    if not ge:
+        return [], None
+    pr = probabilidades_partido(ge["lh"], ge["la"])
+    try:
+        cuotas = cuotas_partido(fid)
+    except Exception:
+        cuotas = {}
+    calib = factores_calibracion()
+    base = (f"Goles esperados {home} {ge['lh']:.2f} - {ge['la']:.2f} {away}. "
+            + "; ".join(ge["motivos"]))
+
+    opciones = [("1x2", "1"), ("1x2", "x"), ("1x2", "2"),
+                ("doble", "1x"), ("doble", "x2"), ("doble", "12"),
+                ("dnb", "dnb1"), ("dnb", "dnb2"),
+                ("btts", "btts_si"), ("btts", "btts_no")]
+    for linea in LINEAS_GOLES:
+        opciones += [("goles", f"over_{linea}"), ("goles", f"under_{linea}")]
+
+    recs = []
+    for mercado, clave in opciones:
+        p = pr.get(clave) if mercado not in ("goles",) else pr.get(clave)
+        if p is None:
+            continue
+        recs.append(_evaluar_opcion(mercado, clave, p, cuotas, home, away,
+                                    ge["confianza"], base, calib))
+
+    # Corners y tarjetas: solo si la casa ofrece el mercado (ahorra llamadas)
+    if incluir_conteos and (cuotas.get("corners") or cuotas.get("tarjetas")):
+        try:
+            sh = _stats_conteos_equipo(fixture["teams"]["home"]["id"])
+            sa = _stats_conteos_equipo(fixture["teams"]["away"]["id"])
+            for mercado, campo, media, disp in (("corners", "c", MEDIA_CORNERS, DISPERSION_CORNERS),
+                                                ("tarjetas", "t", MEDIA_TARJETAS, DISPERSION_TARJETAS)):
+                if not cuotas.get(mercado):
+                    continue
+                esp = _esperado_conteo(sh, sa, campo, media)
+                if esp is None:
+                    continue
+                for clave in cuotas[mercado]:
+                    lado, linea = clave.split("_")
+                    linea = float(linea)
+                    if abs(linea - _m.floor(linea) - 0.5) > 1e-6:
+                        continue   # solo lineas .5 (sin devolucion)
+                    k = int(_m.floor(linea)) + 1
+                    p_over = _negbin_sf(k, esp, disp)
+                    p = p_over if lado == "over" else 1 - p_over
+                    motivo = (f"{NOMBRE_MERCADO_V4[mercado]} esperados: {esp:.1f} "
+                              f"(a favor y en contra de ambos, últimos 10 partidos)")
+                    recs.append(_evaluar_opcion(mercado, clave, p, cuotas, home, away,
+                                                ge["confianza"], motivo, calib))
+        except Exception as e:
+            print("ERROR corners/tarjetas modelo:", e)
+
+    recs.sort(key=lambda r: (r["recomendado"], r["score"], r["prob"]), reverse=True)
+    info = {"ge": ge, "probabilidades": {k: round(v * 100, 1) for k, v in pr.items()
+                                         if k not in ("lh", "la")},
+            "hay_cuotas": bool(cuotas)}
+    return recs, info
+
+
+def favorito_prematch(fixture):
+    """'home', 'away' o None, segun cuotas 1X2 o, si faltan, el modelo."""
+    try:
+        c = cuotas_partido(fixture["fixture"]["id"])
+        p1 = probabilidad_mercado(c, "1x2", "1")
+        p2 = probabilidad_mercado(c, "1x2", "2")
+        if p1 is not None and p2 is not None:
+            if abs(p1 - p2) < 0.10:
+                return None
+            return "home" if p1 > p2 else "away"
+    except Exception:
+        pass
+    try:
+        ge = goles_esperados(fixture)
+        if ge:
+            pr = probabilidades_partido(ge["lh"], ge["la"])
+            if abs(pr["1"] - pr["2"]) < 0.10:
+                return None
+            return "home" if pr["1"] > pr["2"] else "away"
+    except Exception:
+        pass
+    return None
+
+
+def texto_cuotas(r):
+    """Tres cifras separadas + veredicto de valor."""
+    cuota = r.get("cuota_api")
+    casa = r.get("bookmaker") or ""
+    justa = r.get("cuota_justa") or (round(100 / r["prob"], 2) if r.get("prob") else None)
+    minima = r.get("cuota_minima")
+    lineas = []
+    if cuota:
+        lineas.append(f"💰 Cuota mercado: {cuota} ({casa})")
+    else:
+        lineas.append("💰 Cuota mercado: no disponible")
+    lineas.append(f"⚖️ Justa del modelo: {justa or 'N/D'} | Mínima para apostar: {minima or 'N/D'}")
+    if r.get("modelo_v4"):
+        if r.get("recomendado"):
+            lineas.append(f"✅ Con valor (+{r.get('edge')}%)")
+        else:
+            lineas.append("❌ " + "; ".join(r.get("motivos_no") or ["sin valor"]).capitalize())
+    elif cuota and minima:
+        lineas.append("✅ Con valor" if cuota >= minima else "❌ Sin valor, no apostar")
+    else:
+        lineas.append(f"⚠️ Apuesta solo si tu casa paga {minima or justa or 'más'} o más")
+    return "\n".join(lineas)
+
+
 def calcular_stats_mercados(team_id, last=5):
     partidos = api_get(f"/fixtures?team={team_id}&last={last}")
     
@@ -1656,43 +2399,19 @@ def preparar_analisis(fixture_id, incluir_odds=False, incluir_contexto=False):
     home_general = calcular_forma(home_id)
     away_general = calcular_forma(away_id)
 
-    if incluir_contexto or incluir_odds:
+    if incluir_contexto:
         home_home = calcular_forma(home_id, "home")
         away_away = calcular_forma(away_id, "away")
     else:
         home_home = None
         away_away = None
 
-    recomendaciones = obtener_recomendaciones(
-        home_general,
-        away_general,
-        home_home,
-        away_away
-    )
-
-    recomendaciones = agregar_doble_oportunidad(
-    recomendaciones,
-    home,
-    away,
-    home_general,
-    away_general,
-    home_home,
-    away_away
-    )
-
-    recomendaciones = agregar_mercados_extra_prematch(
-    recomendaciones,
-    home_id,
-    away_id,
-    home_general,
-    away_general
-    )
-
-    if incluir_odds:
-        recomendaciones = enriquecer_con_odds(
-            fixture_id,
-            recomendaciones
-        )
+    # Modelo v4: probabilidades calculadas + cuota real + valor
+    try:
+        recomendaciones, info_modelo = recomendaciones_modelo(fixture)
+    except Exception as e:
+        print("ERROR modelo v4:", e)
+        recomendaciones, info_modelo = [], None
 
     return {
         "fixture_id": str(fixture_id),
@@ -1709,7 +2428,8 @@ def preparar_analisis(fixture_id, incluir_odds=False, incluir_contexto=False):
         "away_general": away_general,
         "home_home": home_home,
         "away_away": away_away,
-        "recomendaciones": recomendaciones
+        "recomendaciones": recomendaciones,
+        "info_modelo": info_modelo,
     }
 
 
@@ -1733,6 +2453,10 @@ def guardar_pick_automatico(data: dict, tipo="prematch"):
         top = rec[0] if isinstance(rec, list) and len(rec) > 0 else rec
         if not top:
             return
+
+    # Modelo v4: no se guardan picks sin valor (no cuentan como recomendacion)
+    if top.get("modelo_v4") and not top.get("recomendado"):
+        return
 
     picks = leer_json(PICKS_FILE)
 
@@ -1793,6 +2517,12 @@ def guardar_pick_automatico(data: dict, tipo="prematch"):
         "cuota_pinnacle": cuota_pinnacle if cuota_pinnacle > 1.0 else None,
         "cuota_cierre": None,
         "bookmaker": top.get("bookmaker", "") if cuota_pinnacle > 1.0 else "",
+        "modelo_v4": bool(top.get("modelo_v4")),
+        "mercado_v4": top.get("mercado_v4"),
+        "clave_v4": top.get("clave_v4"),
+        "prob_modelo": top.get("prob_modelo"),
+        "prob_mercado": top.get("prob_mercado"),
+        "edge": top.get("edge"),
         "edge": edge_val,
         "edge_categoria": categoria_edge,
         "valor_esperado": ve_val,
@@ -1845,8 +2575,10 @@ def guardar_pick_live_automatico(fixture_id, home, away, country, league, hora, 
         "riesgo": sugerencia["riesgo"],
         "cuota_minima": _cuota_live,
         "cuota_sugerida": _cuota_live,
-        "cuota": round(100.0 / float(sugerencia["prob"]), 2) if sugerencia.get("prob") else _cuota_live,
-        "cuota_fuente": "estimada",
+        "cuota": sugerencia.get("cuota_api") or (round(100.0 / float(sugerencia["prob"]), 2) if sugerencia.get("prob") else _cuota_live),
+        "cuota_real": sugerencia.get("cuota_api"),
+        "cuota_fuente": "real" if sugerencia.get("cuota_api") else "estimada",
+        "bookmaker": sugerencia.get("bookmaker", ""),
         "estado": "pendiente",
         "resultado_real": None,
         "tipo": "live",
@@ -1910,6 +2642,16 @@ def actualizar_resultados_automaticos():
             hora_correcta = hora_peru(fecha_api)
             if p.get("hora","") != hora_correcta:
                 p["hora"] = hora_correcta
+
+        # Partido cancelado/abandonado, o postergado hace mas de 3 dias -> anulado
+        if status in ("CANC", "ABD", "AWD", "WO") or (
+                status == "PST" and _fecha_de(p) and
+                _fecha_de(p) < (fecha_peru_obj() - timedelta(days=3)).strftime("%Y-%m-%d")):
+            p["estado"] = "anulado"
+            p["resultado"] = "anulado"
+            p["motivo_manual"] = f"Partido {status}"
+            cambios += 1
+            continue
 
         if status not in ["FT", "AET", "PEN"]:
             continue
@@ -2006,6 +2748,25 @@ def actualizar_resultados_automaticos():
 
         else:
             total_eval = total
+
+        # ── Picks del modelo v4 (resultado, empate no apuesta, lineas) ──
+        if p.get("clave_v4"):
+            res_v4 = evaluar_clave_v4(p.get("mercado_v4"), p.get("clave_v4"),
+                                      gh, ga, corners_total, tarjetas_total)
+            if res_v4 == "sin_datos":
+                if p.get("estado") != "pendiente_manual":
+                    p["estado"] = "pendiente_manual"
+                    p["motivo_manual"] = "Sin estadísticas para evaluar"
+                    cambios += 1
+                continue
+            if res_v4 == "anulado":
+                p["estado"] = "anulado"
+                p["resultado"] = "anulado"
+                p["resultado_real"] = f"{gh}-{ga}"
+                cambios += 1
+                continue
+            acierto = res_v4
+            jugada_lower = ""
 
         # ── Goles ────────────────────────────────────────────────────────
         if "under" in jugada_lower and "gol" in jugada_lower:
@@ -2111,6 +2872,29 @@ def actualizar_resultados_automaticos():
     return picks, cambios
 
 
+def evaluar_clave_v4(mercado, clave, gh, ga, corners=None, tarjetas=None):
+    """True/False, 'anulado' (empate no apuesta con empate) o 'sin_datos'."""
+    if mercado == "1x2":
+        return {"1": gh > ga, "x": gh == ga, "2": ga > gh}.get(clave)
+    if mercado == "doble":
+        return {"1x": gh >= ga, "x2": ga >= gh, "12": gh != ga}.get(clave)
+    if mercado == "dnb":
+        if gh == ga:
+            return "anulado"
+        return gh > ga if clave == "dnb1" else ga > gh
+    if mercado == "btts":
+        si = gh > 0 and ga > 0
+        return si if clave == "btts_si" else not si
+    if mercado in ("goles", "corners", "tarjetas"):
+        total = {"goles": gh + ga, "corners": corners, "tarjetas": tarjetas}[mercado]
+        if total is None:
+            return "sin_datos"
+        lado, linea = clave.split("_")
+        linea = float(linea)
+        return total > linea if lado == "over" else total < linea
+    return None
+
+
 def resumen_historial():
     picks, cambios = actualizar_resultados_automaticos()
 
@@ -2195,7 +2979,7 @@ def texto_resumen(data):
 
     texto = (
         f"⚽ {data['home']} vs {data['away']}\n"
-        f"🏆 {data['country']} - {data['league']}\n"
+        f"🏆 {data['league']}\n"
         f"🕒 {data['hora']} Hora Perú\n\n"
     )
 
@@ -2204,13 +2988,20 @@ def texto_resumen(data):
 
     top = recs[0]
 
+    if top.get("modelo_v4") and not top.get("recomendado"):
+        texto += "❌ Ningún mercado tiene valor en este partido. Recomendación: NO apostar.\n\nLo más cercano:\n"
+        for r in recs[:2]:
+            texto += f"• {r['jugada']} — {r['prob']}%\n{texto_cuotas(r)}\n"
+        return texto[:3900]
+
     texto += (
         f"🎯 Mercado: {top['mercado']}\n"
         f"✅ Jugada: {top['jugada']}\n\n"
+        f"📊 Probabilidad: {top.get('prob')}%\n"
         f"⭐ Score: {top['score']}/10\n"
         f"⚠️ Riesgo: {top['riesgo']}/10\n"
         f"{top['confianza']}\n\n"
-        f"💰 Entrar solo si cuota ≥ {top['cuota_minima']}\n\n"
+        f"{texto_cuotas(top)}\n\n"
         f"🧠 Resumen:\n{top['motivo']}\n\n"
         f"💾 Guardado automáticamente para seguimiento."
     )
@@ -2221,7 +3012,7 @@ def texto_resumen(data):
 def texto_detalle(data):
     texto = (
         f"⚽ {data['home']} vs {data['away']}\n"
-        f"🏆 {data['country']} - {data['league']}\n"
+        f"🏆 {data['league']}\n"
         f"🕒 {data['hora']} Hora Perú\n\n"
         f"{bloque_stats(f'📊 General - {data['home']}', data['home_general'])}\n"
         f"{bloque_stats(f'📊 General - {data['away']}', data['away_general'])}\n"
@@ -2229,10 +3020,26 @@ def texto_detalle(data):
         f"{bloque_stats(f'🛫 Fuera - {data['away']}', data['away_away'])}\n"
     )
 
+    info = data.get("info_modelo") or {}
+    if info.get("probabilidades"):
+        pr = info["probabilidades"]
+        ge = info.get("ge") or {}
+        texto += (
+            f"\n🧮 Modelo: goles esperados {ge.get('lh', 0):.2f} - {ge.get('la', 0):.2f}"
+            f" (confianza {ge.get('confianza', '?')})\n"
+            f"1: {pr.get('1')}% | X: {pr.get('x')}% | 2: {pr.get('2')}%\n"
+            f"Over 1.5: {pr.get('over_1.5')}% | Over 2.5: {pr.get('over_2.5')}% | "
+            f"Under 3.5: {pr.get('under_3.5')}% | Ambos marcan: {pr.get('btts_si')}%\n"
+        )
+        if not info.get("hay_cuotas"):
+            texto += "ℹ️ La API no trae cuotas de este partido: no se puede medir el valor.\n"
+
     if not data["recomendaciones"]:
         texto += "\n⚠️ No hay jugada clara.\n"
     else:
-        texto += "\n✅ Mercados detectados:\n"
+        n_rec = sum(1 for r in data["recomendaciones"] if r.get("recomendado", True))
+        texto += ("\n✅ Mercados con valor:\n" if n_rec else
+                  "\n❌ Ningún mercado tiene valor. Lo más cercano:\n")
 
         for r in data["recomendaciones"][:4]:
             texto += (
@@ -2240,19 +3047,11 @@ def texto_detalle(data):
                 f"✅ Jugada: {r['jugada']}\n"
                 f"⭐ Score: {r['score']}/10\n"
                 f"⚠️ Riesgo: {r['riesgo']}/10\n"
-                f"💰 Cuota justa: {r['cuota_justa']}\n"
-                f"💰 Cuota Pinnacle: {r.get('cuota_api') or r.get('cuota_minima','N/D')}\n"
-                f"📈 Edge: {r.get('edge','N/D')}% ({r.get('edge_categoria','?')})\n"
+                f"{texto_cuotas(r)}\n"
             )
 
-            if r.get("cuota_api"):
-                texto += (
-                    f"🏦 Cuota API: {r['cuota_api']} ({r['bookmaker']})\n"
-                    f"📈 Edge: {r['edge']}%\n"
-                )
-
-                if r.get("movimiento"):
-                    texto += f"📉 Movimiento cuota: {r['movimiento']}\n"
+            if r.get("prob_mercado") is not None:
+                texto += f"📊 Prob. modelo {r.get('prob_modelo')}% | mercado {r.get('prob_mercado')}% | final {r.get('prob')}%\n"
 
             texto += f"🧠 Motivo: {r['motivo']}\n"
 
@@ -2453,11 +3252,19 @@ def extraer_stats_live(stats_response):
             "possession": 0,
             "yellow_cards": 0,
             "red_cards": 0,
+            "xg": None,
         }
 
         for item in team_data.get("statistics", []):
             tipo = item.get("type")
             valor = item.get("value") or 0
+
+            if tipo == "expected_goals":
+                try:
+                    stats[name]["xg"] = float(item.get("value"))
+                except (TypeError, ValueError):
+                    stats[name]["xg"] = None
+                continue
 
             if isinstance(valor, str) and "%" in valor:
                 try:
@@ -2876,308 +3683,331 @@ def sugerir_live_ht(
 
     return sugerencias
 
-def analizar_live_fixture(fixture_id):
-    fixture = api_get(f"/fixtures?id={fixture_id}", use_cache=False)
+# ═════════════════════════════════════════════════════════════════
+#  LIVE v4: probabilidades por minutos restantes
+#  - Ritmo base: goles esperados prematch del partido (modelo v4)
+#  - Ajuste por lo que pasa en el partido: xG REAL de la API (si falta,
+#    tiros), marcador y expulsiones. Ajuste acotado (0.75x a 1.35x).
+#  - Cuotas live reales (/odds/live). Sin cuota: se muestra la cuota
+#    minima para que la compares tu en la casa.
+#  - Limites de minuto: nada de Over 1.5 a 0-0 despues del 40',
+#    ambos marcan despues del 55', gol restante despues del 75',
+#    corners despues del 70' (salvo que falte 1). Sin corners HT.
+# ═════════════════════════════════════════════════════════════════
+PROB_MIN_LIVE = 0.70
+MEDIA_GOLES_LIGA = (1.45, 1.15)
+MIN_TOPE_OVER15_00 = 40
+MIN_TOPE_BTTS = 55
+MIN_TOPE_GOL_RESTANTE = 75
+MIN_TOPE_CORNERS = 70
+MIN_TOPE_TARJETAS = 60
 
-    if not fixture:
-        return None
 
-    m = fixture[0]
+def _minutos_restantes(elapsed, status):
+    """Minutos de juego que faltan, con descuento estimado."""
+    e = elapsed or 0
+    if status == "HT":
+        return 45 + 4
+    if status == "1H" or e <= 45:
+        return max(0, 45 - e) + 2 + 45 + 4
+    return max(0, 90 - e) + 4
 
-    home = m["teams"]["home"]["name"]
-    away = m["teams"]["away"]["name"]
 
-    country = m["league"]["country"]
-    league = m["league"]["name"]
-    hora = hora_peru(m["fixture"]["date"])
+def _minutos_restantes_ht(elapsed, status):
+    if status != "1H" or (elapsed or 0) >= 45:
+        return 0
+    return max(0, 45 - (elapsed or 0)) + 2
 
+
+def cuotas_live(fixture_id):
+    """{'goles': {'over_2.5': 1.9}, 'btts': {...}, 'corners': {...}} desde /odds/live."""
+    data = api_get(f"/odds/live?fixture={fixture_id}", use_cache=True, ttl=30)
+    out = {}
+    for item in data or []:
+        for bet in item.get("odds", []):
+            nombre = str(bet.get("name", "")).lower()
+            if any(x in nombre for x in ("half", "1st", "2nd", "team", "asian", "handicap", "exact")):
+                continue
+            if "corner" in nombre and ("total" in nombre or "over/under" in nombre):
+                mercado = "corners"
+            elif "card" in nombre and ("total" in nombre or "over/under" in nombre):
+                mercado = "tarjetas"
+            elif "both teams" in nombre:
+                mercado = "btts"
+            elif "over/under" in nombre or "match goals" in nombre or "total goals" in nombre:
+                mercado = "goles"
+            else:
+                continue
+            for v in bet.get("values", []):
+                if v.get("suspended"):
+                    continue
+                try:
+                    odd = float(v.get("odd"))
+                except (TypeError, ValueError):
+                    continue
+                if not (CUOTA_MIN_VALIDA <= odd <= CUOTA_MAX_VALIDA):
+                    continue
+                val = str(v.get("value", "")).lower().strip()
+                if mercado == "btts":
+                    clave = {"yes": "btts_si", "no": "btts_no"}.get(val)
+                else:
+                    linea = v.get("handicap")
+                    mm = _re_cuotas.match(r"^(over|under)\s*(\d+(?:\.\d+)?)?$", val)
+                    if not mm:
+                        continue
+                    linea = mm.group(2) or linea
+                    try:
+                        clave = f"{mm.group(1)}_{float(linea)}"
+                    except (TypeError, ValueError):
+                        clave = None
+                if clave:
+                    out.setdefault(mercado, {})[clave] = odd
+    return out
+
+
+def _factor_intensidad(obs, esperado):
+    """Compara lo producido con lo esperado; acotado y con prudencia."""
+    if esperado <= 0:
+        return 1.0
+    f = (obs + esperado) / (2 * esperado)   # mitad observado, mitad esperado
+    return max(0.75, min(1.35, f))
+
+
+def sugerencias_live_v4(m, hs, aas):
+    """
+    m: fixture crudo en vivo; hs/aas: estadisticas live de local/visita.
+    Devuelve (sugerencias, info).
+    """
+    status = m["fixture"]["status"]["short"]
+    elapsed = m["fixture"]["status"].get("elapsed") or 0
     gh = m["goals"]["home"] or 0
     ga = m["goals"]["away"] or 0
+    fid = m["fixture"]["id"]
 
+    # Ritmo base del partido
+    try:
+        ge = goles_esperados(m)
+    except Exception:
+        ge = None
+    lh90, la90 = (ge["lh"], ge["la"]) if ge else MEDIA_GOLES_LIGA
+    jugado = min(elapsed, 90)
+    esp_h = lh90 * jugado / 93
+    esp_a = la90 * jugado / 93
+
+    # xG real (si no hay, aproximado por tiros)
+    xh = hs.get("xg")
+    xa = aas.get("xg")
+    fuente_xg = "xG real"
+    if xh is None or xa is None:
+        xh = calcular_xg_aproximado(hs.get("shots_total", 0), hs.get("shots_on_goal", 0))
+        xa = calcular_xg_aproximado(aas.get("shots_total", 0), aas.get("shots_on_goal", 0))
+        fuente_xg = "xG aproximado por tiros"
+    f_h = _factor_intensidad(xh, esp_h) if jugado >= 15 else 1.0
+    f_a = _factor_intensidad(xa, esp_a) if jugado >= 15 else 1.0
+
+    # Marcador y expulsiones
+    if elapsed >= 60:
+        if gh < ga:
+            f_h *= 1.10; f_a *= 0.95
+        elif ga < gh:
+            f_a *= 1.10; f_h *= 0.95
+    rh, ra = hs.get("red_cards", 0) or 0, aas.get("red_cards", 0) or 0
+    if rh > ra:
+        f_h *= 0.75; f_a *= 1.15
+    elif ra > rh:
+        f_a *= 0.75; f_h *= 1.15
+
+    rest = _minutos_restantes(elapsed, status)
+    lam_h = lh90 / 93 * rest * f_h
+    lam_a = la90 / 93 * rest * f_a
+    lam = lam_h + lam_a
+    goles = gh + ga
+
+    try:
+        cl = cuotas_live(fid)
+    except Exception:
+        cl = {}
+
+    sug = []
+
+    def agregar(mercado, jugada, p, clave_cuota, motivo, extra=None):
+        # Lineas triviales (cuota justa < 1.20) o muy improbables no sirven
+        if p > 1 / CUOTA_MIN_RECOMENDAR + 0.02 or p < 0.50:
+            return
+        cuota = (cl.get(clave_cuota[0], {}) or {}).get(clave_cuota[1]) if clave_cuota else None
+        edge = (p * cuota - 1) if cuota else None
+        minima = round((1 + EDGE_MIN) / p, 2)
+        recomendado = (PROB_MIN_LIVE <= p <= 1 / CUOTA_MIN_RECOMENDAR
+                       and (edge is None or edge >= EDGE_MIN))
+        if cuota and edge is not None and edge > EDGE_MAX:
+            recomendado = False
+        score = _score_desde(p, edge if (edge and edge > 0) else 0, bool(cuota))
+        if cuota is None:
+            score = max(0.0, score + 0.5)   # en live la cuota se revisa en la casa
+        if not recomendado:
+            score = min(score, 6.0)
+        d = {
+            "mercado": mercado, "jugada": jugada, "prob": round(p * 100, 1),
+            "score": score, "riesgo": round((1 - p) * 10, 1),
+            "cuota": cuota or round(1 / p, 2),
+            "cuota_api": cuota, "bookmaker": "Live API" if cuota else "",
+            "cuota_justa": round(1 / p, 2), "cuota_minima": minima,
+            "edge": round(edge * 100, 1) if edge is not None else None,
+            "recomendado": recomendado, "motivo": motivo, "live_v4": True,
+        }
+        if extra:
+            d.update(extra)
+        sug.append(d)
+
+    base_txt = (f"Faltan ~{rest} min | goles esperados restantes {lam:.2f} "
+                f"({fuente_xg}: {xh:.2f}-{xa:.2f})")
+
+    # Gol restante (sobre el marcador actual)
+    if elapsed <= MIN_TOPE_GOL_RESTANTE and status in ("1H", "2H", "HT"):
+        p = 1 - _m.exp(-lam)
+        linea = goles + 0.5
+        agregar("Goles restantes", "Over 0.5 gol restante", p, ("goles", f"over_{linea}"),
+                base_txt)
+
+    # Over 1.5 total desde 0-0
+    if goles == 0 and elapsed <= MIN_TOPE_OVER15_00:
+        p = _poisson_sf(2, lam)
+        agregar("Goles totales live", "Over 1.5 goles live", p, ("goles", "over_1.5"), base_txt)
+
+    # Under (partido apagado): la linea mas baja con probabilidad util
+    if elapsed >= 55:
+        for k in (1, 2, 3):
+            linea = goles + k - 0.5
+            p = 1 - _poisson_sf(k, lam)
+            agregar("Goles", f"Under {linea} goles", p, ("goles", f"under_{linea}"), base_txt)
+
+    # Gol antes del descanso
+    rest_ht = _minutos_restantes_ht(elapsed, status)
+    if rest_ht >= 8:
+        lam_ht = (lh90 * f_h + la90 * f_a) / 93 * rest_ht
+        p = 1 - _m.exp(-lam_ht)
+        agregar("Goles HT Live", f"Over {goles}.5 gol HT Live", p, None,
+                f"Faltan ~{rest_ht} min del 1T | {fuente_xg}: {xh:.2f}-{xa:.2f}")
+
+    # Ambos marcan
+    if elapsed <= MIN_TOPE_BTTS and not (gh > 0 and ga > 0):
+        ph = 1.0 if gh > 0 else 1 - _m.exp(-lam_h)
+        pa = 1.0 if ga > 0 else 1 - _m.exp(-lam_a)
+        agregar("Ambos marcan", "Ambos marcan - Sí", ph * pa, ("btts", "btts_si"), base_txt)
+
+    # Corners
+    ch = hs.get("corners", 0) or 0
+    ca = aas.get("corners", 0) or 0
+    ctot = ch + ca
+    ritmo_c = (ctot + MEDIA_CORNERS * 45 / 93) / (max(elapsed, 1) + 45)   # partido + media de la liga
+    lam_c = ritmo_c * rest
+    for faltan in range(1, 9):
+        if elapsed > MIN_TOPE_CORNERS and faltan > 1:
+            continue
+        if elapsed > 80:
+            continue
+        linea = ctot + faltan - 0.5
+        p = _poisson_sf(faltan, lam_c)
+        agregar("Corners", f"Corners Over {linea}", p, ("corners", f"over_{linea}"),
+                f"{ctot} corners al {elapsed}' | esperados restantes {lam_c:.1f}")
+
+    # Tarjetas
+    th = (hs.get("yellow_cards", 0) or 0) + 2 * (hs.get("red_cards", 0) or 0)
+    ta = (aas.get("yellow_cards", 0) or 0) + 2 * (aas.get("red_cards", 0) or 0)
+    ttot = th + ta
+    if elapsed <= MIN_TOPE_TARJETAS:
+        ritmo_t = (ttot + MEDIA_TARJETAS * 45 / 93) / (max(elapsed, 1) + 45)
+        lam_t = ritmo_t * rest * (1.1 if abs(gh - ga) <= 1 else 0.95)
+        for faltan in range(1, 7):
+            linea = ttot + faltan - 0.5
+            p = _poisson_sf(faltan, lam_t)
+            agregar("Tarjetas", f"Tarjetas Over {linea}", p, ("tarjetas", f"over_{linea}"),
+                    f"{ttot} tarjetas al {elapsed}' | esperadas restantes {lam_t:.1f}")
+
+    sug.sort(key=lambda s: (s["recomendado"], s["score"], s["prob"]), reverse=True)
+    info = {"lam": lam, "rest": rest, "xg": (xh, xa), "fuente_xg": fuente_xg,
+            "ge": ge, "hay_cuotas_live": bool(cl)}
+    return sug, info
+
+
+def analizar_live_fixture(fixture_id):
+    fixture = api_get(f"/fixtures?id={fixture_id}", use_cache=False)
+    if not fixture:
+        return None
+    m = fixture[0]
+    home = m["teams"]["home"]["name"]
+    away = m["teams"]["away"]["name"]
+    country = m["league"].get("country", "")
+    league = format_league_name(country, m["league"]["name"])
+    hora = hora_peru(m["fixture"]["date"])
+    gh = m["goals"]["home"] or 0
+    ga = m["goals"]["away"] or 0
     elapsed = m["fixture"]["status"]["elapsed"]
     status = m["fixture"]["status"]["short"]
 
     if status not in ["1H", "2H", "HT", "ET", "LIVE"]:
-        return {
-            "texto": f"⚽ {home} vs {away}\n⚠️ No está en vivo.",
-            "alerta": False,
-            "score_live": 0,
-            "sugerencias": []
-        }
+        return {"texto": f"⚽ {home} vs {away}\n⚠️ No está en vivo.",
+                "alerta": False, "score_live": 0, "sugerencias": []}
+    if liga_excluida(m["league"].get("id"), m["league"].get("name", ""), country):
+        return {"texto": f"⚽ {home} vs {away}\n🚫 Liga excluida.",
+                "alerta": False, "score_live": 0, "sugerencias": []}
 
     stats = extraer_stats_live(
         api_get(f"/fixtures/statistics?fixture={fixture_id}", use_cache=True, ttl=45)
     )
-
     hs = stats.get(home, {})
     aas = stats.get(away, {})
 
-    h_shots = hs.get("shots_total", 0)
-    a_shots = aas.get("shots_total", 0)
-    h_sog = hs.get("shots_on_goal", 0)
-    a_sog = aas.get("shots_on_goal", 0)
-    h_corners = hs.get("corners", 0)
-    a_corners = aas.get("corners", 0)
-    h_da = hs.get("dangerous_attacks", 0)
-    a_da = aas.get("dangerous_attacks", 0)
-    h_poss = hs.get("possession", 0)
-    a_poss = aas.get("possession", 0)
-    h_yellow = hs.get("yellow_cards", 0)
-    a_yellow = aas.get("yellow_cards", 0)
-    h_red = hs.get("red_cards", 0)
-    a_red = aas.get("red_cards", 0)
+    sugerencias, info = sugerencias_live_v4(m, hs, aas)
+    recomendadas = [s for s in sugerencias if s["recomendado"]]
+    score_live = recomendadas[0]["score"] if recomendadas else 0
 
-    total_shots = h_shots + a_shots
-    total_sog = h_sog + a_sog
-    total_corners = h_corners + a_corners
-    total_da = h_da + a_da
-    total_yellow = h_yellow + a_yellow
-    total_red = h_red + a_red
-
-    home_xg = calcular_xg_aproximado(h_shots, h_sog)
-    away_xg = calcular_xg_aproximado(a_shots, a_sog)
-    total_xg = round(home_xg + away_xg, 2)
-
-    fav_side, fav_name = detectar_favorito_por_stats(home, away, hs, aas, gh, ga)
-    fav_estado = estado_favorito(fav_side, gh, ga)
-    fav_presion = presion_favorito_alta(fav_side, hs, aas)
-
-    score_live = 0
-    motivos = []
-
-    if total_shots >= 14:
-        score_live += 2
-        motivos.append("volumen alto de tiros")
-    elif total_shots >= 9:
-        score_live += 1
-        motivos.append("volumen medio de tiros")
-
-    if total_sog >= 5:
-        score_live += 2
-        motivos.append("muchos tiros al arco")
-    elif total_sog >= 3:
-        score_live += 1
-        motivos.append("algunos tiros al arco")
-
-    if total_corners >= 7:
-        score_live += 2
-        motivos.append("ritmo alto de corners")
-    elif total_corners >= 3:
-        score_live += 1
-        motivos.append("corners tempranos o activos")
-
-    if total_da >= 70:
-        score_live += 2
-        motivos.append("ataques peligrosos altos")
-    elif total_da >= 45:
-        score_live += 1
-        motivos.append("ataques peligrosos moderados")
-
-    if total_xg >= 2.2:
-        score_live += 2
-        motivos.append("xG aproximado alto")
-    elif total_xg >= 1.3:
-        score_live += 1
-        motivos.append("xG aproximado moderado")
-
-    if total_yellow >= 5:
-        score_live += 1
-        motivos.append("partido friccionado")
-
-    if total_red >= 1:
-        score_live += 1
-        motivos.append("roja puede abrir el partido")
-
-    if max(h_poss, a_poss) >= 65:
-        score_live += 1
-        motivos.append("dominio fuerte de posesión")
-
-    if elapsed and elapsed >= 60 and abs(gh - ga) <= 1:
-        score_live += 1
-        motivos.append("marcador apretado mantiene intensidad")
-
-    if elapsed and elapsed <= 35 and abs(gh - ga) >= 2:
-        score_live -= 2
-        motivos.append("ventaja amplia puede bajar intensidad")
-
-    score_live = round(clamp(score_live, 0, 10), 1)
-
-    sugerencias = []
-
-    sugerencias.extend(
-        sugerir_live_btts(
-            elapsed,
-            gh,
-            ga,
-            h_shots,
-            a_shots,
-            h_sog,
-            a_sog,
-            h_corners,
-            a_corners,
-            h_da,
-            a_da
-        )
-    )
-
-    sugerencias.extend(
-        sugerir_live_tarjetas(
-            elapsed,
-            total_yellow,
-            total_red,
-            abs(gh - ga) <= 1
-        )
-    )
-
-    sugerencias.extend(
-        sugerir_live_ht(
-            elapsed,
-            gh,
-            ga,
-            total_shots,
-            total_sog,
-            total_corners,
-            h_corners,
-            a_corners,
-            total_da,
-            total_xg,
-            fav_estado,
-            fav_presion
-        )
-    )
-
-    corner_line = linea_corners_recomendada(total_corners, elapsed)
-
-    if corner_line:
-        jugada_corner, cuota_corner = corner_line
-
-        favorito_no_relajado = (
-            fav_estado in ["perdiendo", "empatando"]
-            or (
-                fav_estado == "ganando_1"
-                and fav_presion
-                and score_live >= 5
-            )
-            or fav_estado == "parejo"
-        )
-
-        if favorito_no_relajado and score_live >= 3:
-            sugerencias.append({
-                "mercado": "Corners",
-                "jugada": jugada_corner,
-                "prob": 76,
-                "score": round(max(score_live, 7.0), 1),
-                "riesgo": round(clamp(10 - max(score_live, 7.0), 2, 7), 1),
-                "cuota": cuota_corner,
-                "motivo": (
-                    f"Hay {total_corners} corners al minuto {elapsed}. "
-                    "El favorito no está relajado o aún mantiene presión suficiente."
-                )
-            })
-
-    if sugerencias:
-        sugerencias.sort(key=lambda x: (x["score"], x["prob"]), reverse=True)
-        top_live = sugerencias[0]
-        guardar_pick_live_automatico(
-            fixture_id,
-            home,
-            away,
-            country,
-            league,
-            hora,
-            top_live,
-            minuto=elapsed,
-            goles_local=gh,
-            goles_visita=ga
-        )
+    fav = favorito_prematch(m)
+    fav_txt = {"home": home, "away": away}.get(fav)
 
     texto = (
         f"⚡ LIVE: {home} vs {away}\n"
-        f"🏆 {country} - {league}\n"
-        f"⏱ Minuto: {elapsed}\n"
-        f"⚽ Marcador: {gh}-{ga}\n\n"
-        f"⭐ Score live: {score_live}/10\n"
-        f"⚠️ Riesgo live: {round(clamp(10 - score_live, 1, 10), 1)}/10\n\n"
-        f"📊 Datos clave:\n"
-        f"🎯 Tiros al arco: {total_sog}\n"
-        f"🚩 Corners: {total_corners}\n"
-        f"🔥 Ataques peligrosos: {total_da}\n"
-        f"📈 xG aprox: {total_xg}\n"
-        f"📌 Posesión: {h_poss}% - {a_poss}%\n"
-        f"🟨 Amarillas: {total_yellow} | 🟥 Rojas: {total_red}\n"
+        f"🏆 {league}\n"
+        f"⏱ Minuto: {elapsed} | ⚽ {gh}-{ga}\n\n"
+        f"📊 Datos:\n"
+        f"🎯 Tiros al arco: {hs.get('shots_on_goal',0)}-{aas.get('shots_on_goal',0)} | "
+        f"Tiros: {hs.get('shots_total',0)}-{aas.get('shots_total',0)}\n"
+        f"📈 {info['fuente_xg']}: {info['xg'][0]:.2f}-{info['xg'][1]:.2f}\n"
+        f"🚩 Corners: {hs.get('corners',0)}-{aas.get('corners',0)} | "
+        f"🟨 {hs.get('yellow_cards',0)}-{aas.get('yellow_cards',0)} | "
+        f"🟥 {hs.get('red_cards',0)}-{aas.get('red_cards',0)}\n"
+        f"📌 Posesión: {hs.get('possession',0)}% - {aas.get('possession',0)}%\n"
+        f"⏳ Faltan ~{info['rest']} min | Goles esperados restantes: {info['lam']:.2f}\n"
     )
+    if fav_txt:
+        texto += f"⭐ Favorito prematch: {fav_txt}\n"
+    if not info["hay_cuotas_live"]:
+        texto += "ℹ️ La API no trae cuotas live de este partido: compara la cuota mínima en tu casa.\n"
 
-    if fav_name:
-        texto += f"⭐ Favorito/dominante detectado: {fav_name} ({fav_estado})\n"
-
-    texto += "\n"
-
-    if motivos:
-        texto += "🧠 Lectura rápida:\n"
-        for motivo in motivos[:4]:
-            texto += f"• {motivo}\n"
-        texto += "\n"
-
-    if not sugerencias:
-        texto += "⚠️ No hay oportunidad live clara."
+    if not recomendadas:
+        texto += "\n⚠️ No hay oportunidad live con probabilidad suficiente."
+        mejores = sugerencias[:2]
+        if mejores:
+            texto += "\nLo más cercano:\n" + "\n".join(
+                f"• {s['jugada']}: {s['prob']}% (justa {s['cuota_justa']})" for s in mejores)
     else:
-        texto += "🚨 Oportunidades LIVE:\n"
-        for s in sugerencias[:3]:
+        texto += "\n🚨 Oportunidades LIVE:\n"
+        for s in recomendadas[:3]:
             texto += (
-                f"\n🎯 Mercado: {s['mercado']}\n"
-                f"✅ Jugada: {s['jugada']}\n"
-                f"📊 Probabilidad: {s['prob']}%\n"
-                f"⭐ Score: {s['score']}/10\n"
-                f"⚠️ Riesgo: {s['riesgo']}/10\n"
-                f"💰 Cuota Pinnacle: {s.get('cuota_api') or s.get('cuota','N/D')}\n"
-                f"📈 Edge: {s.get('edge','N/D')}% ({s.get('edge_categoria','?')})\n"
+                f"\n✅ {s['jugada']}\n"
+                f"📊 Probabilidad: {s['prob']}% | ⭐ Score: {s['score']}/10\n"
+                f"{texto_cuotas(s)}\n"
                 f"🧠 {s['motivo']}\n"
             )
-
+        top = recomendadas[0]
+        guardar_pick_live_automatico(
+            fixture_id, home, away, country, league, hora, top,
+            minuto=elapsed, goles_local=gh, goles_visita=ga
+        )
         texto += "\n💾 Mejor jugada live guardada automáticamente."
 
-    # =========================
-    # GUARDAR PICKS LIVE
-    # =========================
-
-    if sugerencias:
-        picks = leer_json(PICKS_FILE)
-
-        for s in sugerencias[:1]:
-            ya_existe = any(
-                p.get("fixture_id") == fixture_id
-                and p.get("jugada") == s["jugada"]
-                and p.get("tipo") == "live"
-                for p in picks
-            )
-
-            if ya_existe:
-                continue
-
-            picks.append({
-                "tipo": "live",
-                "fixture_id": fixture_id,
-                "partido": f"{home} vs {away}",
-                "mercado": s["mercado"],
-                "jugada": s["jugada"],
-                "probabilidad": s.get("prob"),
-                "score": s.get("score"),
-                "riesgo": s.get("riesgo"),
-                "cuota": s.get("cuota"),
-                "estado": "pendiente",
-                "resultado": "pendiente",
-                "minuto_detectado": elapsed,
-                "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            })
-
-        guardar_json_lista(PICKS_FILE, picks)
-
-    return {
-        "texto": texto[:3900],
-        "score_live": score_live,
-        "sugerencias": sugerencias,
-        "alerta": score_live >= 7 and len(sugerencias) > 0
-    }
+    return {"texto": texto[:3900], "score_live": score_live,
+            "sugerencias": recomendadas, "alerta": bool(recomendadas) and score_live >= 7}
 
 
 def listar_live():
@@ -4227,6 +5057,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/analizar_all — Analiza TODAS las ligas automaticamente\n"
         "/minitickets — Genera minitickets (hoy | nuevo | manana)\n"
         "/ligas_hoy — Ligas que entran hoy (con su ID)\n"
+        "/cuotas <id> — Comparar cuotas de las casas\n"
+        "/mi_cuota <id> <cuota> [monto] — Registrar tu cuota real\n"
+        "/estado_dia — Tickets de hoy y stop-loss\n"
+        "/backtest <liga> — Probar el modelo con la temporada\n"
         "/reparar_ligas — Corrige ligas mal etiquetadas en picks\n"
         "/analizar ID — Analiza un partido especifico\n"
         "/detalle ID — Detalle completo de un partido\n"
@@ -4340,9 +5174,7 @@ async def analizar(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     f"✅ Jugada: {top_pre['jugada']}\n"
                     f"⭐ Score prematch: {top_pre['score']}/10\n"
                     f"⚠️ Riesgo prematch: {top_pre['riesgo']}/10\n"
-                    f"💰 Cuota justa: {top_pre.get('cuota_justa', 'N/D')}\n"
-                    f"💰 Cuota Pinnacle: {top_pre.get('cuota_api') or top_pre.get('cuota_minima','N/D')}\n"
-                    f"📈 Edge: {top_pre.get('edge','N/D')}% ({top_pre.get('edge_categoria','?')})\n"
+                    f"{texto_cuotas(top_pre)}\n"
                     f"🧠 {top_pre['motivo']}\n"
             )
 
@@ -4528,8 +5360,7 @@ async def scanear_ligas(update: Update, context: ContextTypes.DEFAULT_TYPE, leag
             f"📊 Prob: {op['prob']}%\n"
             f"⭐ Score: {op['score']}/10\n"
             f"⚠️ Riesgo: {op['riesgo']}/10\n"
-            f"💰 Cuota Pinnacle: {op.get('cuota_api') or op.get('cuota','N/D')}\n"
-            f"📈 Edge: {op.get('edge','N/D')}% ({op.get('edge_categoria','?')})\n"
+            f"{texto_cuotas(op)}\n"
             f"📌 ID: {op['fixture_id']}\n"
         )
 
@@ -4575,8 +5406,7 @@ async def elite(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"📊 Prob: {o['prob']}%\n"
             f"⭐ Score: {o['score']}/10\n"
             f"⚠️ Riesgo: {o['riesgo']}/10\n"
-            f"💰 Cuota Pinnacle: {o.get('cuota_api') or o.get('cuota_minima','N/D')}\n"
-            f"📈 Edge: {o.get('edge','N/D')}% ({o.get('edge_categoria','?')})\n"
+            f"{texto_cuotas(o)}\n"
             f"📌 ID: {o['id']}\n"
         )
 
@@ -4637,8 +5467,7 @@ async def top(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"✅ Jugada: {o['jugada']}\n"
             f"⭐ Score: {o['score']}/10\n"
             f"⚠️ Riesgo: {o['riesgo']}/10\n"
-            f"💰 Cuota Pinnacle: {o.get('cuota_api') or o.get('cuota_minima','N/D')}\n"
-            f"📈 Edge: {o.get('edge','N/D')}% ({o.get('edge_categoria','?')})\n"
+            f"{texto_cuotas(o)}\n"
             f"📌 ID: {o['id']}\n"
         )
 
@@ -5661,9 +6490,9 @@ def _pick_valido_para_combinada(pick):
         if len(equipos_top) >= 2:
             return False  # Clasico — excluir
 
-    # Cuota irreal o sin dato: no entra a un ticket
+    # Cuota irreal, estimada o sin dato: no entra a un ticket
     c = cuota_pick(pick)
-    if c["valor"] is None or c["valor"] > CUOTA_MAX_EN_TICKET:
+    if c["valor"] is None or c["valor"] > CUOTA_MAX_EN_TICKET or c["fuente"] != "real":
         return False
 
     # Corners del 1er tiempo no se pueden evaluar solos -> fuera de tickets
@@ -7558,7 +8387,7 @@ def _estado(p):
         return "acierto"
     if e in ("fallo", "perdida", "lose"):
         return "fallo"
-    if e in ("anulado", "anulada", "void", "nulo", "push"):
+    if e in ("anulado", "anulada", "void", "nulo", "push", "descartado"):
         return "anulado"
     if e == "pendiente_manual":
         return "manual"
@@ -11239,26 +12068,28 @@ def analizar_seleccion(fixture_id, home, away, league, country, hora, round_name
 
     # Doble Oportunidad (ajustada por ranking y motivacion)
     if "Doble Oportunidad" in mercados_pref or "1X o X2" in mercados_pref:
+        jugada_do = None
         if diff_ranking >= 10:
             jugada_do = "1X"
             prob_do = 80 if es_motivacion_alta else 73
+            if desc_away < 4:          # visitante cansado favorece al local
+                prob_do = min(85, prob_do + 3)
         elif diff_ranking <= -10:
             jugada_do = "X2"
             prob_do = 74 if es_motivacion_alta else 67
-        else:
-            jugada_do = "1X"
-            prob_do = 65
-        # Ajuste por cansancio del visitante
-        if desc_away < 4:
-            prob_do = min(85, prob_do + 5)
+            if desc_away < 4:          # el cansado es el favorito: resta
+                prob_do = max(55, prob_do - 3)
+        # Partido parejo: no se fuerza doble oportunidad
+    if ("Doble Oportunidad" in mercados_pref or "1X o X2" in mercados_pref) and jugada_do:
+        _riesgo_do = round((100 - prob_do) / 10, 1)
         sugerencias.append({
             "mercado": "Doble Oportunidad",
             "jugada": jugada_do,
             "prob": prob_do,
             "score": score_final,
-            "riesgo": 1.3,
-            "cuota_minima": cuota_minima(prob_do, 1.3),
-            "cuota": cuota_minima(prob_do, 1.3),
+            "riesgo": _riesgo_do,
+            "cuota_minima": cuota_minima(prob_do, _riesgo_do),
+            "cuota": round(100 / prob_do, 2),
             "confianza": etiqueta_confianza(score_final),
             "motivo": f"Ranking diff: {diff_ranking} | Descanso visitante: {desc_away} dias",
         })
@@ -11546,7 +12377,7 @@ async def _alerta_edge_excelente_job(context):
                     f"\u2605 *{p.get('partido','')}*\n"
                     f"   \U0001f310 {p.get('country','')} | {p.get('league','')}\n"
                     f"   \U0001f3af {p.get('jugada','')}\n"
-                    f"   Score: {p.get('score','')} | Cuota Pinnacle: {cuota_p}\n"
+                    f"   Score: {p.get('score','')} | Cuota: {cuota_p}\n"
                     f"   \U0001f4b9 *Edge: +{edge_p}% vs Pinnacle* [EXCELENTE]\n"
                     f"   Prob modelo: {p.get('probabilidad',p.get('prob','?'))}% | "
                     f"Prob implicita Pinnacle: {round(100/cuota_p,1) if cuota_p else '?'}%"
@@ -12066,6 +12897,7 @@ def _generar_picks_para_minitickets(fecha, max_partidos=60):
             aptas = [
                 r for r in data["recomendaciones"]
                 if float(r.get("score", 0) or 0) >= score_min
+                and r.get("recomendado", True) and r.get("cuota_api")
                 and not _es_btts(r)
             ]
             if not aptas:
@@ -12408,6 +13240,429 @@ async def _job_validar_ligas_inicio(context):
             pass
 
 
+# ═════════════════════════════════════════════════════════════════
+#  VALIDACION, CONTROL PREVIO Y GESTION DEL BANK
+# ═════════════════════════════════════════════════════════════════
+
+# ── Gestion del bank ────────────────────────────────────────────────
+MAX_TICKETS_DIA = 3            # tickets (combinadas + minitickets) por dia
+STOP_LOSS_DIA_PCT = 0.06       # si hoy se pierde 6% del bank (S/30 con S/500) se frena
+COMANDOS_TICKET = [
+    "combinada", "combinada_manana", "comb3", "comb3_manana", "comb4", "comb4_live",
+    "comb4_mixta", "comb5", "comb5_live", "comb5_mixta", "combinada_live",
+    "combinada_mixta", "mixta", "mixta_alta", "minitickets",
+]
+
+
+def resultado_dia(fecha=None):
+    """Tickets y apuestas registradas hoy: cantidad, stake y ganancia/perdida en S/."""
+    fecha = fecha or fecha_hoy_peru()
+    tickets = [c for c in leer_json(COMBINADAS_FILE)
+               if isinstance(c, dict) and c.get("picks") and not c.get("sin_combinada")
+               and str(c.get("fecha", ""))[:10] == fecha]
+    stake_ticket = round(BANK_INICIAL * STAKE_COMBINADA, 2)
+    pnl, stake_total = 0.0, 0.0
+    for c in tickets:
+        st = float(c.get("stake") or stake_ticket)
+        stake_total += st
+        e = _estado(c)
+        if e == "acierto":
+            pnl += st * (float(cuota_ticket(c.get("picks", []))[0]) - 1)
+        elif e == "fallo":
+            pnl -= st
+    apuestas = [p for p in leer_json(PICKS_FILE)
+                if p.get("apostado") and _fecha_de(p) == fecha]
+    for p in apuestas:
+        st = float(p.get("stake_tomado") or 0)
+        stake_total += st
+        e = _estado(p)
+        if e == "acierto":
+            pnl += st * (float(p.get("cuota_tomada") or 1) - 1)
+        elif e == "fallo":
+            pnl -= st
+    return {"tickets": len(tickets), "apuestas": len(apuestas),
+            "stake": round(stake_total, 2), "pnl": round(pnl, 2)}
+
+
+def bloqueo_diario():
+    """Devuelve un texto si hoy ya no se deben generar tickets; None si se puede."""
+    r = resultado_dia()
+    limite = round(BANK_INICIAL * STOP_LOSS_DIA_PCT, 2)
+    if r["pnl"] <= -limite:
+        return (f"🛑 Stop-loss del día alcanzado: resultado de hoy S/ {r['pnl']:.2f} "
+                f"(límite -S/ {limite:.2f}). No genero más tickets hasta mañana.")
+    if r["tickets"] >= MAX_TICKETS_DIA:
+        return (f"🛑 Ya hay {r['tickets']} tickets hoy (máximo {MAX_TICKETS_DIA}). "
+                f"Menos tickets, mejor elegidos.")
+    return None
+
+
+def con_limite_diario(func):
+    """Envuelve un comando de tickets con el limite diario y el stop-loss."""
+    async def envoltura(update, context):
+        args = [a.lower() for a in (context.args or [])]
+        para_manana = any(a in ("manana", "mañana") for a in args)
+        aviso = None if para_manana else bloqueo_diario()
+        if aviso:
+            await update.message.reply_text(aviso)
+            return
+        return await func(update, context)
+    envoltura.__name__ = getattr(func, "__name__", "comando")
+    return envoltura
+
+
+async def estado_dia(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    r = await asyncio.to_thread(resultado_dia)
+    limite = round(BANK_INICIAL * STOP_LOSS_DIA_PCT, 2)
+    aviso = bloqueo_diario()
+    await update.message.reply_text(
+        f"📅 Hoy ({fecha_hoy_peru()})\n"
+        f"🎟️ Tickets: {r['tickets']}/{MAX_TICKETS_DIA}\n"
+        f"📝 Apuestas registradas con /mi_cuota: {r['apuestas']}\n"
+        f"💵 Stake del día: S/ {r['stake']:.2f}\n"
+        f"📊 Resultado cerrado: S/ {r['pnl']:+.2f} (stop-loss: -S/ {limite:.2f})\n"
+        + (f"\n{aviso}" if aviso else "\n✅ Dentro de los límites.")
+    )
+
+
+# ── /mi_cuota: registrar la cuota con la que apostaste ──────────────
+async def mi_cuota(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/mi_cuota <fixture_id> <cuota> [monto] [n° de pick]"""
+    args = context.args or []
+    if len(args) < 2:
+        await update.message.reply_text(
+            "Uso: /mi_cuota <fixture_id> <cuota> [monto]\n"
+            "Ej: /mi_cuota 1234567 1.85 10\n"
+            "Guarda la cuota real con la que apostaste; el ROI usará esa cuota.")
+        return
+    fid = args[0]
+    try:
+        cuota = float(args[1].replace(",", "."))
+        monto = float(args[2].replace(",", ".")) if len(args) >= 3 else round(BANK_INICIAL * 0.02, 2)
+    except ValueError:
+        await update.message.reply_text("❌ Cuota o monto no válidos.")
+        return
+    if not (CUOTA_MIN_VALIDA <= cuota <= CUOTA_MAX_VALIDA):
+        await update.message.reply_text("❌ Cuota fuera de rango (1.01 a 15).")
+        return
+    picks = leer_json(PICKS_FILE)
+    cand = [p for p in picks if str(p.get("fixture_id")) == str(fid)
+            and _estado(p) in ("pendiente", "manual")]
+    if not cand:
+        cand = [p for p in picks if str(p.get("fixture_id")) == str(fid)]
+    if not cand:
+        await update.message.reply_text("❌ No encontré picks de ese partido.")
+        return
+    idx = 0
+    if len(args) >= 4:
+        try:
+            idx = max(0, int(args[3]) - 1)
+        except ValueError:
+            idx = 0
+    if len(cand) > 1 and len(args) < 4:
+        lista = "\n".join(f"{i+1}. {p.get('jugada')}" for i, p in enumerate(cand))
+        await update.message.reply_text(
+            f"Hay {len(cand)} picks de ese partido; se registró en el 1.\n{lista}\n"
+            f"Para otro: /mi_cuota {fid} {cuota} {monto} <n°>")
+    p = cand[min(idx, len(cand) - 1)]
+    p["cuota_tomada"] = cuota
+    p["stake_tomado"] = monto
+    p["apostado"] = True
+    p["cuota_real"] = cuota
+    p["cuota_fuente"] = "real"
+    p["bookmaker"] = "Mi casa"
+    guardar_json_lista(PICKS_FILE, picks)
+    await update.message.reply_text(
+        f"✅ Registrado: {p.get('partido')} — {p.get('jugada')}\n"
+        f"Cuota tomada {cuota} | Monto S/ {monto:.2f}")
+
+
+# ── /cuotas: comparar casas de un partido ───────────────────────────
+async def cuotas_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.message.reply_text("Uso: /cuotas <fixture_id>")
+        return
+    fid = context.args[0]
+    c = await asyncio.to_thread(cuotas_partido, fid)
+    if not c:
+        await update.message.reply_text("❌ La API no trae cuotas para ese partido.")
+        return
+    nombres = {"1": "Local", "x": "Empate", "2": "Visita", "1x": "1X", "x2": "X2", "12": "12",
+               "btts_si": "Ambos marcan Sí", "btts_no": "Ambos marcan No",
+               "dnb1": "Empate no apuesta local", "dnb2": "Empate no apuesta visita"}
+    lineas = [f"💱 Cuotas del partido {fid}"]
+    orden = [("1x2", ["1", "x", "2"]), ("doble", ["1x", "x2", "12"]), ("dnb", ["dnb1", "dnb2"]),
+             ("goles", ["over_1.5", "under_1.5", "over_2.5", "under_2.5", "over_3.5", "under_3.5"]),
+             ("btts", ["btts_si", "btts_no"])]
+    for mercado, claves in orden:
+        g = c.get(mercado, {})
+        if not g:
+            continue
+        lineas.append(f"\n<b>{NOMBRE_MERCADO_V4[mercado]}</b>")
+        for k in claves:
+            if k not in g:
+                continue
+            casas = sorted(g[k].items(), key=lambda x: -x[1])
+            pref = [x for x in casas if any(p.lower() in x[0].lower() for p in CASAS_PREFERIDAS)]
+            pin = [x for x in casas if _es_pinnacle(x[0])]
+            muestra = (pref + pin + [x for x in casas if x not in pref and x not in pin])[:4]
+            pm = probabilidad_mercado(c, mercado, k)
+            nom = nombres.get(k) or k.replace("_", " ").capitalize()
+            lineas.append(f"• {nom}: " + " | ".join(f"{_html_rep.escape(n)} {o}" for n, o in muestra)
+                          + (f"  (prob. mercado {pm*100:.0f}%)" if pm else ""))
+    await enviar_texto_largo(context.bot, update.effective_chat.id, "\n".join(lineas))
+
+
+# ── Control previo (~1 hora antes) ─────────────────────────────────
+def _titulares(fixture_id):
+    data = api_get(f"/fixtures/lineups?fixture={fixture_id}", use_cache=True, ttl=600)
+    out = {}
+    for t in data or []:
+        ids = [x["player"]["id"] for x in t.get("startXI", []) if x.get("player", {}).get("id")]
+        if ids:
+            out[t["team"]["id"]] = set(ids)
+    return out
+
+
+def _ultimo_partido_equipo(team_id, ts_antes):
+    data = api_get(f"/fixtures?team={team_id}&last=3", use_cache=True, ttl=21600)
+    previos = [m for m in data or [] if int(m["fixture"]["timestamp"]) < ts_antes - 3600]
+    if not previos:
+        return None
+    return max(previos, key=lambda m: int(m["fixture"]["timestamp"]))["fixture"]["id"]
+
+
+def revisar_pick_previo(p):
+    """Devuelve (estado, alertas). estado: 'ok' | 'descartar' | 'esperar'."""
+    fid = p.get("fixture_id")
+    fx = api_get(f"/fixtures?id={fid}", use_cache=True, ttl=300)
+    if not fx:
+        return "esperar", []
+    fx = fx[0]
+    ts = int(fx["fixture"]["timestamp"])
+    alertas, graves = [], 0
+
+    # Alineaciones y rotaciones
+    tit = _titulares(fid)
+    if not tit:
+        mins = _minutos_para_inicio(p)
+        if mins is not None and mins > 25:
+            return "esperar", []
+        alertas.append("Alineaciones no publicadas")
+    else:
+        for lado in ("home", "away"):
+            tid = fx["teams"][lado]["id"]
+            nombre = fx["teams"][lado]["name"]
+            ult = _ultimo_partido_equipo(tid, ts)
+            if ult and tid in tit:
+                prev = _titulares(ult).get(tid)
+                if prev:
+                    cambios = len(tit[tid] - prev)
+                    if cambios >= 6:
+                        alertas.append(f"{nombre} rota {cambios} titulares respecto a su último partido")
+                        graves += 1
+    # Bajas confirmadas
+    les = api_get(f"/injuries?fixture={fid}", use_cache=True, ttl=1800)
+    bajas = {}
+    for x in les or []:
+        tname = x.get("team", {}).get("name", "")
+        bajas[tname] = bajas.get(tname, 0) + 1
+    for tname, n in bajas.items():
+        if n >= 4:
+            alertas.append(f"{tname} con {n} bajas")
+
+    # Cuota actual vs la del pick
+    c = cuota_pick(p)
+    if c["fuente"] == "real" and p.get("jugada"):
+        CACHE.pop(f"/odds?fixture={fid}", None)
+        nueva, casa = buscar_mejor_cuota(fid, p["jugada"])
+        prob = _prob_de_pick(p)
+        if nueva and prob:
+            edge = prob / 100 * nueva - 1
+            if edge < 0:
+                alertas.append(f"La cuota bajó a {nueva} ({casa}): ya no tiene valor")
+                graves += 1
+            p["cuota_cierre"] = nueva
+            p["casa_cierre"] = casa
+
+    return ("descartar" if graves else "ok"), alertas
+
+
+def control_previo_picks():
+    """Revisa picks prematch pendientes que empiezan en 20-75 min. Devuelve avisos."""
+    picks = leer_json(PICKS_FILE)
+    avisos, cambios = [], 0
+    for p in picks:
+        if _es_live(p) or _estado(p) != "pendiente" or p.get("control_previo"):
+            continue
+        mins = _minutos_para_inicio(p)
+        if mins is None or not (20 <= mins <= 75):
+            continue
+        try:
+            estado, alertas = revisar_pick_previo(p)
+        except Exception as e:
+            print("ERROR control previo:", e)
+            continue
+        if estado == "esperar":
+            continue
+        p["control_previo"] = {"estado": estado, "alertas": alertas, "hora": fecha_hora_peru()}
+        cambios += 1
+        if estado == "descartar":
+            p["estado"] = "descartado"
+            p["resultado"] = "descartado"
+            p["motivo_manual"] = "; ".join(alertas)
+            avisos.append(f"❌ <b>NO APOSTAR</b>: {_html_rep.escape(p.get('partido',''))} — "
+                          f"{_html_rep.escape(p.get('jugada',''))}\n   " +
+                          _html_rep.escape("; ".join(alertas)))
+        elif alertas:
+            avisos.append(f"⚠️ Revisar: {_html_rep.escape(p.get('partido',''))} — "
+                          f"{_html_rep.escape(p.get('jugada',''))}\n   " +
+                          _html_rep.escape("; ".join(alertas)))
+    if cambios:
+        guardar_json_lista(PICKS_FILE, picks)
+    return avisos
+
+
+async def _job_control_previo(context):
+    try:
+        avisos = await asyncio.to_thread(control_previo_picks)
+    except Exception as e:
+        print("ERROR job control previo:", e)
+        return
+    if not avisos:
+        return
+    texto = "🔎 <b>Control 1 hora antes</b>\n\n" + "\n\n".join(avisos)
+    for cid in list(_CHAT_IDS_ALARMAS):
+        try:
+            await enviar_texto_largo(context.bot, int(cid), texto)
+        except Exception as e:
+            print("ERROR enviando control previo:", e)
+
+
+# ── /backtest: probar el modelo con la temporada ya jugada ──────────
+def backtest_liga(league_id, season=None, desde_fraccion=0.4, cada=10):
+    season = season or _season_actual_liga(league_id)
+    partidos = _partidos_temporada(league_id, season)
+    if len(partidos) < 60:
+        return None
+    inicio = int(len(partidos) * desde_fraccion)
+    preds = []
+    rat = None
+    for i in range(inicio, len(partidos)):
+        if rat is None or (i - inicio) % cada == 0:
+            rat = calcular_ratings(partidos[:i], ts_ref=partidos[i]["ts"] - 1)
+        if not rat:
+            continue
+        p = partidos[i]
+        h, a = p["home"], p["away"]
+        if (rat["jugados"].get(h, 0) < MIN_PARTIDOS_EQUIPO
+                or rat["jugados"].get(a, 0) < MIN_PARTIDOS_EQUIPO):
+            continue
+        lh = rat["media_local"] * rat["ata"][h] * rat["def"][a]
+        la = rat["media_visita"] * rat["ata"][a] * rat["def"][h]
+        pr = probabilidades_partido(lh, la)
+        res = "1" if p["gh"] > p["ga"] else ("x" if p["gh"] == p["ga"] else "2")
+        preds.append({"pr": pr, "res": res, "tot": p["gh"] + p["ga"],
+                      "btts": p["gh"] > 0 and p["ga"] > 0})
+    if not preds:
+        return None
+
+    n = len(preds)
+    base = {k: sum(1 for x in preds if x["res"] == k) / n for k in ("1", "x", "2")}
+    base_o25 = sum(1 for x in preds if x["tot"] > 2.5) / n
+    base_btts = sum(1 for x in preds if x["btts"]) / n
+
+    def brier_1x2(prob_fn):
+        return sum(sum((prob_fn(x)[k] - (1 if x["res"] == k else 0)) ** 2 for k in ("1", "x", "2"))
+                   for x in preds) / n
+
+    def brier_bin(pf, yf):
+        return sum((pf(x) - (1 if yf(x) else 0)) ** 2 for x in preds) / n
+
+    out = {
+        "liga": league_id, "season": season, "n": n,
+        "brier_1x2": round(brier_1x2(lambda x: x["pr"]), 4),
+        "brier_1x2_base": round(brier_1x2(lambda x: base), 4),
+        "brier_o25": round(brier_bin(lambda x: x["pr"]["over_2.5"], lambda x: x["tot"] > 2.5), 4),
+        "brier_o25_base": round(brier_bin(lambda x: base_o25, lambda x: x["tot"] > 2.5), 4),
+        "brier_btts": round(brier_bin(lambda x: x["pr"]["btts_si"], lambda x: x["btts"]), 4),
+        "brier_btts_base": round(brier_bin(lambda x: base_btts, lambda x: x["btts"]), 4),
+        "calibracion": {},
+    }
+    # Calibracion de opciones "tipo pick" (prob >= 60%)
+    eventos = {
+        "Over 1.5": (lambda x: x["pr"]["over_1.5"], lambda x: x["tot"] > 1.5),
+        "Under 3.5": (lambda x: x["pr"]["under_3.5"], lambda x: x["tot"] < 3.5),
+        "Over 2.5": (lambda x: x["pr"]["over_2.5"], lambda x: x["tot"] > 2.5),
+        "Ambos marcan": (lambda x: x["pr"]["btts_si"], lambda x: x["btts"]),
+        "1X": (lambda x: x["pr"]["1x"], lambda x: x["res"] in ("1", "x")),
+        "X2": (lambda x: x["pr"]["x2"], lambda x: x["res"] in ("x", "2")),
+        "Gana local": (lambda x: x["pr"]["1"], lambda x: x["res"] == "1"),
+    }
+    for nombre, (pf, yf) in eventos.items():
+        tramos = {}
+        for x in preds:
+            pv = pf(x)
+            if pv < 0.6:
+                continue
+            t = "60-70%" if pv < 0.7 else ("70-80%" if pv < 0.8 else "80%+")
+            g = tramos.setdefault(t, [0, 0.0, 0])
+            g[0] += 1 if yf(x) else 0
+            g[1] += pv
+            g[2] += 1
+        out["calibracion"][nombre] = {t: {"n": g[2], "pred": round(g[1] / g[2] * 100, 1),
+                                          "real": round(g[0] / g[2] * 100, 1)}
+                                      for t, g in tramos.items()}
+    return out
+
+
+def texto_backtest(r):
+    if not r:
+        return "❌ No hay partidos suficientes (mínimo 60 jugados) para probar esa liga."
+    def mejora(a, b):
+        return f"{(1 - a / b) * 100:+.1f}%" if b else "—"
+    L = [f"🧪 <b>Backtest liga {r['liga']} — temporada {r['season']}</b>",
+         f"Partidos evaluados: {r['n']} (cada uno predicho solo con partidos anteriores)",
+         "",
+         "<b>Error (Brier, menor es mejor) vs. usar solo el promedio de la liga</b>",
+         f"• 1X2: {r['brier_1x2']} vs {r['brier_1x2_base']} ({mejora(r['brier_1x2'], r['brier_1x2_base'])})",
+         f"• Over 2.5: {r['brier_o25']} vs {r['brier_o25_base']} ({mejora(r['brier_o25'], r['brier_o25_base'])})",
+         f"• Ambos marcan: {r['brier_btts']} vs {r['brier_btts_base']} ({mejora(r['brier_btts'], r['brier_btts_base'])})",
+         "",
+         "<b>Calibración (el modelo dijo → pasó de verdad)</b>"]
+    for nombre, tramos in r["calibracion"].items():
+        if not tramos:
+            continue
+        partes = [f"{t}: {v['pred']}%→{v['real']}% (n={v['n']})"
+                  for t, v in sorted(tramos.items())]
+        L.append(f"• {nombre}: " + " | ".join(partes))
+    L.append("")
+    L.append("<i>Si 'pasó de verdad' queda muy por debajo de lo que dijo el modelo, "
+             "ese mercado está sobreestimado en esta liga. Muestras de menos de 30 son poco fiables.</i>")
+    return "\n".join(L)
+
+
+async def backtest_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/backtest <league_id> — ej. /backtest 281 (Perú)."""
+    if not context.args:
+        await update.message.reply_text(
+            "Uso: /backtest <league_id>\nEj: /backtest 39 (Premier), /backtest 281 (Perú).\n"
+            "Usa /ligas_hoy para ver los IDs.")
+        return
+    try:
+        lid = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("❌ ID de liga no válido.")
+        return
+    await update.message.reply_text("🧪 Probando el modelo con la temporada ya jugada...")
+    try:
+        r = await asyncio.to_thread(backtest_liga, lid)
+    except Exception as e:
+        await update.message.reply_text(f"❌ Error en backtest: {e}")
+        return
+    await enviar_texto_largo(context.bot, update.effective_chat.id, texto_backtest(r))
+
+
 app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
 
 app.add_handler(CommandHandler("start", start))
@@ -12438,18 +13693,18 @@ app.add_handler(CommandHandler("pdf_semana", pdf_semana))
 app.add_handler(CommandHandler("pdf_mes", pdf_mes))
 app.add_handler(CommandHandler("feedback", feedback))
 app.add_handler(CommandHandler("rendimiento", rendimiento))
-app.add_handler(CommandHandler("combinada", combinada))
-app.add_handler(CommandHandler("combinada_live", combinada_live))
-app.add_handler(CommandHandler("combinada_mixta", combinada_mixta))
-app.add_handler(CommandHandler("comb3", comb3))
-app.add_handler(CommandHandler("comb3_live", comb3_live))
-app.add_handler(CommandHandler("comb3_mixta", comb3_mixta))
-app.add_handler(CommandHandler("comb4", comb4))
-app.add_handler(CommandHandler("comb4_live", comb4_live))
-app.add_handler(CommandHandler("comb4_mixta", comb4_mixta))
-app.add_handler(CommandHandler("comb5", comb5))
-app.add_handler(CommandHandler("comb5_live", comb5_live))
-app.add_handler(CommandHandler("comb5_mixta", comb5_mixta))
+app.add_handler(CommandHandler("combinada", con_limite_diario(combinada)))
+app.add_handler(CommandHandler("combinada_live", con_limite_diario(combinada_live)))
+app.add_handler(CommandHandler("combinada_mixta", con_limite_diario(combinada_mixta)))
+app.add_handler(CommandHandler("comb3", con_limite_diario(comb3)))
+app.add_handler(CommandHandler("comb3_live", con_limite_diario(comb3_live)))
+app.add_handler(CommandHandler("comb3_mixta", con_limite_diario(comb3_mixta)))
+app.add_handler(CommandHandler("comb4", con_limite_diario(comb4)))
+app.add_handler(CommandHandler("comb4_live", con_limite_diario(comb4_live)))
+app.add_handler(CommandHandler("comb4_mixta", con_limite_diario(comb4_mixta)))
+app.add_handler(CommandHandler("comb5", con_limite_diario(comb5)))
+app.add_handler(CommandHandler("comb5_live", con_limite_diario(comb5_live)))
+app.add_handler(CommandHandler("comb5_mixta", con_limite_diario(comb5_mixta)))
 app.add_handler(CommandHandler("reparar_cuotas", reparar_cuotas))
 app.add_handler(CommandHandler("actualizar_combinadas", actualizar_combinadas_cmd))
 app.add_handler(CommandHandler("resumen_prematch", resumen_prematch))
@@ -12457,9 +13712,13 @@ app.add_handler(CommandHandler("resumen_live", resumen_live))
 app.add_handler(CommandHandler("resumen_combinadas", resumen_combinadas))
 app.add_handler(CommandHandler("estado", estado))
 app.add_handler(CommandHandler("validar_ligas", validar_ligas))
-app.add_handler(CommandHandler("minitickets", minitickets))
+app.add_handler(CommandHandler("minitickets", con_limite_diario(minitickets)))
 app.add_handler(CommandHandler("reparar_ligas", reparar_ligas))
 app.add_handler(CommandHandler("ligas_hoy", ligas_hoy))
+app.add_handler(CommandHandler("estado_dia", estado_dia))
+app.add_handler(CommandHandler("mi_cuota", mi_cuota))
+app.add_handler(CommandHandler("cuotas", cuotas_cmd))
+app.add_handler(CommandHandler("backtest", backtest_cmd))
 app.add_handler(CommandHandler("combinada_manana", combinada_manana))
 app.add_handler(CommandHandler("comb3_manana", comb3_manana))
 app.add_handler(CommandHandler("comb4_manana", comb4_manana))
@@ -12470,7 +13729,7 @@ app.add_handler(CommandHandler("cancelar_escalera", cancelar_escalera))
 app.add_handler(CommandHandler("analizar_all", analizar_all))
 app.add_handler(CommandHandler("live_all", live_all))
 
-print("🤖 HarryNine V14 ejecutándose...")
+print("🤖 HarryNine V15 (modelo v4) ejecutándose...")
 async def _set_commands(app_instance):
     from telegram import BotCommand
     comandos = [
@@ -12558,6 +13817,10 @@ async def _registrar_comandos_bot(context):
         BotCommand("validar_ligas",              "Verifica que los IDs de ligas sean correctos"),
         BotCommand("minitickets",                "Genera minitickets (hoy | nuevo | manana)"),
         BotCommand("ligas_hoy",                  "Ligas que entran hoy y sus IDs"),
+        BotCommand("cuotas",                     "Cuotas de todas las casas de un partido"),
+        BotCommand("mi_cuota",                   "Registrar la cuota con la que apostaste"),
+        BotCommand("estado_dia",                 "Tickets de hoy, resultado y stop-loss"),
+        BotCommand("backtest",                   "Probar el modelo con la temporada de una liga"),
         BotCommand("reparar_ligas",              "Corrige ligas mal etiquetadas en picks"),
         BotCommand("combinada_manana",           "Combinada 2.5x+ de manana"),
         BotCommand("comb3_manana",               "Combinada 3x+ de manana"),
@@ -12629,6 +13892,7 @@ async def _job_cuota_cierre(context):
 app.job_queue.run_once(_registrar_comandos_bot, when=3)
 app.job_queue.run_once(_restaurar_chats_inicio, when=6)
 app.job_queue.run_repeating(_job_cuota_cierre, interval=600, first=90, name="cuota_cierre")
+app.job_queue.run_repeating(_job_control_previo, interval=600, first=120, name="control_previo")
 app.job_queue.run_once(_job_validar_ligas_inicio, when=10)
 app.run_polling()
 
